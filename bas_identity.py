@@ -82,9 +82,13 @@ DEFAULT_POLICY = {
     # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP
     "app_require_attrs": True,
     # 是否强制要求「APP 密钥签名」验证通过（client_attrs.app_verified == "1"）。
-    # False（默认）= 没有签名时按"前缀+证书身份"启发式判定，兼容 APP 未改造；
-    # True          = 只有通过 APP 私钥签名的连接才算本 APP（最强，需 APP 已发版）。
+    # ⚠️ 建议**保持 False**：用 FMO 固件登录的用户没有 APP 私钥，永远签不出签名。
+    #    现场要求：固件通道必须一直保留。一旦置 True，固件用户会被判为非本 APP。
     "app_require_signature": False,
+    # 「仅证书客户端」是否视为合法（默认 True）：
+    #   有 SAS 证书身份但**没有** APP 签名 → 判定为 FMO 固件/仅证书客户端，
+    #   绝不因"没有 APP 签名"而封禁。置 False 才会把它们当非本 APP。
+    "app_allow_certonly": True,
     # 连续 N 轮确认才处置（防抖：重连瞬间会有短暂的无属性状态）
     "app_confirm_rounds": 2,
     # 拉黑时长（小时）；None = 永久。默认 24 小时 —— 误封可自愈，不再出现 infinity
@@ -301,7 +305,19 @@ class IdentityPolicy(object):
             return False, False, "未通过 APP 密钥签名（app_verified=%s, app_sig=%s）: %s" % (
                 app_verified or "无", app_sig or "none", cid or "(空)")
 
-        # 回退（兼容 APP 尚未改造）：前缀 + SAS 证书身份
+        # 回退（兼容固件与尚未改造的 APP）：前缀 + SAS 证书身份
+        # 注意：**没有 APP 签名不等于非法** —— FMO 固件用户就是这种情况，
+        # 它的通道必须一直保留，绝不能因"签不出 APP 签名"而被判非本 APP / 被封。
+        certonly = bool(cs and uid)
+        if self.cfg.get("app_allow_certonly", True) and certonly:
+            if not self._prefix_hit(cid, "app_clientid_prefixes"):
+                # 仅证书但 clientid 不是 APP 形态：多为固件/其它客户端，仍放行并标注
+                return True, False, "仅证书客户端（非 APP 形态 clientid=%s 身份=%s/%s）" % (
+                    cid or "(空)", cs, uid)
+            return True, False, "仅证书客户端（FMO 固件或未带 APP 签名；身份=%s/%s）" % (cs, uid)
+        if self.cfg.get("app_require_signature"):
+            return False, False, "未通过 APP 密钥签名（app_verified=%s, app_sig=%s）: %s" % (
+                app_verified or "无", app_sig or "none", cid or "(空)")
         if not self._prefix_hit(cid, "app_clientid_prefixes"):
             return False, False, "clientid 不是 APP 形态: %s" % (cid or "(空)")
         if self.cfg.get("app_require_attrs", True) and not (cs and uid):

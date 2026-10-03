@@ -375,6 +375,10 @@ DEFAULT_SAS_RUNTIME_CONFIG = {
     # 不豁免的话，一开强制就会把自家监控/网页打死。
     'client_signature_exempt_callsigns': ['SERVER'],
     'client_signature_exempt_prefixes': ['FMO-MONITOR', 'fmo-web-'],
+    # 「仅证书客户端」：用 **FMO 固件**登录的用户。固件里没有 APP 私钥，
+    # 永远签不出 app_signature —— 强制模式下必须放行，否则固件用户全部掉线。
+    # 按呼号逐个加入（默认空）。
+    'client_signature_certonly_callsigns': [],
     'auto_trust_local_ca': True,    # 自动信任本地 Root CA
     'uid_range': {'start': 1, 'end': 200000},
     'issuing_countries': ['CN'],
@@ -506,12 +510,17 @@ APP_MQTT_AUTH_PREFIX = "FMO-APP-mqtt"
 # （否则一开 require_client_signature，自家监控与网页 PTT 立刻掉线）
 DEFAULT_SIGNATURE_EXEMPT_CALLSIGNS = ['SERVER']
 DEFAULT_SIGNATURE_EXEMPT_PREFIXES = ['FMO-MONITOR', 'fmo-web-']
+# 用 FMO 固件登录的用户：只有证书、没有 APP 私钥，强制模式下必须放行
+DEFAULT_CERTONLY_CALLSIGNS = []
 
 
 def app_signature_exempt(callsign, clientid):
     """
-    判断该连接是否豁免 APP 签名要求（内部服务/面板）。
-    返回 (是否豁免, 原因)
+    判断该连接是否豁免 APP 签名要求。返回 (是否豁免, 原因)
+
+    三类豁免：
+      1) 内部服务呼号（SERVER）与内部客户端前缀（FMO-MONITOR / fmo-web-）
+      2) 「仅证书客户端」= 用 FMO 固件登录的用户（固件没有 APP 私钥）
     """
     rt = SAS_RUNTIME_CONFIG or {}
     cs = str(callsign or '').strip().upper()
@@ -522,12 +531,18 @@ def app_signature_exempt(callsign, clientid):
     exempt_pf = rt.get('client_signature_exempt_prefixes')
     if exempt_pf is None:
         exempt_pf = DEFAULT_SIGNATURE_EXEMPT_PREFIXES
+    certonly = rt.get('client_signature_certonly_callsigns')
+    if certonly is None:
+        certonly = DEFAULT_CERTONLY_CALLSIGNS
     for x in (exempt_cs or []):
         if cs and cs == str(x).strip().upper():
             return True, "内部服务呼号 %s" % cs
     for p in (exempt_pf or []):
         if p and cid.startswith(str(p)):
             return True, "内部客户端前缀 %s" % p
+    for x in (certonly or []):
+        if cs and cs == str(x).strip().upper():
+            return True, "仅证书客户端（FMO 固件用户）%s" % cs
     return False, ""
 
 
@@ -2609,6 +2624,25 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 return
         if 'require_client_signature' in body:
             SAS_RUNTIME_CONFIG['require_client_signature'] = bool(body['require_client_signature'])
+        # 仅证书客户端（FMO 固件用户）：强制 APP 签名时放行这些呼号
+        if 'client_signature_certonly_callsigns' in body:
+            val = body['client_signature_certonly_callsigns']
+            if isinstance(val, list):
+                SAS_RUNTIME_CONFIG['client_signature_certonly_callsigns'] = [
+                    str(x).strip().upper() for x in val if str(x).strip()
+                ]
+            else:
+                self.send_json({'ok': False, 'error': 'client_signature_certonly_callsigns 必须是列表'})
+                return
+        if 'client_signature_exempt_callsigns' in body:
+            val = body['client_signature_exempt_callsigns']
+            if isinstance(val, list):
+                SAS_RUNTIME_CONFIG['client_signature_exempt_callsigns'] = [
+                    str(x).strip().upper() for x in val if str(x).strip()
+                ]
+            else:
+                self.send_json({'ok': False, 'error': 'client_signature_exempt_callsigns 必须是列表'})
+                return
         if 'auto_trust_local_ca' in body:
             SAS_RUNTIME_CONFIG['auto_trust_local_ca'] = bool(body['auto_trust_local_ca'])
         if 'uid_range' in body:

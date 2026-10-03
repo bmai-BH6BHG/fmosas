@@ -125,29 +125,46 @@ def build_app_signature_mqtt(timestamp, callsign, user_pubkey_b64, clientid) -> 
 
 ## 5. 服务端行为
 
-| 情况 | `client_attrs` | 观察模式 (`require_client_signature=false`) | 强制模式 (`=true`) |
+| 情况 | `client_attrs` | 观察模式（默认，`require_client_signature=false`） | 强制模式（`=true`） |
 |---|---|---|---|
 | `FMO-APP-mqtt` 签名正确 | `app_verified="1"`, `app_sig="bound"` | 放行 | 放行 |
 | 旧式 `FMO-APP-auth` 签名正确 | `app_verified="1"`, `app_sig="legacy"` | 放行 | **拒绝**（未绑定连接） |
 | 有签名但错/被篡改/重放/过期 | `app_verified="0"`, `app_sig="invalid"` | 放行（留证） | 拒绝 |
-| 没有签名 | `app_verified="0"`, `app_sig="none"` | 放行 | 拒绝 |
+| 没有签名（**FMO 固件/仅证书客户端**） | `app_verified="0"`, `app_sig="none"` | **放行（固件通道，永久保留）** | 拒绝，除非该呼号在 `client_signature_certonly_callsigns` 里 |
 
 * 服务端要求 EMQX 认证器请求体带 `clientid`：
   `{"username":"${username}","password":"${password}","clientid":"${clientid}"}`
   （`bas_emqx_auth.py` 已按此写入；缺失时只剩未绑定的 legacy 路径）
 * 用户公钥由服务端从 `certPackage.userCert.subject.publicKey` 自行读取，**不需要 APP 额外传**。
 
-## 6. 上线步骤（重要：分两阶段，避免把所有人拒之门外）
+## 6. 上线步骤（重要：分两阶段，且**固件通道必须一直保留**）
 
-1. **阶段一（观察）**：服务端把 APP 公钥填进 `config.dmrid.app_pubkey`，
-   `require_client_signature=false`。此时任何连接都能进，日志/审计里会记录
-   `app_verified` 与 `app_sig`，可统计"有多少连接带了有效 APP 签名"。
-2. **阶段二（APP 发版）**：APP 按本文实现，MQTT CONNECT 时带上 `app_timestamp`/`app_signature`。
-   观察 `app_sig=bound` 覆盖率 → 达到 100% 后。
-3. **阶段三（强制）**：把 `require_client_signature` 设为 `true`（或在审计界面里切换）。
-   此后没有有效 `FMO-APP-mqtt` 签名的连接一律拒绝。
+> ⚠️ **前提：用 FMO 固件登录的用户没有 APP 私钥，永远签不出 `app_signature`。**
+> 现场要求"固件通道永久开放"，因此 `require_client_signature` **保持 `false`**：
 
-> 回滚：把 `require_client_signature` 改回 `false` 即可立刻放行（无需改 APP、无需重启 EMQX）。
+1. **阶段一（默认，长期状态）**：服务端填好 `config.dmrid.app_pubkey`，
+   `require_client_signature = false`。此时：
+   - APP 连接 → `app_verified="1"` / `app_sig="bound"`（**能确认是本 APP**）
+   - **FMO 固件 / 仅证书客户端 → `app_sig="none"`，照常放行**（不会被拒、不会被封）
+   - 用途：**识别**而不是**拦阻** —— 审计里一眼看出"这条是 APP、那条是固件/其它"
+2. **阶段二（可选，谨慎）**：确实需要"没有 APP 签名就不许连"时，
+   必须先做两件事，否则会误伤：
+   - 把固件用户呼号加进 `sas_runtime.client_signature_certonly_callsigns`
+   - 把内部服务留在 `sas_runtime.client_signature_exempt_callsigns` / `..._prefixes`
+   然后再把 `require_client_signature` 设为 `true`。
+
+**判定优先级**（`bas_identity.client_is_app`）：
+```
+APP 签名有效(app_verified=1)         → 本 APP
+内部服务(SERVER / FMO-MONITOR / fmo-web-) → 豁免
+仅证书客户端(有证书身份、无签名)      → 合法（FMO 固件）★ 永不被封
+无证书身份且非 APP 形态               → 非本 APP（按 app_only_verdict 处置）
+```
+
+> 回滚：把 `require_client_signature` 改回 `false` 立刻恢复开放（无需改 APP、无需重启 EMQX）。
+
+<!-- 原三阶段方案已废弃：强制模式会挡掉固件用户，与现场要求冲突。 -->
+
 
 ## 7. 常见失败原因（服务端拒绝时的 reason 会写明）
 

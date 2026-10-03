@@ -241,6 +241,25 @@ class ExemptionTests(unittest.TestCase):
         ok2, _ = api.app_signature_exempt("SERVER", "x")
         self.assertFalse(ok2, "自定义列表应覆盖默认值")
 
+    def test_firmware_certonly_callsign_exempt(self):
+        """★ FMO 固件用户：没有 APP 私钥，强制模式下必须放行"""
+        api.SAS_RUNTIME_CONFIG['client_signature_certonly_callsigns'] = ['BH6FWE']
+        ok, why = api.app_signature_exempt('BH6FWE', 'FMO-BH6FWE-405-1733')
+        self.assertTrue(ok)
+        self.assertIn("固件", why)
+        ok2, how2 = api.app_signature_exempt('BH9XXX', 'FMO-BH9XXX-9-AAAA')
+        self.assertFalse(ok2, "未列入的呼号不应豁免")
+
+    def test_firmware_list_case_insensitive(self):
+        api.SAS_RUNTIME_CONFIG['client_signature_certonly_callsigns'] = ['bh6fwe']
+        ok, _ = api.app_signature_exempt('BH6FWE', 'x')
+        self.assertTrue(ok)
+        ok2, _ = api.app_signature_exempt('bh6fwe', 'x')
+        self.assertTrue(ok2)
+
+    def test_certonly_key_in_defaults(self):
+        self.assertIn('client_signature_certonly_callsigns', api.DEFAULT_SAS_RUNTIME_CONFIG)
+
     def test_defaults_present_in_config_template(self):
         for k in ('client_signature_exempt_callsigns', 'client_signature_exempt_prefixes'):
             self.assertIn(k, api.DEFAULT_SAS_RUNTIME_CONFIG)
