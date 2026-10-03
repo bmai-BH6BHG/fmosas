@@ -12,7 +12,7 @@
   curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-install.sh | bash -s -- --scan-only
 
 卸载:
-  curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninstall-bas.sh | sudo bash
+  curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-uninstall.sh | sudo bash
   彻底删除加 --purge
 
 装完的入口:

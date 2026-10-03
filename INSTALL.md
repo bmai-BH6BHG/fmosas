@@ -41,8 +41,8 @@ curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-in
 卸载：
 
 ```bash
-curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninstall-bas.sh | sudo bash            # 保留数据
-curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninstall-bas.sh | sudo bash -s -- --purge  # 彻底删除
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-uninstall.sh | sudo bash            # 保留数据
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-uninstall.sh | sudo bash -s -- --purge  # 彻底删除
 ```
 
 > **身份控制默认是 `warn` 模式**：逐包核对身份、可疑事件全部留证并进入「待审救援」队列，

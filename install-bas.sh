@@ -315,6 +315,6 @@ echo "  首次使用：EMQX → 认证(Authentication) → HTTP 认证，URL 填
 echo "            http://<本机IP>:$SUBSYS_PORT/auth （注意是「认证」不是「授权」）"
 echo "  日志     : journalctl -u ${SVC:-fmo-subsystem} -f"
 echo "  再跑一次 : 可安全重跑（幂等）"
-echo "  卸载     : curl -fsSL $BASE_URL/uninstall-bas.sh | sudo bash"
+echo "  卸载     : curl -fsSL $BASE_URL/bas-uninstall.sh | sudo bash"
 echo "======================================"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

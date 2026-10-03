@@ -115,13 +115,19 @@ jobs:
           TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
         run: |
           set -e
-          # 注意：GitHub Release 会把资产名里的 "bas/" 前缀压平，导致 bas-install.sh 变成
-          # install.sh 与主脚本撞名、且 /download/bas/xxx 取不到。因此这里显式用扁平名：
-          #   bas-install.sh / bas-uninstall.sh / bas-migrate.py / bas-emqx-auth.py / bas-version.txt
-          [ -f out/bas/install-bas.sh ]   && gh release upload "$TAG" out/bas/install-bas.sh#bas-install.sh   --clobber
-          [ -f out/bas/uninstall-bas.sh ] && gh release upload "$TAG" out/bas/uninstall-bas.sh#bas-uninstall.sh --clobber
-          [ -f out/bas/bas_migrate.py ]   && gh release upload "$TAG" out/bas/bas_migrate.py#bas-migrate.py   --clobber
-          [ -f out/bas/bas_emqx_auth.py ] && gh release upload "$TAG" out/bas/bas_emqx_auth.py#bas-emqx-auth.py --clobber
-          [ -f out/bas/VERSION ]          && gh release upload "$TAG" out/bas/VERSION#bas-version.txt        --clobber
+          # GitHub Release 会把资产名里的 "bas/" 前缀压平（bas/install-bas.sh → install-bas.sh，
+          # 与主 install.sh 撞名且 /download/bas/xxx 取不到），且 gh 的 "src#新名" 语法不生效。
+          # 因此先在 staging 目录里改成目标名，再逐个上传。
+          mkdir -p up
+          cp out/bas/install-bas.sh    up/bas-install.sh
+          cp out/bas/uninstall-bas.sh  up/bas-uninstall.sh
+          cp out/bas/bas_migrate.py    up/bas-migrate.py
+          cp out/bas/bas_emqx_auth.py  up/bas-emqx-auth.py
+          cp out/bas/VERSION           up/bas-version.txt
+          ls -l up/
+          for f in up/*; do
+            echo "上传 $f"
+            gh release upload "$TAG" "$f" --clobber
+          done
           echo "--- 复核 BAS 资产 ---"
           gh release view "$TAG" --json assets -q '.assets[].name' | grep '^bas-' || true
