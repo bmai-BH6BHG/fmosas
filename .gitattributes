@@ -1,0 +1,9 @@
+# 强制 shell 脚本在仓库里始终是 LF：这些文件在 Linux 上直接执行，
+# CRLF 会导致 "bad interpreter: /usr/bin/env bash^M" 之类的启动失败。
+*.sh            text eol=lf
+*.service       text eol=lf
+*.py            text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.txt           text eol=lf
+.gitattributes  text eol=lf

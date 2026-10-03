@@ -1,0 +1,20 @@
+# FMO 分系统 发布版本信息（构建时由 build_release.sh 读取）
+# VERSION          : 发布版本号，会写入 install.sh 与打包文件名
+# RELEASE_BASE_URL : 分发根地址，install.sh 从这里下载包与校验文件
+#                    当前用 GitHub Release 的 latest/download 固定入口：
+#                      https://github.com/bmai-BH6BHG/fmosas/releases/latest/download
+#                    ★ 它永远指向最新一次 Release，发新版本不用改这里。
+#                    备选写法（可选）：
+#                      固定版本：https://github.com/bmai-BH6BHG/fmosas/releases/download/v1.0.0
+#                      对象存储：https://your-bucket.oss-cn-hangzhou.aliyuncs.com/fmo-deploy
+#                    改完执行 bash build_release.sh 重新打包，地址会被注入包内 install.sh
+VERSION=1.0.0
+RELEASE_BASE_URL=https://github.com/bmai-BH6BHG/fmosas/releases/latest/download
+
+# 部署后 install.sh 的可选环境变量（默认全自动，无需任何参数）：
+#   FMO_BASE_URL  覆盖下载根地址（仅当分发地址变更时使用）
+#   FMO_DIR       覆盖安装目录（默认 /opt/fmo-subsystem 或可写回退目录）
+#   FMO_PORT      覆盖公网 API 端口（默认 35928，管理端口自动为端口+1）
+#   FMO_DOMAIN    覆盖对外域名（默认取本机 IP，用于数据库命名与上报）
+#   FMO_MASTER    覆盖总系统地址（默认沿用 config.json 内的 master_url）
+#   FMO_NO_SERVICE=1  只解压部署，不注册开机自启服务

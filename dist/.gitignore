@@ -1,0 +1,9 @@
+# dist/ 目录说明：
+#   VERSION 是版本/分发地址定义文件，属于源文件，必须入库；
+#   下面显式列出 build_release.sh 生成的构建产物，只忽略它们，
+#   不使用 "*"（否则会把 dist/ 目录本身一并忽略，导致 !VERSION 反选失效）。
+/fmo-subsystem-*.tar.gz
+/fmo-subsystem-*.tar.gz.sha256
+/checksums.txt
+/MANIFEST.txt
+/_staging/

@@ -1,0 +1,80 @@
+# FMO 分系统部署包 .gitignore
+# 用户数据库（敏感数据，不提交）
+users.db
+users.db-journal
+users.db-wal
+users.db-shm
+
+# 域名前缀命名的数据库（运行时自动生成，如 bh6bhg.synology.me_users.db）
+*_users.db
+*_sas.db
+*_users.db-journal
+*_users.db-wal
+*_users.db-shm
+*_sas.db-journal
+*_sas.db-wal
+*_sas.db-shm
+voice.db
+voice.db-journal
+voice.db-wal
+voice.db-shm
+
+# CA 证书与私钥（ca_private.json 含私钥，绝不能提交）
+ca/
+# 信任链运行时数据
+roots/
+
+# 上传的证书图片（用户隐私数据，不提交）
+uploads/*
+# 但保留 uploads 目录本身
+!uploads/.gitkeep
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+venv/
+env/
+.venv/
+ENV/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+logs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.old
+
+# 发布构建产物（build_release.sh 生成，不入库；dist/VERSION 等源文件不受影响）
+dist/*.tar.gz
+dist/*.tar.gz.sha256
+dist/checksums.txt
+dist/MANIFEST.txt
+dist/_staging/
+dist/release-upload/
+# 明确保留版本/分发地址定义文件
+!dist/VERSION
+!dist/.gitignore
+
+# 运行期数据库（含用户数据，不入库）
+sas.db
+sas.db-journal
+sas.db-wal
+sas.db-shm

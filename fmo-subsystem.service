@@ -1,0 +1,18 @@
+[Unit]
+Description=FMO Subsystem API Server (前后端分离版)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fmo-subsystem
+ExecStart=/usr/bin/python3 -u /opt/fmo-subsystem/api_server.py --port 35928
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# 环境变量（可选）
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

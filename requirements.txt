@@ -1,0 +1,10 @@
+# FMO 分系统后端 API 服务依赖
+# ==========================================
+# 唯一第三方依赖：cryptography
+#   （cert_gen.py / sas_server.py 的 Ed25519 证书签发与签名验证）
+# 其余全部使用 Python 3 标准库（http.server / sqlite3 / json /
+# hashlib / uuid / base64 / threading / urllib 等）。
+#
+# Python 版本: Python 3.7+
+# 安装: pip install -r requirements.txt
+cryptography>=41.0

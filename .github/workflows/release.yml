@@ -1,0 +1,101 @@
+name: release
+
+# 触发方式（任选其一）：
+#   1) 打标签自动发版：git tag v1.0.0 && git push origin v1.0.0
+#   2) 手动作业：仓库 Actions 页面 → release → Run workflow
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号（不带 v，例如 1.0.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 计算版本号与分发地址
+        id: ver
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base=https://github.com/${{ github.repository }}/releases/latest/download" >> "$GITHUB_OUTPUT"
+          echo "版本号: $VERSION"
+
+      - name: 写入版本号
+        run: |
+          set -e
+          python3 - "${{ steps.ver.outputs.version }}" <<'PY'
+          import io, re, sys
+          ver = sys.argv[1]
+          p = 'dist/VERSION'
+          t = io.open(p, encoding='utf-8').read()
+          t = re.sub(r'(?m)^VERSION=.*$', 'VERSION=%s' % ver, t)
+          io.open(p, 'w', encoding='utf-8', newline='\n').write(t)
+          PY
+          grep -E '^(VERSION|RELEASE_BASE_URL)=' dist/VERSION
+
+      - name: 校验 shell 语法
+        run: bash -n install.sh uninstall.sh build_release.sh
+
+      - name: 打包（自动注入 GitHub 分发地址与版本号）
+        run: bash build_release.sh '${{ steps.ver.outputs.base }}'
+
+      - name: 组装 Release 资产
+        id: assets
+        run: |
+          set -e
+          mkdir -p out
+          # dist/release-upload/ 是给静态站/对象存储用的上传文件夹，
+          # Release 与它内容相同，直接复用；另加留档文件。
+          cp -a dist/release-upload/. out/
+          cp -a dist/MANIFEST.txt dist/checksums.txt out/ 2>/dev/null || true
+          ls -l out/
+          echo "--- 资产 sha256 校验 ---"
+          (cd out && sha256sum -c fmo-subsystem-1.*.tar.gz.sha256 && sha256sum -c fmo-subsystem.tar.gz.sha256)
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: FMO 分系统 v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            一键安装（Linux / 群晖）：
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
+            ```
+
+            一键卸载（默认保留数据）：
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/uninstall.sh | sudo bash
+            ```
+
+            详细说明见仓库内 `INSTALL.md`。
+          files: |
+            out/install.sh
+            out/uninstall.sh
+            out/fmo-subsystem-*.tar.gz
+            out/fmo-subsystem-*.tar.gz.sha256
+            out/fmo-subsystem.tar.gz
+            out/fmo-subsystem.tar.gz.sha256
+            out/VERSION
+            out/MANIFEST.txt
+            out/checksums.txt

@@ -1,0 +1,2492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FMO 用户监控后台（分系统）</title>
+<style>
+    /* ============ 主题变量（统一深色科技风格） ============ */
+    :root {
+        --bg-base: #0a0e1a;
+        --bg-card: rgba(13, 27, 42, 0.6);
+        --bg-card-solid: #0d1b2a;
+        --bg-deep: #1b263b;
+        --neon: #00e5ff;
+        --neon-soft: #00b4ff;
+        --neon-deep: #0077b6;
+        --online: #00ff9d;
+        --danger: #ff4d6d;
+        --warn: #ffb84d;
+        --text: #c5d0e6;
+        --text-dim: #6c7a96;
+        --border: rgba(0, 180, 255, 0.15);
+        --border-strong: rgba(0, 180, 255, 0.3);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        background: #0a0e1a;
+        color: #c5d0e6;
+        font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        min-height: 100vh;
+        background-image:
+            radial-gradient(circle at 20% 20%, rgba(0, 180, 255, 0.08) 0%, transparent 40%),
+            radial-gradient(circle at 80% 80%, rgba(0, 255, 180, 0.06) 0%, transparent 40%);
+    }
+    .header {
+        background: linear-gradient(90deg, #0d1b2a, #1b263b);
+        border-bottom: 2px solid #00b4ff;
+        padding: 20px 30px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        box-shadow: 0 2px 20px rgba(0, 180, 255, 0.2);
+    }
+    .header h1 {
+        color: #00e5ff;
+        font-size: 22px;
+        letter-spacing: 2px;
+        text-shadow: 0 0 10px rgba(0, 229, 255, 0.5);
+    }
+    .header .subtitle {
+        color: #6c7a96;
+        font-size: 12px;
+        margin-top: 4px;
+    }
+    .stats-bar {
+        display: flex;
+        gap: 20px;
+    }
+    .stat-card {
+        background: rgba(0, 180, 255, 0.08);
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        border-radius: 8px;
+        padding: 12px 20px;
+        text-align: center;
+        min-width: 110px;
+    }
+    .stat-card .label {
+        font-size: 12px;
+        color: #6c7a96;
+        margin-bottom: 4px;
+    }
+    .stat-card .value {
+        font-size: 26px;
+        font-weight: bold;
+        color: #00e5ff;
+    }
+    .stat-card.online .value { color: #00ff9d; }
+    .container {
+        padding: 24px 30px;
+    }
+    .table-wrap {
+        background: rgba(13, 27, 42, 0.6);
+        border: 1px solid rgba(0, 180, 255, 0.15);
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    th {
+        background: rgba(0, 180, 255, 0.1);
+        color: #00e5ff;
+        padding: 14px 16px;
+        text-align: left;
+        font-size: 13px;
+        letter-spacing: 1px;
+        border-bottom: 1px solid rgba(0, 180, 255, 0.2);
+    }
+    td {
+        padding: 12px 16px;
+        border-bottom: 1px solid rgba(108, 122, 150, 0.1);
+        font-size: 13px;
+        vertical-align: middle;
+    }
+    tr:hover td { background: rgba(0, 180, 255, 0.05); }
+    .status-dot {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 6px;
+        vertical-align: middle;
+    }
+    .status-dot.online {
+        background: #00ff9d;
+        box-shadow: 0 0 8px #00ff9d;
+        animation: pulse 1.5s infinite;
+    }
+    .status-dot.offline { background: #ff4d6d; box-shadow: 0 0 6px rgba(255, 77, 109, 0.5); }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    .status-text { font-size: 12px; vertical-align: middle; }
+    .status-text.online { color: #00ff9d; }
+    .status-text.offline { color: #ff4d6d; }
+    .thumb {
+        width: 48px;
+        height: 48px;
+        object-fit: cover;
+        border-radius: 6px;
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        cursor: pointer;
+        transition: transform 0.2s;
+        background: #1b263b;
+    }
+    .thumb:hover { transform: scale(1.8); border-color: #00e5ff; }
+    .thumb-group { display: flex; gap: 8px; }
+    .callsign { color: #ffb84d; font-weight: bold; letter-spacing: 1px; }
+    .empty {
+        text-align: center;
+        padding: 60px;
+        color: #6c7a96;
+        font-size: 14px;
+    }
+    .footer {
+        text-align: center;
+        padding: 20px;
+        color: #6c7a96;
+        font-size: 11px;
+    }
+    .refresh-indicator {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #00ff9d;
+        margin-right: 6px;
+        animation: pulse 2s infinite;
+    }
+    .reg-form-wrap {
+        background: rgba(13, 27, 42, 0.6);
+        border: 1px solid rgba(0, 180, 255, 0.15);
+        border-radius: 10px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+    }
+    .reg-form-wrap h2 {
+        color: #00e5ff;
+        font-size: 16px;
+        margin-bottom: 16px;
+        letter-spacing: 1px;
+    }
+    .reg-row {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+    }
+    .reg-row input[type="text"], .reg-row input[type="password"] {
+        flex: 1;
+        min-width: 120px;
+        padding: 10px 14px;
+        background: #0a0e1a;
+        border: 1px solid rgba(0, 180, 255, 0.2);
+        border-radius: 6px;
+        color: #c5d0e6;
+        font-size: 13px;
+    }
+    .reg-row input:focus {
+        outline: none;
+        border-color: #00b4ff;
+    }
+    .file-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 16px;
+        background: rgba(0, 180, 255, 0.1);
+        border: 1px dashed rgba(0, 180, 255, 0.4);
+        border-radius: 6px;
+        color: #6c7a96;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    .file-label:hover {
+        border-color: #00e5ff;
+        color: #00e5ff;
+    }
+    .file-label input[type="file"] {
+        display: none;
+    }
+    #reg-btn {
+        padding: 10px 28px;
+        background: linear-gradient(135deg, #00b4ff, #0077b6);
+        border: none;
+        border-radius: 6px;
+        color: #fff;
+        font-size: 14px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: opacity 0.2s;
+    }
+    #reg-btn:hover { opacity: 0.85; }
+    #reg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #reg-result {
+        margin-top: 8px;
+        font-size: 13px;
+    }
+    #reg-result.ok { color: #00ff9d; }
+    #reg-result.err { color: #ff4d6d; }
+    /* 后端 API 地址配置条 */
+    .api-config-bar {
+        background: linear-gradient(90deg, #1b263b, #0d1b2a);
+        border-bottom: 1px solid rgba(0, 180, 255, 0.25);
+        padding: 12px 30px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+    }
+    .api-config-bar label {
+        color: #00e5ff;
+        font-size: 13px;
+        letter-spacing: 1px;
+    }
+    .api-config-bar input[type="text"] {
+        flex: 1;
+        min-width: 280px;
+        padding: 8px 14px;
+        background: #0a0e1a;
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        border-radius: 6px;
+        color: #c5d0e6;
+        font-size: 13px;
+        font-family: 'Consolas', 'Courier New', monospace;
+    }
+    .api-config-bar input:focus {
+        outline: none;
+        border-color: #00b4ff;
+    }
+    .api-config-bar button {
+        padding: 8px 20px;
+        background: linear-gradient(135deg, #00b4ff, #0077b6);
+        border: none;
+        border-radius: 6px;
+        color: #fff;
+        font-size: 13px;
+        font-weight: bold;
+        cursor: pointer;
+    }
+    .api-config-bar button:hover { opacity: 0.85; }
+    .api-config-bar .hint {
+        color: #6c7a96;
+        font-size: 11px;
+    }
+    .api-config-bar .status-tag {
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: bold;
+    }
+    .api-config-bar .status-tag.ok { background: rgba(0, 255, 157, 0.15); color: #00ff9d; border: 1px solid #00ff9d; }
+    .api-config-bar .status-tag.err { background: rgba(255, 77, 109, 0.15); color: #ff4d6d; border: 1px solid #ff4d6d; }
+
+    /* ============ 顶部导航栏 ============ */
+    .nav-bar {
+        background: linear-gradient(90deg, #0d1b2a, #1b263b);
+        border-bottom: 1px solid rgba(0, 180, 255, 0.25);
+        padding: 0 30px;
+        display: flex;
+        gap: 4px;
+        box-shadow: 0 2px 12px rgba(0, 180, 255, 0.1);
+    }
+    .nav-tab {
+        padding: 14px 28px;
+        color: #6c7a96;
+        font-size: 14px;
+        font-weight: bold;
+        letter-spacing: 1px;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        transition: all 0.2s;
+        user-select: none;
+    }
+    .nav-tab:hover {
+        color: #00e5ff;
+        background: rgba(0, 180, 255, 0.05);
+    }
+    .nav-tab.active {
+        color: #00e5ff;
+        border-bottom-color: #00e5ff;
+        text-shadow: 0 0 8px rgba(0, 229, 255, 0.4);
+    }
+
+    /* ============ SAS 卡片 ============ */
+    .sas-card {
+        background: rgba(13, 27, 42, 0.6);
+        border: 1px solid rgba(0, 180, 255, 0.15);
+        border-radius: 10px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+        backdrop-filter: blur(6px);
+    }
+    .sas-card h2 {
+        color: #00e5ff;
+        font-size: 16px;
+        margin-bottom: 16px;
+        letter-spacing: 1px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .sas-card h2 .sub {
+        color: #6c7a96;
+        font-size: 12px;
+        font-weight: normal;
+        letter-spacing: 0;
+    }
+    .sas-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+    }
+    .info-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 0;
+        border-bottom: 1px solid rgba(108, 122, 150, 0.1);
+        font-size: 13px;
+    }
+    .info-row:last-child { border-bottom: none; }
+    .info-row .k { color: #6c7a96; }
+    .info-row .v { color: #c5d0e6; font-family: 'Consolas', 'Courier New', monospace; word-break: break-all; text-align: right; }
+    .info-row .v.neon { color: #00e5ff; }
+    .info-row .v.online { color: #00ff9d; }
+    .info-row .v.danger { color: #ff4d6d; }
+    .info-row .v.warn { color: #ffb84d; }
+
+    /* ============ 表单元素 ============ */
+    .sas-field { margin-bottom: 12px; }
+    .sas-field > label {
+        display: block;
+        color: #6c7a96;
+        font-size: 12px;
+        margin-bottom: 6px;
+        letter-spacing: 1px;
+    }
+    .sas-input, .sas-textarea, .sas-select {
+        width: 100%;
+        padding: 10px 14px;
+        background: #0a0e1a;
+        border: 1px solid rgba(0, 180, 255, 0.2);
+        border-radius: 6px;
+        color: #c5d0e6;
+        font-size: 13px;
+        font-family: 'Consolas', 'Courier New', monospace;
+        transition: border-color 0.2s;
+    }
+    .sas-input:focus, .sas-textarea:focus, .sas-select:focus {
+        outline: none;
+        border-color: #00b4ff;
+    }
+    .sas-textarea {
+        min-height: 120px;
+        resize: vertical;
+        line-height: 1.5;
+    }
+    .sas-btn {
+        padding: 10px 22px;
+        background: linear-gradient(135deg, #00b4ff, #0077b6);
+        border: none;
+        border-radius: 6px;
+        color: #fff;
+        font-size: 13px;
+        font-weight: bold;
+        cursor: pointer;
+        letter-spacing: 1px;
+        transition: opacity 0.2s, transform 0.1s;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .sas-btn:hover { opacity: 0.85; }
+    .sas-btn:active { transform: scale(0.97); }
+    .sas-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .sas-btn.danger { background: linear-gradient(135deg, #ff4d6d, #c9184a); }
+    .sas-btn.warn { background: linear-gradient(135deg, #ffb84d, #ff8c00); color: #1b1b1b; }
+    .sas-btn.ghost {
+        background: rgba(0, 180, 255, 0.08);
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        color: #00e5ff;
+    }
+    .sas-btn.ghost:hover { background: rgba(0, 180, 255, 0.15); }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+    /* ============ 开关 ============ */
+    .switch {
+        position: relative;
+        display: inline-block;
+        width: 46px;
+        height: 24px;
+        vertical-align: middle;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+        position: absolute;
+        cursor: pointer;
+        inset: 0;
+        background: #1b263b;
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        border-radius: 24px;
+        transition: 0.3s;
+    }
+    .switch .slider:before {
+        content: "";
+        position: absolute;
+        height: 18px;
+        width: 18px;
+        left: 2px;
+        top: 2px;
+        background: #6c7a96;
+        border-radius: 50%;
+        transition: 0.3s;
+    }
+    .switch input:checked + .slider { background: rgba(0, 229, 255, 0.25); border-color: #00e5ff; }
+    .switch input:checked + .slider:before { transform: translateX(22px); background: #00e5ff; box-shadow: 0 0 8px #00e5ff; }
+    .switch-label { display: flex; align-items: center; gap: 10px; color: #c5d0e6; font-size: 13px; }
+
+    /* ============ 白名单标签 ============ */
+    .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+    .tag-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 10px;
+        background: rgba(0, 180, 255, 0.1);
+        border: 1px solid rgba(0, 180, 255, 0.3);
+        border-radius: 16px;
+        color: #00e5ff;
+        font-size: 12px;
+        font-family: 'Consolas', 'Courier New', monospace;
+    }
+    .tag-item .x {
+        cursor: pointer;
+        color: #ff4d6d;
+        font-weight: bold;
+        font-size: 14px;
+        line-height: 1;
+    }
+    .tag-item .x:hover { color: #fff; }
+    .tag-empty { color: #6c7a96; font-size: 12px; font-style: italic; }
+
+    /* ============ JSON / 证书查看器 ============ */
+    .json-viewer {
+        background: #06080f;
+        border: 1px solid rgba(0, 180, 255, 0.2);
+        border-radius: 6px;
+        padding: 12px 14px;
+        font-family: 'Consolas', 'Courier New', monospace;
+        font-size: 12px;
+        color: #c5d0e6;
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 320px;
+        overflow: auto;
+        line-height: 1.5;
+    }
+    .cert-block { margin-bottom: 14px; }
+    .cert-block .cert-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 6px;
+    }
+    .cert-block .cert-title {
+        color: #ffb84d;
+        font-size: 13px;
+        font-weight: bold;
+        letter-spacing: 1px;
+    }
+
+    /* ============ 模态框 ============ */
+    .modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(5, 8, 15, 0.75);
+        backdrop-filter: blur(4px);
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal-box {
+        background: linear-gradient(135deg, #0d1b2a, #1b263b);
+        border: 1px solid #00b4ff;
+        border-radius: 12px;
+        padding: 24px 28px;
+        min-width: 340px;
+        max-width: 90vw;
+        box-shadow: 0 0 40px rgba(0, 180, 255, 0.3);
+        animation: modalIn 0.2s ease;
+    }
+    @keyframes modalIn {
+        from { transform: scale(0.9); opacity: 0; }
+        to { transform: scale(1); opacity: 1; }
+    }
+    .modal-box h3 {
+        color: #00e5ff;
+        font-size: 16px;
+        margin-bottom: 12px;
+        letter-spacing: 1px;
+    }
+    .modal-box .modal-body {
+        color: #c5d0e6;
+        font-size: 13px;
+        line-height: 1.7;
+        margin-bottom: 20px;
+        white-space: pre-wrap;
+    }
+    .modal-box .modal-body.warn { color: #ffb84d; }
+    .modal-box .modal-foot { display: flex; justify-content: flex-end; gap: 10px; }
+
+    /* ============ Toast ============ */
+    .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 1100;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 360px;
+    }
+    .toast {
+        padding: 12px 18px;
+        border-radius: 8px;
+        font-size: 13px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+        animation: toastIn 0.25s ease;
+        border-left: 4px solid;
+        background: #0d1b2a;
+        color: #c5d0e6;
+        word-break: break-all;
+    }
+    @keyframes toastIn {
+        from { transform: translateX(40px); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
+    .toast.ok { border-left-color: #00ff9d; }
+    .toast.err { border-left-color: #ff4d6d; }
+    .toast.warn { border-left-color: #ffb84d; }
+    .toast.info { border-left-color: #00b4ff; }
+    .toast .t-title { font-weight: bold; margin-bottom: 2px; }
+    .toast.ok .t-title { color: #00ff9d; }
+    .toast.err .t-title { color: #ff4d6d; }
+    .toast.warn .t-title { color: #ffb84d; }
+    .toast.info .t-title { color: #00e5ff; }
+
+    /* ============ loading ============ */
+    .loading { color: #6c7a96; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .spinner {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(0, 180, 255, 0.2);
+        border-top-color: #00e5ff;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ============ 同步状态节点 ============ */
+    .peer-list { display: flex; flex-direction: column; gap: 8px; }
+    .peer-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 14px;
+        background: rgba(0, 180, 255, 0.05);
+        border: 1px solid rgba(0, 180, 255, 0.15);
+        border-radius: 6px;
+        font-size: 13px;
+    }
+    .peer-item .peer-addr { color: #00e5ff; font-family: 'Consolas', 'Courier New', monospace; }
+    .peer-item .peer-state { font-size: 12px; }
+
+    /* ============ 语音监控瀑布图 ============ */
+    .mon-bar {
+        display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+        background: rgba(10, 16, 32, 0.85);
+        border: 1px solid rgba(0, 180, 255, 0.2);
+        border-radius: 10px; padding: 10px 16px; margin-bottom: 12px;
+        color: #c7d3ea; font-size: 13px;
+    }
+    .mon-dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: #ff4d6d; display: inline-block;
+    }
+    .mon-dot.ok { background: #00e676; box-shadow: 0 0 8px #00e676; }
+    .mon-dot.warn { background: #ffc400; box-shadow: 0 0 8px #ffc400; }
+    .mon-chk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .mon-main { display: flex; gap: 12px; align-items: stretch; }
+    .mon-wf-wrap {
+        flex: 1; min-width: 0;
+        background: #05070f;
+        border: 1px solid rgba(0, 180, 255, 0.25);
+        border-radius: 10px; overflow: hidden;
+    }
+    #wf { display: block; width: 100%; height: 460px; cursor: crosshair; }
+    .mon-side {
+        width: 250px; flex-shrink: 0;
+        background: rgba(10, 16, 32, 0.85);
+        border: 1px solid rgba(0, 180, 255, 0.2);
+        border-radius: 10px; padding: 12px 14px;
+        display: flex; flex-direction: column; gap: 8px;
+        max-height: 460px; overflow-y: auto;
+    }
+    .mon-side-title {
+        color: #00e5ff; font-size: 12px; letter-spacing: 1px;
+        border-bottom: 1px solid rgba(0, 180, 255, 0.15);
+        padding-bottom: 6px; margin-top: 4px;
+    }
+    .mon-now { color: #e8f1ff; font-size: 14px; min-height: 20px; }
+    .mon-now .playing { color: #00e676; }
+    .mon-beacons { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+    .mon-beacon {
+        background: rgba(0, 180, 255, 0.06);
+        border: 1px solid rgba(0, 180, 255, 0.12);
+        border-radius: 6px; padding: 6px 8px; color: #c7d3ea;
+    }
+    .mon-beacon b { color: #00e5ff; }
+    .mon-beacon .t { color: #6c7a96; float: right; }
+    @media (max-width: 900px) {
+        .mon-main { flex-direction: column; }
+        .mon-side { width: 100%; max-height: 220px; }
+    }
+
+    /* ============ 响应式 ============ */
+    @media (max-width: 768px) {
+        .header { flex-direction: column; gap: 14px; padding: 16px 16px; }
+        .stats-bar { flex-wrap: wrap; justify-content: center; }
+        .nav-bar { padding: 0 8px; overflow-x: auto; }
+        .nav-tab { padding: 12px 18px; font-size: 13px; }
+        .container { padding: 16px 12px; }
+        .sas-grid { grid-template-columns: 1fr; }
+        .reg-row { flex-direction: column; align-items: stretch; }
+        .reg-row input[type="text"], .reg-row input[type="password"] { min-width: 100%; }
+        .toast-container { left: 12px; right: 12px; max-width: none; }
+    }
+</style>
+</head>
+<body>
+<div class="header">
+    <div>
+        <h1>⚡ FMO 用户监控后台</h1>
+        <div class="subtitle">业余无线电用户管理系统 · 分系统</div>
+    </div>
+    <div class="stats-bar">
+        <div class="stat-card">
+            <div class="label">总用户数</div>
+            <div class="value" id="stat-total">0</div>
+        </div>
+        <div class="stat-card online">
+            <div class="label">当前在线</div>
+            <div class="value" id="stat-online">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="label"><span class="refresh-indicator"></span>自动刷新</div>
+            <div class="value" style="font-size:14px;">5s</div>
+        </div>
+    </div>
+</div>
+
+<!-- ============ 顶部导航栏 ============ -->
+<div class="nav-bar">
+    <div class="nav-tab active" data-page="register">注册系统</div>
+    <div class="nav-tab" data-page="sas">SAS 配置</div>
+    <div class="nav-tab" data-page="monitor">语音监控</div>
+</div>
+
+<!-- ============ 页面：注册系统（现有内容） ============ -->
+<div id="page-register" class="page">
+<div class="container">
+    <!-- APP 登录地址配置 -->
+    <div class="reg-form-wrap">
+        <h2>📱 APP 登录与 MQTT 地址配置</h2>
+        <div class="reg-row">
+            <label style="min-width:100px;color:#6c7a96;">登录域名</label>
+            <input type="text" id="cfg-app-domain" placeholder="例如 register.example.com">
+        </div>
+        <div class="reg-row">
+            <label style="min-width:100px;color:#6c7a96;">端口</label>
+            <input type="text" id="cfg-app-port" placeholder="例如 35928" style="flex:0.3;min-width:80px;">
+            <label style="color:#6c7a96;display:flex;align-items:center;gap:6px;">
+                <input type="checkbox" id="cfg-use-port" checked> 地址中包含端口
+            </label>
+            <button id="cfg-save-btn">保存配置</button>
+        </div>
+        <div class="reg-row">
+            <label style="min-width:100px;color:#6c7a96;">APP 登录地址</label>
+            <span id="cfg-preview" style="color:#00e5ff;font-size:16px;font-weight:bold;">未配置</span>
+        </div>
+        <div class="reg-row">
+            <label style="min-width:100px;color:#6c7a96;">MQTT 地址</label>
+            <input type="text" id="cfg-mqtt-host" placeholder="例如 127.0.0.1 或 broker.example.com">
+            <input type="text" id="cfg-mqtt-port" placeholder="1883" style="flex:0.3;min-width:80px;">
+        </div>
+        <div class="reg-row">
+            <span style="color:#5a6a86;font-size:12px;">保存后此地址自动上报总系统，作为总系统分系统卡片与 APP 服务器列表中本机的地址，无需手改 config.json。MQTT 为语音/信标抄收连接地址，保存后立即重连生效。</span>
+        </div>
+        <div id="cfg-result"></div>
+    </div>
+
+    <!-- 手动注册表单 -->
+    <div class="reg-form-wrap">
+        <h2>手动添加用户</h2>
+        <form id="reg-form" enctype="multipart/form-data">
+            <div class="reg-row">
+                <input type="text" id="reg-name" name="name" placeholder="姓名" required>
+                <input type="text" id="reg-callsign" name="callsign" placeholder="呼号" required>
+                <input type="text" id="reg-phone" name="phone" placeholder="手机号" required>
+                <input type="password" id="reg-password" name="password" placeholder="密码" required>
+            </div>
+            <div class="reg-row">
+                <label class="file-label">操作证书 <input type="file" name="cert_photo" accept="image/*"></label>
+                <label class="file-label">设备证书 <input type="file" name="device_cert" accept="image/*"></label>
+                <button type="submit" id="reg-btn">添加用户</button>
+            </div>
+        </form>
+        <div id="reg-result"></div>
+    </div>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th style="width:50px;">ID</th>
+                    <th>姓名</th>
+                    <th>呼号</th>
+                    <th>手机号</th>
+                    <th>注册时间</th>
+                    <th>最后心跳</th>
+                    <th>状态</th>
+                    <th>证书</th>
+                    <th>操作</th>
+                    <th>操作证书</th>
+                    <th>设备证书</th>
+                </tr>
+            </thead>
+            <tbody id="user-tbody">
+                <tr><td colspan="11" class="empty">加载中...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+</div>
+
+<!-- ============ 页面：SAS 配置 ============ -->
+<div id="page-sas" class="page" style="display:none;">
+<div class="container">
+
+    <!-- 模块A：CA 管理 -->
+    <div class="sas-card">
+        <h2>🔐 CA 管理 <span class="sub">本地 Root CA / Int CA</span></h2>
+        <div id="ca-info-area" class="loading"><span class="spinner"></span>正在加载 CA 信息...</div>
+        <div class="btn-row" style="margin-top:16px;">
+            <button class="sas-btn" id="ca-init-btn">初始化 CA</button>
+            <button class="sas-btn warn" id="ca-renew-btn">轮换 CA</button>
+            <button class="sas-btn ghost" id="ca-refresh-btn">刷新信息</button>
+        </div>
+    </div>
+
+    <!-- 模块B：证书签发 -->
+    <div class="sas-card">
+        <h2>📜 证书签发 <span class="sub">为呼号签发用户证书与设备密钥</span></h2>
+        <div class="sas-grid">
+            <div class="sas-field">
+                <label>呼号 (callsign)</label>
+                <input type="text" class="sas-input" id="issue-callsign" placeholder="例如 BH1ACG（4-10 位大写字母/数字）">
+            </div>
+            <div class="sas-field">
+                <label>UID（可选，留空自动分配）</label>
+                <input type="text" class="sas-input" id="issue-uid" placeholder="例如 1001（1-200000）">
+            </div>
+        </div>
+        <div class="btn-row">
+            <button class="sas-btn" id="issue-btn">签发证书</button>
+        </div>
+        <div id="issue-result"></div>
+        <div id="cert-output" style="margin-top:16px;"></div>
+    </div>
+
+    <!-- 模块C：信任链管理 -->
+    <div class="sas-card">
+        <h2>🔗 信任链管理 <span class="sub">信任的远程 CA 列表</span></h2>
+        <div class="table-wrap" style="margin-bottom:16px;">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:50px;">ID</th>
+                        <th>远程 CA 指纹</th>
+                        <th>CA 类型</th>
+                        <th>信任来源</th>
+                        <th>创建时间</th>
+                        <th style="width:80px;">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="trust-tbody">
+                    <tr><td colspan="6" class="empty">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="sas-field">
+            <label>添加信任 CA（粘贴远程 CA 证书 JSON）</label>
+            <textarea class="sas-textarea" id="trust-ca-json" placeholder='{"subject":"...","public_key":"...","signature":"..."}'></textarea>
+        </div>
+        <div class="sas-grid">
+            <div class="sas-field">
+                <label>CA 类型</label>
+                <select class="sas-select" id="trust-ca-type">
+                    <option value="rootCA">rootCA</option>
+                    <option value="intCA">intCA</option>
+                </select>
+            </div>
+            <div class="sas-field">
+                <label>信任来源（可选）</label>
+                <input type="text" class="sas-input" id="trust-source" placeholder="例如 manual">
+            </div>
+        </div>
+        <div class="btn-row">
+            <button class="sas-btn" id="trust-add-btn">添加信任 CA</button>
+            <button class="sas-btn ghost" id="trust-refresh-btn">刷新列表</button>
+        </div>
+    </div>
+
+    <!-- 模块D：认证规则配置 -->
+    <div class="sas-card">
+        <h2>⚙️ 认证规则配置 <span class="sub">SAS 运行时策略</span></h2>
+        <div id="sas-config-area" class="loading"><span class="spinner"></span>正在加载 SAS 配置...</div>
+
+        <div id="sas-config-form" style="display:none;margin-top:8px;">
+            <div class="sas-field">
+                <label>呼号白名单（空列表表示不限制；输入呼号后回车添加）</label>
+                <div class="tag-list" id="whitelist-tags"></div>
+                <input type="text" class="sas-input" id="whitelist-input" placeholder="输入呼号，回车添加（如 BH1ACG）">
+            </div>
+            <div class="sas-grid" style="margin-top:12px;">
+                <div class="switch-label">
+                    <label class="switch"><input type="checkbox" id="cfg-allow-all"><span class="slider"></span></label>
+                    <span>允许所有已验证证书（auto_trust_local_ca）</span>
+                </div>
+                <div class="sas-field" style="margin:0;">
+                    <label>认证模式</label>
+                    <select class="sas-select" id="cfg-auth-mode">
+                        <option value="strict">严格（require_client_signature = true）</option>
+                        <option value="loose">宽松（require_client_signature = false）</option>
+                    </select>
+                </div>
+            </div>
+            <div class="sas-grid" style="margin-top:12px;">
+                <div class="sas-field" style="margin:0;">
+                    <label>UID 范围 - 起始</label>
+                    <input type="text" class="sas-input" id="cfg-uid-start" placeholder="1">
+                </div>
+                <div class="sas-field" style="margin:0;">
+                    <label>UID 范围 - 结束</label>
+                    <input type="text" class="sas-input" id="cfg-uid-end" placeholder="200000">
+                </div>
+            </div>
+            <div class="btn-row" style="margin-top:16px;">
+                <button class="sas-btn" id="sas-save-btn">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模块E：同步状态 -->
+    <div class="sas-card">
+        <h2>🔄 同步状态 <span class="sub">分布式同步引擎 · 每 10 秒自动刷新</span></h2>
+        <div id="sync-status-area" class="loading"><span class="spinner"></span>正在加载同步状态...</div>
+    </div>
+
+</div>
+</div>
+
+<!-- ============ 页面：语音监控（瀑布图） ============ -->
+<div id="page-monitor" class="page" style="display:none;">
+<div class="container">
+    <div class="mon-bar">
+        <span class="mon-dot" id="mon-dot"></span>
+        <span id="mon-state">监控未启动</span>
+        <span id="mon-stats" style="color:#6c7a96;"></span>
+        <span style="flex:1"></span>
+        <label class="mon-chk"><input type="checkbox" id="mon-autoplay" checked> 自动播放</label>
+        <label class="mon-chk">音量 <input type="range" id="mon-vol" min="0" max="100" value="80" style="width:90px;"></label>
+        <button class="sas-btn ghost" id="mon-clear">清空画布</button>
+    </div>
+    <div class="mon-main">
+        <div class="mon-wf-wrap"><canvas id="wf"></canvas></div>
+        <div class="mon-side">
+            <div class="mon-side-title">📻 正在播放</div>
+            <div id="mon-now" class="mon-now">—</div>
+            <div class="mon-side-title">🛰 信标（FMO/TELE）</div>
+            <div id="mon-beacons" class="mon-beacons"><span style="color:#6c7a96;">暂无信标</span></div>
+        </div>
+    </div>
+</div>
+</div>
+
+<div class="footer">FMO Subsystem · Powered by Python Standard Library · 数据每 5 秒自动刷新 · 由 BH6BHG 提供</div>
+
+<!-- ============ 自定义模态框 ============ -->
+<div id="modal-overlay" class="modal-overlay">
+    <div class="modal-box">
+        <h3 id="modal-title">确认</h3>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-foot">
+            <button class="sas-btn ghost" id="modal-cancel">取消</button>
+            <button class="sas-btn" id="modal-ok">确定</button>
+        </div>
+    </div>
+</div>
+
+<!-- ============ Toast 容器 ============ -->
+<div id="toast-container" class="toast-container"></div>
+
+<script>
+// 同源访问，API_BASE 始终为空
+var API_BASE = '';
+
+// 转义 HTML 防注入
+function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+}
+
+// 格式化时间
+function fmtTime(ts) {
+    if (!ts || ts === 0) return '-';
+    var d = new Date(ts * 1000);
+    var p = n => (n < 10 ? '0' : '') + n;
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+
+// 渲染缩略图（图片地址拼接 API_BASE）
+function thumb(path) {
+    if (!path) return '<span style="color:#6c7a96;font-size:11px;">无</span>';
+    return '<img class="thumb" src="/uploads/' + esc(path) + '" alt="证书" onerror="this.style.display=\'none\'">';
+}
+
+// 加载用户数据
+function loadData() {
+    fetch('/api/users')
+        .then(r => r.json())
+        .then(data => {
+            if (!data.ok) return;
+            var users = data.users || [];
+            var onlineCount = 0;
+            var tbody = document.getElementById('user-tbody');
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无注册用户</td></tr>';
+            } else {
+                tbody.innerHTML = users.map(u => {
+                    if (u.online) onlineCount++;
+                    var statusCls = u.online ? 'online' : 'offline';
+                    var statusText = u.online ? '在线' : '离线';
+                    // 证书状态列
+                    var certCell, opCell;
+                    if (u.cert_uid != null) {
+                        var fp = u.cert_fingerprint ? String(u.cert_fingerprint).substring(0, 12) + '…' : '';
+                        certCell = '<span class="status-text online" title="' + esc(u.cert_fingerprint || '') + '">已签发 UID:' + esc(u.cert_uid) + '</span>' +
+                            (fp ? '<div style="color:#6c7a96;font-size:10px;">' + esc(fp) + '</div>' : '');
+                        opCell = '<button class="sas-btn ghost" style="padding:5px 12px;font-size:12px;" onclick="downloadCertBundle(\'' + esc(u.callsign) + '\')">⬇ 证书包</button>';
+                    } else {
+                        certCell = '<span style="color:#ffb020;font-size:12px;">未签发</span>';
+                        opCell = '<button class="sas-btn" style="padding:5px 12px;font-size:12px;" onclick="issueCert(\'' + esc(u.callsign) + '\', this)">一键签发</button>';
+                    }
+                    opCell += ' <button class="sas-btn danger" style="padding:5px 12px;font-size:12px;" onclick="deleteUser(\'' + esc(u.callsign) + '\')">删除</button>';
+                    return '<tr>' +
+                        '<td>' + esc(u.id) + '</td>' +
+                        '<td>' + esc(u.name) + '</td>' +
+                        '<td class="callsign">' + esc(u.callsign) + '</td>' +
+                        '<td>' + esc(u.phone) + '</td>' +
+                        '<td>' + fmtTime(u.created_at) + '</td>' +
+                        '<td>' + fmtTime(u.last_heartbeat) + '</td>' +
+                        '<td><span class="status-dot ' + statusCls + '"></span><span class="status-text ' + statusCls + '">' + statusText + '</span></td>' +
+                        '<td>' + certCell + '</td>' +
+                        '<td>' + opCell + '</td>' +
+                        '<td>' + thumb(u.cert_photo_path) + '</td>' +
+                        '<td>' + thumb(u.device_cert_path) + '</td>' +
+                        '</tr>';
+                }).join('');
+            }
+            document.getElementById('stat-total').textContent = users.length;
+            document.getElementById('stat-online').textContent = onlineCount;
+        })
+        .catch(err => {
+            document.getElementById('user-tbody').innerHTML = '<tr><td colspan="11" class="empty">加载失败: ' + esc(err) + '</tr>';
+        });
+}
+
+// 一键签发证书（幂等：已签发则返回现有记录）
+async function issueCert(callsign, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = '签发中...'; }
+    try {
+        var data = await apiPost('/api/cert/auto-issue', { callsign: callsign });
+        if (data.ok) {
+            showToast('success', '签发成功', callsign + ' UID:' + data.uid);
+        } else {
+            showToast('error', '签发失败', data.error || '未知错误');
+            if (btn) { btn.disabled = false; btn.textContent = '一键签发'; }
+            return;
+        }
+    } catch (e) {
+        showToast('error', '签发失败', String(e));
+        if (btn) { btn.disabled = false; btn.textContent = '一键签发'; }
+        return;
+    }
+    loadData();
+}
+
+// 证书套 ZIP 一键下载（root/int/user/devicekey 四件套，管理端口内网接口）
+async function downloadCertBundle(callsign) {
+    try {
+        var resp = await fetch('/api/cert/bundle?callsign=' + encodeURIComponent(callsign));
+        if (!resp.ok) {
+            var d = await resp.json().catch(function() { return {}; });
+            showToast('error', '下载失败', d.error || ('HTTP ' + resp.status));
+            return;
+        }
+        var blob = await resp.blob();
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = callsign + '_certs.zip';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+        showToast('success', '证书包已下载', callsign + '_certs.zip（含 devicekey 私钥，请安全转交本人）');
+    } catch (e) {
+        showToast('error', '下载失败', String(e));
+    }
+}
+
+// ==================== APP 登录地址配置 ====================
+function updateConfigPreview() {
+    var domain = document.getElementById('cfg-app-domain').value.trim();
+    var port = document.getElementById('cfg-app-port').value.trim();
+    var usePort = document.getElementById('cfg-use-port').checked;
+    var preview = document.getElementById('cfg-preview');
+    if (!domain) {
+        preview.textContent = '未配置';
+        preview.style.color = '#ff4d6d';
+        return;
+    }
+    var url = domain;
+    if (usePort && port) {
+        url = domain + ':' + port;
+    }
+    preview.textContent = url;
+    preview.style.color = '#00e5ff';
+}
+
+function loadConfig() {
+    fetch('/api/config')
+        .then(r => r.json())
+        .then(data => {
+            if (!data.ok) return;
+            var cfg = data.config || {};
+            document.getElementById('cfg-app-domain').value = cfg.app_domain || '';
+            document.getElementById('cfg-app-port').value = cfg.app_port || '';
+            document.getElementById('cfg-use-port').checked = cfg.app_use_port !== false;
+            document.getElementById('cfg-mqtt-host').value = cfg.mqtt_host || '';
+            document.getElementById('cfg-mqtt-port').value = cfg.mqtt_port || '';
+            updateConfigPreview();
+        })
+        .catch(err => console.log('加载配置失败:', err));
+}
+
+document.getElementById('cfg-save-btn').addEventListener('click', async () => {
+    var btn = document.getElementById('cfg-save-btn');
+    var result = document.getElementById('cfg-result');
+    var data = {
+        app_domain: document.getElementById('cfg-app-domain').value.trim(),
+        app_port: parseInt(document.getElementById('cfg-app-port').value.trim()) || null,
+        app_use_port: document.getElementById('cfg-use-port').checked,
+        mqtt_host: document.getElementById('cfg-mqtt-host').value.trim(),
+        mqtt_port: parseInt(document.getElementById('cfg-mqtt-port').value.trim()) || null
+    };
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+    try {
+        var resp = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data)
+        });
+        var res = await resp.json();
+        if (res.ok) {
+            result.className = 'ok';
+            result.textContent = '配置已保存';
+            updateConfigPreview();
+        } else {
+            result.className = 'err';
+            result.textContent = res.error || '保存失败';
+        }
+    } catch (err) {
+        result.className = 'err';
+        result.textContent = '请求失败: ' + err.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '保存配置';
+    }
+});
+
+// 配置输入变化时实时更新预览
+['cfg-app-domain', 'cfg-app-port', 'cfg-use-port'].forEach(id => {
+    var el = document.getElementById(id);
+    el.addEventListener('input', updateConfigPreview);
+    el.addEventListener('change', updateConfigPreview);
+});
+
+// ==================== 初始化 ====================
+
+// 初始加载
+loadData();
+loadConfig();
+// 每 5 秒刷新
+setInterval(loadData, 5000);
+
+// 手动注册表单提交
+document.getElementById('reg-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    var btn = document.getElementById('reg-btn');
+    var result = document.getElementById('reg-result');
+    var form = document.getElementById('reg-form');
+    btn.disabled = true;
+    btn.textContent = '添加中...';
+    result.className = '';
+    result.textContent = '';
+    try {
+        var formData = new FormData(form);
+        var resp = await fetch('/api/register', { method: 'POST', body: formData });
+        var data = await resp.json();
+        if (data.ok) {
+            result.className = 'ok';
+            result.textContent = '用户添加成功：' + (formData.get('callsign') || '');
+            form.reset();
+            loadData();
+        } else {
+            result.className = 'err';
+            result.textContent = data.error || '添加失败';
+        }
+    } catch (err) {
+        result.className = 'err';
+        result.textContent = '请求失败: ' + err.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '添加用户';
+    }
+});
+
+// ============================================================
+//  以下为新增：导航栏切换 + 通用组件 + SAS 配置界面
+// ============================================================
+
+// ---------- 通用：Toast 通知 ----------
+var TOAST_SEQ = 0;
+function showToast(type, title, msg, duration) {
+    duration = duration || 3500;
+    var id = 'toast-' + (++TOAST_SEQ);
+    var container = document.getElementById('toast-container');
+    var div = document.createElement('div');
+    div.className = 'toast ' + type;
+    div.id = id;
+    var html = '<div class="t-title">' + esc(title) + '</div>';
+    if (msg) html += '<div>' + esc(msg) + '</div>';
+    div.innerHTML = html;
+    container.appendChild(div);
+    setTimeout(function() {
+        var el = document.getElementById(id);
+        if (el) el.parentNode.removeChild(el);
+    }, duration);
+}
+
+// ---------- 通用：自定义确认模态框 ----------
+// 用法：confirmModal({title, body, okText, danger}).then(ok => {...})
+function confirmModal(opts) {
+    opts = opts || {};
+    return new Promise(function(resolve) {
+        var overlay = document.getElementById('modal-overlay');
+        var titleEl = document.getElementById('modal-title');
+        var bodyEl = document.getElementById('modal-body');
+        var okBtn = document.getElementById('modal-ok');
+        var cancelBtn = document.getElementById('modal-cancel');
+        titleEl.textContent = opts.title || '确认操作';
+        bodyEl.textContent = opts.body || '';
+        bodyEl.className = 'modal-body' + (opts.warn ? ' warn' : '');
+        okBtn.textContent = opts.okText || '确定';
+        cancelBtn.textContent = opts.cancelText || '取消';
+        // 危险操作用红色按钮
+        okBtn.className = 'sas-btn' + (opts.danger ? ' danger' : '');
+        overlay.classList.add('show');
+
+        function cleanup() {
+            overlay.classList.remove('show');
+            okBtn.removeEventListener('click', onOk);
+            cancelBtn.removeEventListener('click', onCancel);
+            overlay.removeEventListener('click', onOverlay);
+        }
+        function onOk() { cleanup(); resolve(true); }
+        function onCancel() { cleanup(); resolve(false); }
+        function onOverlay(e) { if (e.target === overlay) { cleanup(); resolve(false); } }
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        overlay.addEventListener('click', onOverlay);
+    });
+}
+
+// ---------- 通用：JSON 美化 ----------
+function prettyJson(obj) {
+    try { return JSON.stringify(obj, null, 2); }
+    catch (e) { return String(obj); }
+}
+
+// ---------- 通用：下载文本文件 ----------
+function downloadText(filename, text) {
+    var blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 200);
+}
+
+// ---------- 通用：fetch 封装（带错误归一化） ----------
+async function apiGet(url) {
+    var resp = await fetch(url);
+    return await resp.json();
+}
+async function apiPost(url, body) {
+    var resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    return await resp.json();
+}
+async function apiDelete(url) {
+    var resp = await fetch(url, { method: 'DELETE' });
+    return await resp.json();
+}
+
+// ---------- 导航栏切换 ----------
+var _sasInited = false;
+var _syncTimer = null;
+function switchPage(page) {
+    var tabs = document.querySelectorAll('.nav-tab');
+    tabs.forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-page') === page);
+    });
+    document.getElementById('page-register').style.display = (page === 'register') ? '' : 'none';
+    document.getElementById('page-sas').style.display = (page === 'sas') ? '' : 'none';
+    document.getElementById('page-monitor').style.display = (page === 'monitor') ? '' : 'none';
+
+    if (page === 'monitor') {
+        monitorStart();
+    } else {
+        monitorStop();
+    }
+
+    if (page === 'sas') {
+        // 首次进入 SAS 页面时初始化各模块
+        if (!_sasInited) {
+            _sasInited = true;
+            loadCaInfo();
+            loadTrustList();
+            loadSasConfig();
+            loadSyncStatus();
+        }
+        // 启动同步状态自动刷新（每 10 秒）
+        if (!_syncTimer) {
+            _syncTimer = setInterval(loadSyncStatus, 10000);
+        }
+    } else {
+        // 离开 SAS 页面时暂停同步刷新，避免后台无谓请求
+        if (_syncTimer) {
+            clearInterval(_syncTimer);
+            _syncTimer = null;
+        }
+    }
+}
+document.querySelectorAll('.nav-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+        switchPage(tab.getAttribute('data-page'));
+    });
+});
+
+// ============================================================
+//  模块 A：CA 管理
+// ============================================================
+function renderCaInfo(info) {
+    var area = document.getElementById('ca-info-area');
+    if (!info) {
+        area.innerHTML = '<span style="color:#ff4d6d;">CA 信息不可用</span>';
+        return;
+    }
+    var initialized = info.initialized !== false;
+    // Root CA 字段（兼容多种命名）
+    var root = info.root_cert || info.rootCert || info.root || {};
+    var intc = info.int_cert || info.intCert || info.int || {};
+    var html = '';
+    // 状态总览
+    html += '<div class="info-row"><span class="k">初始化状态</span>' +
+        '<span class="v ' + (initialized ? 'online' : 'danger') + '">' +
+        (initialized ? '已初始化' : '未初始化') + '</span></div>';
+    html += '<div class="info-row"><span class="k">CA 名称</span>' +
+        '<span class="v neon">' + esc(info.ca_name || info.name || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">信任的远程 CA 数</span>' +
+        '<span class="v">' + esc(info.trusted_ca_count != null ? info.trusted_ca_count : '-') + '</span></div>';
+
+    // Root CA 详情
+    html += '<div style="margin-top:10px;color:#00e5ff;font-size:13px;letter-spacing:1px;">Root CA</div>';
+    html += '<div class="info-row"><span class="k">指纹</span><span class="v">' +
+        esc(root.fingerprint || root.fp || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">Subject</span><span class="v">' +
+        esc(root.subject || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">创建时间</span><span class="v">' +
+        esc(root.created_at ? fmtTime(root.created_at) : (root.not_before ? fmtTime(root.not_before) : '-')) + '</span></div>';
+    html += '<div class="info-row"><span class="k">有效期至</span><span class="v">' +
+        esc(root.not_after ? fmtTime(root.not_after) : (root.validity_years ? (root.validity_years + ' 年') : '-')) + '</span></div>';
+
+    // Int CA 详情
+    html += '<div style="margin-top:10px;color:#00e5ff;font-size:13px;letter-spacing:1px;">Int CA</div>';
+    html += '<div class="info-row"><span class="k">指纹</span><span class="v">' +
+        esc(intc.fingerprint || intc.fp || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">Subject</span><span class="v">' +
+        esc(intc.subject || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">有效期至</span><span class="v">' +
+        esc(intc.not_after ? fmtTime(intc.not_after) : (intc.validity_years ? (intc.validity_years + ' 年') : '-')) + '</span></div>';
+
+    area.innerHTML = html;
+}
+
+async function loadCaInfo() {
+    var area = document.getElementById('ca-info-area');
+    area.innerHTML = '<span class="spinner"></span>正在加载 CA 信息...';
+    area.className = 'loading';
+    try {
+        var data = await apiGet('/api/ca/info');
+        if (data.ok) {
+            renderCaInfo(data.ca || {});
+        } else {
+            area.className = '';
+            area.innerHTML = '<span style="color:#ff4d6d;">加载失败：' + esc(data.error || '未知错误') + '</span>';
+        }
+    } catch (err) {
+        area.className = '';
+        area.innerHTML = '<span style="color:#ff4d6d;">请求失败：' + esc(err.message) + '</span>';
+    }
+}
+
+document.getElementById('ca-init-btn').addEventListener('click', async function() {
+    var ok = await confirmModal({
+        title: '初始化 CA',
+        body: '确定要初始化本地 CA 吗？\n若 CA 已存在，将保持现有 CA 不变（如需强制重建请使用"轮换 CA"）。',
+        okText: '初始化'
+    });
+    if (!ok) return;
+    var btn = document.getElementById('ca-init-btn');
+    btn.disabled = true; btn.textContent = '初始化中...';
+    try {
+        var data = await apiPost('/api/ca/init', { force: false });
+        if (data.ok) {
+            showToast('ok', 'CA 初始化成功', data.message || '');
+            renderCaInfo(data.ca || {});
+        } else {
+            showToast('err', 'CA 初始化失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = '初始化 CA';
+    }
+});
+
+document.getElementById('ca-renew-btn').addEventListener('click', async function() {
+    var ok = await confirmModal({
+        title: '轮换 CA',
+        body: '⚠️ 危险操作！轮换 CA 将重新生成 Root/Int CA，所有已签发的用户证书将立即失效，客户端需要重新签发证书。\n\n确定要继续吗？',
+        okText: '确认轮换',
+        danger: true,
+        warn: true
+    });
+    if (!ok) return;
+    var btn = document.getElementById('ca-renew-btn');
+    btn.disabled = true; btn.textContent = '轮换中...';
+    try {
+        var data = await apiPost('/api/ca/renew', {});
+        if (data.ok) {
+            showToast('warn', 'CA 已轮换', data.warning || '已签发证书将失效');
+            renderCaInfo(data.ca || {});
+        } else {
+            showToast('err', 'CA 轮换失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = '轮换 CA';
+    }
+});
+
+document.getElementById('ca-refresh-btn').addEventListener('click', loadCaInfo);
+
+// ============================================================
+//  模块 B：证书签发
+// ============================================================
+var _lastCerts = null; // 缓存最近一次签发结果，供下载使用
+
+function renderCertOutput(certs) {
+    _lastCerts = certs;
+    var out = document.getElementById('cert-output');
+    var blocks = [
+        { key: 'cert_root',    title: 'Root CA 证书',   data: certs.cert_root },
+        { key: 'cert_int',     title: 'Int CA 证书',    data: certs.cert_int },
+        { key: 'cert_user',    title: 'User 证书',      data: certs.cert_user },
+        { key: 'cert_devicekey', title: 'Device Key',   data: certs.cert_devicekey }
+    ];
+    var html = '<div class="info-row"><span class="k">呼号</span><span class="v neon">' + esc(certs.callsign) + '</span></div>';
+    html += '<div class="info-row"><span class="k">UID</span><span class="v">' + esc(certs.uid) + '</span></div>';
+    html += '<div class="info-row"><span class="k">证书指纹</span><span class="v">' + esc(certs.fingerprint) + '</span></div>';
+    html += '<div style="margin:10px 0 16px;">' +
+        '<button class="sas-btn" onclick="downloadCertBundle(\'' + esc(certs.callsign) + '\')">⬇ 打包下载证书套（ZIP 四件套）</button>' +
+        '</div>';
+    blocks.forEach(function(b) {
+        var text = prettyJson(b.data);
+        var filename = certs.callsign + '_' + b.key + '.json';
+        html += '<div class="cert-block">' +
+            '<div class="cert-head">' +
+                '<span class="cert-title">' + esc(b.title) + ' (' + esc(b.key) + ')</span>' +
+                '<button class="sas-btn ghost" onclick="downloadText(\'' + esc(filename) + '\', _lastCerts[\'' + b.key + '\'] ? prettyJson(_lastCerts[\'' + b.key + '\']) : \'\'">⬇ 下载</button>' +
+            '</div>' +
+            '<div class="json-viewer">' + esc(text) + '</div>' +
+        '</div>';
+    });
+    out.innerHTML = html;
+}
+
+document.getElementById('issue-btn').addEventListener('click', async function() {
+    var callsign = document.getElementById('issue-callsign').value.trim().toUpperCase();
+    var uidRaw = document.getElementById('issue-uid').value.trim();
+    var result = document.getElementById('issue-result');
+    var btn = document.getElementById('issue-btn');
+
+    if (!callsign) {
+        result.innerHTML = '<span style="color:#ff4d6d;">请输入呼号</span>';
+        return;
+    }
+    var body = { callsign: callsign };
+    if (uidRaw) {
+        var uidNum = parseInt(uidRaw, 10);
+        if (isNaN(uidNum)) {
+            result.innerHTML = '<span style="color:#ff4d6d;">UID 必须是整数</span>';
+            return;
+        }
+        body.uid = uidNum;
+    }
+
+    btn.disabled = true; btn.textContent = '签发中...';
+    result.innerHTML = '<span class="loading"><span class="spinner"></span>正在签发证书...</span>';
+    try {
+        var data = await apiPost('/api/cert/issue', body);
+        if (data.ok) {
+            result.innerHTML = '<span style="color:#00ff9d;">✓ 证书签发成功</span>';
+            renderCertOutput(data);
+            showToast('ok', '签发成功', 'callsign=' + data.callsign + ', uid=' + data.uid);
+        } else {
+            result.innerHTML = '<span style="color:#ff4d6d;">' + esc(data.error || '签发失败') + '</span>';
+            showToast('err', '签发失败', data.error);
+        }
+    } catch (err) {
+        result.innerHTML = '<span style="color:#ff4d6d;">请求失败：' + esc(err.message) + '</span>';
+        showToast('err', '请求失败', err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = '签发证书';
+    }
+});
+
+// ============================================================
+//  模块 C：信任链管理
+// ============================================================
+async function loadTrustList() {
+    var tbody = document.getElementById('trust-tbody');
+    tbody.innerHTML = '<tr><td colspan="6" class="empty"><span class="spinner"></span> 加载中...</td></tr>';
+    try {
+        var data = await apiGet('/api/trust/list');
+        if (data.ok) {
+            var list = data.trust_chain || [];
+            if (list.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无信任的远程 CA</td></tr>';
+            } else {
+                tbody.innerHTML = list.map(function(t) {
+                    return '<tr>' +
+                        '<td>' + esc(t.id) + '</td>' +
+                        '<td style="font-family:Consolas,monospace;color:#00e5ff;word-break:break-all;">' + esc(t.remote_ca_fingerprint || t.fingerprint || '-') + '</td>' +
+                        '<td>' + esc(t.ca_type || '-') + '</td>' +
+                        '<td>' + esc(t.trusted_by || t.source || '-') + '</td>' +
+                        '<td>' + (t.created_at ? fmtTime(t.created_at) : '-') + '</td>' +
+                        '<td><button class="sas-btn danger" style="padding:5px 12px;font-size:12px;" onclick="deleteTrust(\'' + esc(t.id) + '\')">删除</button></td>' +
+                        '</tr>';
+                }).join('');
+            }
+        } else {
+            tbody.innerHTML = '<tr><td colspan="6" class="empty" style="color:#ff4d6d;">加载失败：' + esc(data.error || '') + '</td></tr>';
+        }
+    } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty" style="color:#ff4d6d;">请求失败：' + esc(err.message) + '</td></tr>';
+    }
+}
+
+async function deleteTrust(id) {
+    var ok = await confirmModal({
+        title: '删除信任 CA',
+        body: '确定要删除信任链记录 #' + id + ' 吗？\n删除后，由该远程 CA 签发的证书将不再被信任。',
+        okText: '删除',
+        danger: true
+    });
+    if (!ok) return;
+    try {
+        var data = await apiDelete('/api/trust/' + id);
+        if (data.ok) {
+            showToast('ok', '删除成功', '已删除信任记录 #' + id);
+            loadTrustList();
+        } else {
+            showToast('err', '删除失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    }
+}
+
+// 删除账户：吊销该呼号全部证书 + 软删除用户，删除状态同步到全系统
+async function deleteUser(callsign) {
+    var ok = await confirmModal({
+        title: '删除账户',
+        body: '确定要删除账户 ' + callsign + ' 吗？\n删除后：\n1. 该呼号名下所有证书将被吊销，立即无法通过认证；\n2. 该账户将无法登录 APP、无法拉取证书；\n3. 删除与吊销状态会同步到总系统和所有分系统。\n此操作不可恢复！',
+        okText: '删除',
+        danger: true
+    });
+    if (!ok) return;
+    try {
+        var data = await apiDelete('/api/user/' + encodeURIComponent(callsign));
+        if (data.ok) {
+            showToast('ok', '删除成功', data.message || ('已删除账户 ' + callsign));
+            loadData();
+        } else {
+            showToast('err', '删除失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    }
+}
+
+document.getElementById('trust-add-btn').addEventListener('click', async function() {
+    var jsonText = document.getElementById('trust-ca-json').value.trim();
+    var caType = document.getElementById('trust-ca-type').value;
+    var source = document.getElementById('trust-source').value.trim();
+    var btn = document.getElementById('trust-add-btn');
+    if (!jsonText) {
+        showToast('err', '输入为空', '请粘贴远程 CA 证书 JSON');
+        return;
+    }
+    var remoteCa;
+    try { remoteCa = JSON.parse(jsonText); }
+    catch (e) {
+        showToast('err', 'JSON 解析失败', e.message);
+        return;
+    }
+    btn.disabled = true; btn.textContent = '添加中...';
+    try {
+        // 后端字段为 remote_ca（非 remote_ca_cert）
+        var body = { remote_ca: remoteCa, ca_type: caType };
+        if (source) body.trusted_by = source;
+        var data = await apiPost('/api/trust/add', body);
+        if (data.ok) {
+            showToast('ok', '添加成功', '指纹：' + (data.fingerprint || '').slice(0, 24) + '...');
+            document.getElementById('trust-ca-json').value = '';
+            document.getElementById('trust-source').value = '';
+            loadTrustList();
+        } else {
+            showToast('err', '添加失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = '添加信任 CA';
+    }
+});
+
+document.getElementById('trust-refresh-btn').addEventListener('click', loadTrustList);
+
+// ============================================================
+//  模块 D：认证规则配置
+// ============================================================
+var _whitelist = []; // 白名单呼号数组
+
+function renderWhitelist() {
+    var box = document.getElementById('whitelist-tags');
+    if (_whitelist.length === 0) {
+        box.innerHTML = '<span class="tag-empty">无白名单（不限制呼号）</span>';
+        return;
+    }
+    box.innerHTML = _whitelist.map(function(cs, idx) {
+        return '<span class="tag-item">' + esc(cs) +
+            '<span class="x" onclick="removeWhitelist(' + idx + ')">×</span></span>';
+    }).join('');
+}
+
+function removeWhitelist(idx) {
+    _whitelist.splice(idx, 1);
+    renderWhitelist();
+}
+
+function loadSasConfig() {
+    var area = document.getElementById('sas-config-area');
+    var form = document.getElementById('sas-config-form');
+    area.innerHTML = '<span class="spinner"></span>正在加载 SAS 配置...';
+    area.className = 'loading';
+    apiGet('/api/sas/config').then(function(data) {
+        if (!data.ok) {
+            area.className = '';
+            area.innerHTML = '<span style="color:#ff4d6d;">加载失败：' + esc(data.error || '') + '</span>';
+            return;
+        }
+        var cfg = data.config || {};
+        _whitelist = (cfg.allowed_callsigns || []).slice();
+        renderWhitelist();
+        document.getElementById('cfg-allow-all').checked = cfg.auto_trust_local_ca !== false;
+        // 严格模式 = require_client_signature 为 true
+        var requireSig = cfg.require_client_signature === true;
+        document.getElementById('cfg-auth-mode').value = requireSig ? 'strict' : 'loose';
+        var rng = cfg.uid_range || {};
+        document.getElementById('cfg-uid-start').value = rng.start != null ? rng.start : 1;
+        document.getElementById('cfg-uid-end').value = rng.end != null ? rng.end : 200000;
+        area.style.display = 'none';
+        form.style.display = '';
+    }).catch(function(err) {
+        area.className = '';
+        area.innerHTML = '<span style="color:#ff4d6d;">请求失败：' + esc(err.message) + '</span>';
+    });
+}
+
+// 白名单输入：回车添加
+document.getElementById('whitelist-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        var v = this.value.trim().toUpperCase();
+        if (!v) return;
+        if (_whitelist.indexOf(v) === -1) {
+            _whitelist.push(v);
+            renderWhitelist();
+        }
+        this.value = '';
+    }
+});
+
+document.getElementById('sas-save-btn').addEventListener('click', async function() {
+    var btn = document.getElementById('sas-save-btn');
+    var startRaw = document.getElementById('cfg-uid-start').value.trim();
+    var endRaw = document.getElementById('cfg-uid-end').value.trim();
+    var startN = parseInt(startRaw, 10);
+    var endN = parseInt(endRaw, 10);
+    if (isNaN(startN) || isNaN(endN) || startN < 1 || endN > 200000 || startN > endN) {
+        showToast('err', 'UID 范围无效', '需满足 1 ≤ start ≤ end ≤ 200000');
+        return;
+    }
+    var body = {
+        allowed_callsigns: _whitelist,
+        auto_trust_local_ca: document.getElementById('cfg-allow-all').checked,
+        require_client_signature: document.getElementById('cfg-auth-mode').value === 'strict',
+        uid_range: { start: startN, end: endN }
+    };
+    btn.disabled = true; btn.textContent = '保存中...';
+    try {
+        var data = await apiPost('/api/sas/config', body);
+        if (data.ok) {
+            showToast('ok', '配置已保存', 'SAS 运行时配置已持久化');
+            // 同步本地状态
+            if (data.config) {
+                _whitelist = (data.config.allowed_callsigns || []).slice();
+                renderWhitelist();
+            }
+        } else {
+            showToast('err', '保存失败', data.error || '');
+        }
+    } catch (err) {
+        showToast('err', '请求失败', err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = '保存配置';
+    }
+});
+
+// ============================================================
+//  模块 E：同步状态
+// ============================================================
+// 同步方向常量（与 sync_engine.py 一致）
+var SYNC_DIR_LABELS = {
+    report: '上报总系统',
+    pull: '从总系统拉取',
+    peer_out: '推送到节点',
+    peer_in: '从节点接收'
+};
+
+function renderSyncStatus(data) {
+    var area = document.getElementById('sync-status-area');
+    area.className = '';
+    // 真实响应：{ok, subsystem_id, mode, master_url, peers:[url...],
+    //   last_report_time, last_full_report_time,
+    //   status:[{peer,direction,last_sync,last_status,last_count,consecutive_failures}],
+    //   recent_log:[{timestamp,direction,peer,data_type,count,status,error,duration}]}
+    var html = '';
+    // 基本状态
+    html += '<div class="info-row"><span class="k">分系统 ID</span><span class="v neon">' +
+        esc(data.subsystem_id || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">同步模式</span><span class="v">' +
+        esc(data.mode || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">总系统地址</span><span class="v">' +
+        esc(data.master_url || '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">上次上报</span><span class="v">' +
+        (data.last_report_time ? fmtTime(data.last_report_time) : '-') + '</span></div>';
+    html += '<div class="info-row"><span class="k">上次全量上报</span><span class="v">' +
+        (data.last_full_report_time ? fmtTime(data.last_full_report_time) : '-') + '</span></div>';
+
+    // 各方向同步状态表
+    var rows = data.status || [];
+    html += '<div style="margin-top:14px;color:#00e5ff;font-size:13px;letter-spacing:1px;">同步状态（' + rows.length + '）</div>';
+    if (rows.length === 0) {
+        html += '<div class="empty" style="padding:14px;">暂无同步记录（等待首次同步）</div>';
+    } else {
+        html += '<div class="table-wrap" style="margin-top:8px;"><table><thead><tr>' +
+            '<th>对象</th><th>方向</th><th>上次同步</th><th>结果</th><th>数量</th><th>连续失败</th>' +
+            '</tr></thead><tbody>';
+        rows.forEach(function(r) {
+            var okCls = r.last_status === 'ok' ? 'online' : 'danger';
+            var failN = r.consecutive_failures || 0;
+            html += '<tr>' +
+                '<td style="word-break:break-all;max-width:220px;">' + esc(r.peer || '-') + '</td>' +
+                '<td>' + esc(SYNC_DIR_LABELS[r.direction] || r.direction || '-') + '</td>' +
+                '<td>' + (r.last_sync ? fmtTime(r.last_sync) : '-') + '</td>' +
+                '<td><span class="status-text ' + okCls + '">' + esc(r.last_status || '-') + '</span></td>' +
+                '<td>' + esc(r.last_count != null ? r.last_count : '-') + '</td>' +
+                '<td>' + (failN > 0 ? '<span class="status-text danger">' + esc(failN) + '</span>' : '0') + '</td>' +
+                '</tr>';
+        });
+        html += '</tbody></table></div>';
+    }
+
+    // P2P 对等节点列表
+    var peers = data.peers || [];
+    html += '<div style="margin-top:14px;color:#00e5ff;font-size:13px;letter-spacing:1px;">P2P 对等节点（' + peers.length + '）</div>';
+    if (peers.length === 0) {
+        html += '<div class="empty" style="padding:14px;">暂无对等节点</div>';
+    } else {
+        html += '<div class="peer-list" style="margin-top:8px;">';
+        peers.forEach(function(p) {
+            var addr = (typeof p === 'string') ? p : (p.address || p.addr || p.url || p.host || '-');
+            // 从同步状态表推断该节点是否健康（任一方向有失败即视为异常）
+            var broken = rows.some(function(r) {
+                return r.peer === addr && r.last_status && r.last_status !== 'ok';
+            });
+            var stateCls = broken ? 'offline' : 'online';
+            html += '<div class="peer-item"><span class="peer-addr">' + esc(addr) + '</span>' +
+                '<span class="peer-state"><span class="status-dot ' + stateCls + '"></span>' +
+                '<span class="status-text ' + stateCls + '">' + (broken ? '异常' : '正常') + '</span></span></div>';
+        });
+        html += '</div>';
+    }
+
+    // 最近同步日志（最多 10 条）
+    var logs = (data.recent_log || []).slice(0, 10);
+    if (logs.length > 0) {
+        html += '<div style="margin-top:14px;color:#00e5ff;font-size:13px;letter-spacing:1px;">最近同步日志</div>';
+        html += '<div class="table-wrap" style="margin-top:8px;"><table><thead><tr>' +
+            '<th>时间</th><th>方向</th><th>类型</th><th>数量</th><th>状态</th><th>错误</th>' +
+            '</tr></thead><tbody>';
+        logs.forEach(function(g) {
+            var okCls = g.status === 'ok' ? 'online' : 'danger';
+            html += '<tr>' +
+                '<td>' + (g.timestamp ? fmtTime(g.timestamp) : '-') + '</td>' +
+                '<td>' + esc(SYNC_DIR_LABELS[g.direction] || g.direction || '-') + '</td>' +
+                '<td>' + esc(g.data_type || '-') + '</td>' +
+                '<td>' + esc(g.count != null ? g.count : '-') + '</td>' +
+                '<td><span class="status-text ' + okCls + '">' + esc(g.status || '-') + '</span></td>' +
+                '<td style="word-break:break-all;max-width:200px;">' + esc(g.error || '') + '</td>' +
+                '</tr>';
+        });
+        html += '</tbody></table></div>';
+    }
+    area.innerHTML = html;
+}
+
+async function loadSyncStatus() {
+    var area = document.getElementById('sync-status-area');
+    // 仅在 SAS 页面可见时刷新，避免后台空转
+    if (document.getElementById('page-sas').style.display === 'none') return;
+    // 首次加载显示 spinner，后续静默刷新避免闪烁
+    if (!area.querySelector('.info-row') && !area.querySelector('.json-viewer')) {
+        area.className = 'loading';
+        area.innerHTML = '<span class="spinner"></span>正在加载同步状态...';
+    }
+    try {
+        var data = await apiGet('/api/sync/status');
+        if (data.ok) {
+            renderSyncStatus(data);
+        } else {
+            area.className = '';
+            area.innerHTML = '<span style="color:#ff4d6d;">加载失败：' + esc(data.error || '') + '</span>';
+        }
+    } catch (err) {
+        area.className = '';
+        area.innerHTML = '<span style="color:#ff4d6d;">请求失败：' + esc(err.message) + '</span>';
+    }
+}
+
+// ============================================================
+//  语音监控瀑布图（FMO/RAW 语音段 + FMO/TELE 信标）
+// ============================================================
+var MON = {
+    api: '/api/monitor',
+    segs: [], seen: {}, lastTs: 0, firstPoll: true, openTime: 0,
+    beacons: [], lastBeaconTs: 0,
+    serverName: '', serverDesc: '',
+    pollTimer: null, beaconTimer: null, raf: null,
+    actx: null, gain: null, curSrc: null,
+    queue: [], playingId: null,
+    serverOffset: 0,
+    pxPerSec: 16, gutter: 96, rulerH: 22, laneH: 30
+};
+
+// ---- IMA ADPCM 解码（与 APP ima_adpcm.rs 一致：高 nibble 在前）----
+var IMA_STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,
+73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,
+494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,
+2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,
+10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767];
+var IMA_IDX = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
+
+function decodeAdpcmSegment(buf) {
+    // 每块 323B = [valprev s16 LE][index u8][320B ADPCM] → 640 样本 s16
+    var dv = new DataView(buf);
+    var nblocks = Math.floor(buf.byteLength / 323);
+    var out = new Int16Array(nblocks * 640);
+    var o = 0;
+    for (var b = 0; b < nblocks; b++) {
+        var off = b * 323;
+        var vp = dv.getInt16(off, true);
+        var idx = dv.getUint8(off + 2);
+        if (idx > 88) idx = 88;
+        for (var i = 0; i < 320; i++) {
+            var by = dv.getUint8(off + 3 + i);
+            for (var h = 0; h < 2; h++) {
+                var nib = (h === 0) ? (by >> 4) : (by & 0x0F);
+                var step = IMA_STEP[idx];
+                var diff = step >> 3;
+                if (nib & 4) diff += step;
+                if (nib & 2) diff += step >> 1;
+                if (nib & 1) diff += step >> 2;
+                vp = (nib & 8) ? (vp - diff) : (vp + diff);
+                if (vp > 32767) vp = 32767;
+                if (vp < -32768) vp = -32768;
+                idx += IMA_IDX[nib];
+                if (idx < 0) idx = 0;
+                if (idx > 88) idx = 88;
+                out[o++] = vp;
+            }
+        }
+    }
+    return out;
+}
+
+// ---- 音频播放 ----
+function ensureAudio() {
+    if (!MON.actx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return false;
+        MON.actx = new AC();
+        MON.gain = MON.actx.createGain();
+        MON.gain.connect(MON.actx.destination);
+        MON.gain.value = document.getElementById('mon-vol').value / 100;
+    }
+    if (MON.actx.state === 'suspended') MON.actx.resume();
+    return true;
+}
+document.addEventListener('click', function() {
+    if (document.getElementById('page-monitor').style.display !== 'none') ensureAudio();
+}, true);
+document.getElementById('mon-vol').addEventListener('input', function() {
+    if (MON.gain) MON.gain.value = this.value / 100;
+});
+
+function playSegment(seg) {
+    fetch(MON.api + '/audio?id=' + seg.id).then(function(r) {
+        if (!r.ok) throw new Error('audio 404');
+        return r.arrayBuffer();
+    }).then(function(buf) {
+        if (!ensureAudio()) { showToast('err', '无法播放', '浏览器不支持 WebAudio'); playNext(); return; }
+        if (seg.codec === 'opus') {
+            // 服务端已封装为 Ogg/Opus，交给浏览器原生解码（Safari 不支持）
+            MON.actx.decodeAudioData(buf, function(abuf) { playAbuf(seg, abuf); }, function() {
+                showToast('err', '解码失败', '浏览器无法解码 Opus，请使用 Chrome / Edge');
+                playNext();
+            });
+            return;
+        }
+        var pcm = decodeAdpcmSegment(buf);
+        if (!pcm.length) { playNext(); return; }
+        var abuf = MON.actx.createBuffer(1, pcm.length, 8000);
+        var ch = abuf.getChannelData(0);
+        for (var i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+        playAbuf(seg, abuf);
+    }).catch(function() { playNext(); });
+}
+
+function playAbuf(seg, abuf) {
+    stopCurrentAudio();
+    var src = MON.actx.createBufferSource();
+    src.buffer = abuf;
+    src.connect(MON.gain);
+    MON.playingId = seg.id;
+    MON.curSrc = src;
+    updateNowPlaying(seg);
+    src.onended = function() {
+        MON.playingId = null;
+        MON.curSrc = null;
+        updateNowPlaying(null);
+        playNext();
+    };
+    src.start();
+}
+
+function stopCurrentAudio() {
+    stopLiveStream();
+    if (MON.curSrc) {
+        try { MON.curSrc.onended = null; MON.curSrc.stop(); } catch (e) {}
+        MON.curSrc = null;
+    }
+    MON.playingId = null;
+}
+
+function playNext() {
+    if (MON.playingId !== null) return;
+    var seg = MON.queue.shift();
+    if (!seg) return;
+    playSegment(seg);
+}
+
+// ============================================================
+//  边发边放：进行中语音段流式播放（/api/monitor/live 1s 轮询 +
+//  /api/monitor/live_audio 增量拉取，ADPCM 按 323B 块即解即播，
+//  Opus 走 WebCodecs AudioDecoder；无 WebCodecs 时 Opus 退化为
+//  切段后整段播放）
+// ============================================================
+var LIVE = { timer: null, cur: null, seen: {}, decoder: null, decReady: false };
+
+function liveKeyOf(callsign, session, startTs) {
+    return callsign + '/' + session + '/' + Number(startTs).toFixed(3);
+}
+
+async function livePoll() {
+    if (!document.getElementById('mon-autoplay').checked) return;
+    try {
+        var d = await apiGet(MON.api + '/live');
+        if (!d.ok) return;
+        (d.segments || []).forEach(function(m) {
+            var k = liveKeyOf(m.callsign, m.session, m.start_ts);
+            if (LIVE.seen[k] || (LIVE.cur && LIVE.cur.key === k)) return;
+            // 只自动播放本页打开之后新产生的段
+            if (m.start_ts < MON.openTime - 2) return;
+            // Opus 且无 WebCodecs（http 访问）：等段收尾后立即拉 Ogg 整段播放
+            if (m.codec === 'opus' && !('AudioDecoder' in window)) {
+                if (!m.done) return;
+                LIVE.seen[k] = 1;
+                playLiveOgg(m, k);
+                return;
+            }
+            startLiveStream(m);
+        });
+    } catch (e) { /* 下轮重试 */ }
+}
+
+// 无 WebCodecs 的 Opus 退化路径：段收尾后拉完整 Ogg 立即整段播放
+function playLiveOgg(m, k) {
+    fetch(MON.api + '/live_audio?callsign=' + encodeURIComponent(m.callsign) +
+          '&session=' + m.session + '&offset=0&ogg=1')
+    .then(function(r) {
+        if (!r.ok) throw new Error('ogg ' + r.status);
+        return r.arrayBuffer();
+    }).then(function(buf) {
+        if (!ensureAudio()) throw new Error('no webaudio');
+        MON.actx.decodeAudioData(buf, function(abuf) {
+            stopCurrentAudio();
+            var src = MON.actx.createBufferSource();
+            src.buffer = abuf;
+            src.connect(MON.gain);
+            MON.curSrc = src;
+            updateNowPlaying({ callsign: m.callsign, codec: 'opus',
+                duration_ms: Math.round((m.last_ts - m.start_ts) * 1000) });
+            src.onended = function() {
+                MON.curSrc = null;
+                updateNowPlaying(null);
+                playNext();
+            };
+            src.start();
+        }, function() { delete LIVE.seen[k]; });
+    }).catch(function() {
+        // 失败：放行给段轮询兜底
+        delete LIVE.seen[k];
+    });
+}
+
+function startLiveStream(m) {
+    if (!ensureAudio()) return;
+    stopLiveStream();
+    stopCurrentAudio();
+    MON.queue = [];
+    var st = {
+        key: liveKeyOf(m.callsign, m.session, m.start_ts), meta: m,
+        offset: 0, done: false, allFetched: false, fetching: false,
+        pend: new Uint8Array(0), nextTime: 0, srcs: [], active: 0,
+        opusTs: 0
+    };
+    LIVE.cur = st;
+    LIVE.seen[st.key] = 1;
+    MON.playingId = 'live';
+    var el = document.getElementById('mon-now');
+    el.innerHTML = '<span class="playing">▶ ' + esc(m.callsign) + '</span>' +
+        ' <span style="color:#00e676;">实时 · ' + esc(m.codec) + '</span>';
+    if (m.codec === 'opus') {
+        try {
+            LIVE.decoder = new AudioDecoder({
+                output: function(ad) { onLivePcm(st, ad); },
+                error: function(e) { console.warn('opus decoder:', e); }
+            });
+            // OpusHead：magic + v1 + 1ch + preskip0 + 48k + gain0 + map0
+            var head = new Uint8Array([0x4F, 0x70, 0x75, 0x73, 0x48, 0x65,
+                0x61, 0x64, 1, 1, 0, 0, 0x80, 0xBB, 0, 0, 0, 0, 0]);
+            LIVE.decoder.configure({ codec: 'opus', sampleRate: 48000,
+                numberOfChannels: 1, description: head });
+            LIVE.decReady = true;
+        } catch (e) {
+            LIVE.decReady = false;
+            finishLive(st, false);   // 配置失败，交回整段兜底
+            return;
+        }
+    }
+    liveFetch(st);
+}
+
+function liveFetch(st) {
+    if (st.fetching || LIVE.cur !== st || st.allFetched) return;
+    st.fetching = true;
+    var m = st.meta;
+    fetch(MON.api + '/live_audio?callsign=' + encodeURIComponent(m.callsign) +
+            '&session=' + m.session + '&offset=' + st.offset)
+    .then(function(r) {
+        if (!r.ok) throw new Error('live_audio ' + r.status);
+        st.done = r.headers.get('X-Done') === '1';
+        return r.arrayBuffer();
+    }).then(function(buf) {
+        st.fetching = false;
+        if (LIVE.cur !== st) return;
+        if (buf && buf.byteLength) {
+            var nb = new Uint8Array(st.pend.length + buf.byteLength);
+            nb.set(st.pend); nb.set(new Uint8Array(buf), st.pend.length);
+            st.pend = nb;
+            st.offset += buf.byteLength;
+            if (m.codec === 'adpcm') drainLiveAdpcm(st);
+            else drainLiveOpus(st);
+        }
+        if (st.done) {
+            st.allFetched = true;
+            if (st.active <= 0) { finishLive(st, true); }
+            return;   // 等已排音频播完，由 onended 收尾
+        }
+        setTimeout(function() { liveFetch(st); }, (buf && buf.byteLength) ? 120 : 600);
+    }).catch(function() {
+        st.fetching = false;
+        if (LIVE.cur !== st) return;
+        finishLive(st, false);   // 段已过期/消失，交回整段兜底
+    });
+}
+
+function drainLiveAdpcm(st) {
+    var nblocks = Math.floor(st.pend.length / 323);
+    if (!nblocks) return;
+    var chunk = st.pend.slice(0, nblocks * 323);
+    st.pend = st.pend.slice(nblocks * 323);
+    var pcm = decodeAdpcmSegment(chunk.buffer);
+    if (!pcm.length) return;
+    var abuf = MON.actx.createBuffer(1, pcm.length, 8000);
+    var ch = abuf.getChannelData(0);
+    for (var i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+    queueLiveBuffer(st, abuf);
+}
+
+function drainLiveOpus(st) {
+    if (!LIVE.decReady || !LIVE.decoder) return;
+    var dv = new DataView(st.pend.buffer, st.pend.byteOffset, st.pend.length);
+    var pos = 0;
+    while (pos + 2 <= st.pend.length) {
+        var len = dv.getUint16(pos, true);
+        if (pos + 2 + len > st.pend.length) break;
+        var pkt = st.pend.slice(pos + 2, pos + 2 + len);
+        try {
+            LIVE.decoder.decode(new EncodedAudioChunk({
+                type: 'key', timestamp: st.opusTs, data: pkt }));
+            st.opusTs += 20000;
+        } catch (e) { /* 跳过坏包 */ }
+        pos += 2 + len;
+    }
+    if (pos) st.pend = st.pend.slice(pos);
+}
+
+function onLivePcm(st, ad) {
+    try {
+        var n = ad.numberOfFrames;
+        if (!n) { ad.close(); return; }
+        var abuf = MON.actx.createBuffer(1, n, ad.sampleRate || 48000);
+        ad.copyTo(abuf.getChannelData(0), { planeIndex: 0, format: 'f32-planar' });
+        ad.close();
+        if (LIVE.cur !== st) return;
+        queueLiveBuffer(st, abuf);
+    } catch (e) { try { ad.close(); } catch (e2) {} }
+}
+
+function queueLiveBuffer(st, abuf) {
+    var t = Math.max(MON.actx.currentTime + 0.06, st.nextTime);
+    var src = MON.actx.createBufferSource();
+    src.buffer = abuf;
+    src.connect(MON.gain);
+    st.nextTime = t + abuf.duration;
+    st.active++;
+    st.srcs.push(src);
+    src.onended = function() {
+        st.active--;
+        if (LIVE.cur === st && st.allFetched && st.active <= 0) finishLive(st, true);
+    };
+    src.start(t);
+}
+
+function finishLive(st, graceful) {
+    if (LIVE.cur !== st) return;
+    LIVE.cur = null;
+    if (!graceful) delete LIVE.seen[st.key];   // 让整段轮询兜底补播
+    if (LIVE.decoder) {
+        try { LIVE.decoder.close(); } catch (e) {}
+        LIVE.decoder = null; LIVE.decReady = false;
+    }
+    MON.playingId = null;
+    updateNowPlaying(null);
+}
+
+function stopLiveStream() {
+    var st = LIVE.cur;
+    if (!st) return;
+    LIVE.cur = null;
+    st.srcs.forEach(function(s) {
+        try { s.onended = null; s.stop(); } catch (e) {}
+    });
+    st.srcs = [];
+    if (LIVE.decoder) {
+        try { LIVE.decoder.close(); } catch (e) {}
+        LIVE.decoder = null; LIVE.decReady = false;
+    }
+    if (MON.playingId === 'live') {
+        MON.playingId = null;
+        updateNowPlaying(null);
+    }
+}
+
+function updateNowPlaying(seg) {
+    var el = document.getElementById('mon-now');
+    if (!seg) { el.innerHTML = '—'; return; }
+    el.innerHTML = '<span class="playing">▶ ' + esc(seg.callsign) + '</span>' +
+        ' <span style="color:#6c7a96;">' + seg.duration_ms / 1000 + 's · ' +
+        esc(seg.codec) + (seg.subsystem_id ? ' · ' + esc(seg.subsystem_id) : '') + '</span>';
+}
+
+// ---- 数据轮询 ----
+function monNow() { return Date.now() / 1000 + MON.serverOffset; }
+
+async function monPollStatus() {
+    try {
+        var d = await apiGet(MON.api + '/status');
+        var dot = document.getElementById('mon-dot');
+        var st = document.getElementById('mon-state');
+        if (d.ok && d.monitor) {
+            var m = d.monitor;
+            if (m.state === 'connected') { dot.className = 'mon-dot ok'; }
+            else if (m.state === 'connecting') { dot.className = 'mon-dot warn'; }
+            else { dot.className = 'mon-dot'; }
+            st.textContent = ({connected:'MQTT 已连接', connecting:'连接中…',
+                error:'连接异常', disabled:'监控未启用'})[m.state] || m.state;
+            if (m.detail && m.state === 'error') st.textContent += '：' + m.detail;
+            document.getElementById('mon-stats').textContent =
+                '段 ' + (m.stats.segments || 0) + ' · 帧 ' + (m.stats.frames || 0) +
+                ' · 信标 ' + (m.stats.beacons || 0) + ' · ' + (m.mqtt || '');
+            // 服务器名/欢迎语（SERVER_INFO 抄收），变化时重绘信标卡片
+            var sn = m.server_name || '', sd = m.server_desc || '';
+            if (sn !== MON.serverName || sd !== MON.serverDesc) {
+                MON.serverName = sn; MON.serverDesc = sd;
+                renderBeacons();
+            }
+        } else {
+            dot.className = 'mon-dot';
+            st.textContent = d.error || '监控不可用';
+        }
+    } catch (e) {
+        document.getElementById('mon-dot').className = 'mon-dot';
+        document.getElementById('mon-state').textContent = '状态查询失败';
+    }
+}
+
+async function monPollSegments() {
+    try {
+        var d = await apiGet(MON.api + '/segments?since=' + MON.lastTs.toFixed(3) + '&limit=200');
+        if (!d.ok) return;
+        if (d.now) MON.serverOffset = d.now - Date.now() / 1000;
+        var fresh = [];
+        (d.segments || []).forEach(function(s) {
+            if (MON.seen[s.id]) return;
+            MON.seen[s.id] = 1;
+            MON.segs.push(s);
+            if (s.start_ts > MON.lastTs) MON.lastTs = s.start_ts;
+            // 已被边发边放流式播过的段不再入自动播放队列
+            var lk = liveKeyOf(s.callsign, s.session, s.start_ts);
+            // 只自动播放本页打开之后新产生的段
+            if (!MON.firstPoll && s.start_ts >= MON.openTime - 2 &&
+                !LIVE.seen[lk]) fresh.push(s);
+        });
+        MON.firstPoll = false;
+        // 只保留最近 5 分钟的段
+        var cutoff = monNow() - 300;
+        MON.segs = MON.segs.filter(function(s) { return s.end_ts >= cutoff; });
+        if (document.getElementById('mon-autoplay').checked) {
+            fresh.forEach(function(s) { MON.queue.push(s); });
+            if (fresh.length) playNext();
+        }
+    } catch (e) { /* 下轮重试 */ }
+}
+
+async function monPollBeacons() {
+    try {
+        var d = await apiGet(MON.api + '/beacons?since=' + MON.lastBeaconTs.toFixed(3) + '&limit=30');
+        if (!d.ok) return;
+        var rows = d.beacons || [];
+        rows.forEach(function(b) {
+            if (b.created_at > MON.lastBeaconTs) MON.lastBeaconTs = b.created_at;
+        });
+        MON.beacons = rows.concat(MON.beacons).slice(0, 15);
+        renderBeacons();
+    } catch (e) { /* 下轮重试 */ }
+}
+
+function renderBeacons() {
+    var el = document.getElementById('mon-beacons');
+    if (!MON.beacons.length) {
+        el.innerHTML = '<span style="color:#6c7a96;">暂无信标</span>';
+        return;
+    }
+    var html = '';
+    MON.beacons.forEach(function(b) {
+        var f = [];
+        if (b.freq1) f.push(b.freq1.toFixed(3));
+        if (b.freq2) f.push(b.freq2.toFixed(3));
+        html += '<div class="mon-beacon"><b>' + esc(b.callsign) + '</b>' +
+            '<span class="t">' + fmtHMS(b.created_at) + '</span><br>' +
+            (f.length ? esc(f.join(' / ') + ' MHz') : '—') +
+            (MON.serverName ? '<br><span style="color:#7fc8a9;">@' + esc(MON.serverName) + '</span>' : '') +
+            (MON.serverDesc ? '<br><span style="color:#8fa3c8;">' + esc(MON.serverDesc) + '</span>' : '') +
+            (b.subsystem_id ? ' <span style="color:#6c7a96;">@' + esc(b.subsystem_id) + '</span>' : '') +
+            '</div>';
+    });
+    el.innerHTML = html;
+}
+
+function fmtHMS(ts) {
+    var d = new Date(ts * 1000);
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// ---- 瀑布图绘制 ----
+function hashHue(s) {
+    var h = 0;
+    for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h % 360;
+}
+
+function drawWaterfall() {
+    var cv = document.getElementById('wf');
+    var wrap = cv.parentElement;
+    var W = wrap.clientWidth, H = wrap.clientHeight || 460;
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    var g = cv.getContext('2d');
+    g.fillStyle = '#05070f';
+    g.fillRect(0, 0, W, H);
+
+    var now = monNow();
+    var plotW = W - MON.gutter;
+    var winSec = plotW / MON.pxPerSec;
+    var t1 = now, t0 = now - winSec;
+    function xOf(ts) { return MON.gutter + (ts - t0) * MON.pxPerSec; }
+
+    // 时间刻度（每 5 秒竖线 + 标签）
+    g.strokeStyle = 'rgba(0,180,255,0.12)';
+    g.fillStyle = '#4a5a78';
+    g.font = '10px Consolas, monospace';
+    g.textAlign = 'center';
+    var tick0 = Math.ceil(t0 / 5) * 5;
+    for (var t = tick0; t <= t1; t += 5) {
+        var x = xOf(t);
+        g.beginPath(); g.moveTo(x, MON.rulerH); g.lineTo(x, H); g.stroke();
+        g.fillText(fmtHMS(t), x, 12);
+    }
+    // 右缘"现在"标记
+    g.strokeStyle = 'rgba(0,230,118,0.5)';
+    g.beginPath(); g.moveTo(xOf(t1), 0); g.lineTo(xOf(t1), H); g.stroke();
+
+    // 车道分配：按窗口内最近活动排序
+    var act = {};
+    MON.segs.forEach(function(s) {
+        if (s.end_ts >= t0 && s.start_ts <= t1) {
+            var k = s.subsystem_id ? (s.subsystem_id + '/' + s.callsign) : s.callsign;
+            if (!act[k] || act[k] < s.end_ts) act[k] = s.end_ts;
+        }
+    });
+    var maxLanes = Math.max(1, Math.floor((H - MON.rulerH) / MON.laneH));
+    var lanes = Object.keys(act).sort(function(a, b) { return act[b] - act[a]; })
+        .slice(0, maxLanes);
+    var laneOf = {};
+    lanes.forEach(function(k, i) { laneOf[k] = i; });
+
+    // 车道背景与呼号标签
+    lanes.forEach(function(k, i) {
+        var y = MON.rulerH + i * MON.laneH;
+        if (i % 2 === 0) {
+            g.fillStyle = 'rgba(0,180,255,0.04)';
+            g.fillRect(0, y, W, MON.laneH);
+        }
+        var hue = hashHue(k);
+        g.fillStyle = 'hsl(' + hue + ',70%,60%)';
+        g.font = 'bold 11px Consolas, monospace';
+        g.textAlign = 'left';
+        var label = k.length > 13 ? k.slice(0, 12) + '…' : k;
+        g.fillText(label, 6, y + MON.laneH / 2 + 4);
+    });
+
+    // 语音段色块
+    MON.hitBlocks = [];
+    MON.segs.forEach(function(s) {
+        var k = s.subsystem_id ? (s.subsystem_id + '/' + s.callsign) : s.callsign;
+        var li = laneOf[k];
+        if (li === undefined) return;
+        var x1 = Math.max(xOf(s.start_ts), MON.gutter);
+        var x2 = Math.min(xOf(s.end_ts), W);
+        if (x2 - x1 < 2) x2 = x1 + 2;
+        if (x2 <= MON.gutter || x1 >= W) return;
+        var y = MON.rulerH + li * MON.laneH + 3;
+        var h = MON.laneH - 6;
+        var hue = hashHue(k);
+        var playing = (MON.playingId === s.id);
+        g.fillStyle = playing ? 'hsl(' + hue + ',90%,65%)' : 'hsl(' + hue + ',65%,42%)';
+        g.beginPath();
+        if (g.roundRect) g.roundRect(x1, y, x2 - x1, h, 3); else g.rect(x1, y, x2 - x1, h);
+        g.fill();
+        if (playing) {
+            g.strokeStyle = '#ffffff';
+            g.lineWidth = 1.5;
+            g.stroke();
+            g.lineWidth = 1;
+        }
+        // 块内显示呼号与时长（宽度足够时）
+        if (x2 - x1 > 46) {
+            g.fillStyle = '#05070f';
+            g.font = 'bold 10px Consolas, monospace';
+            g.textAlign = 'left';
+            g.fillText(s.callsign + ' ' + (s.duration_ms / 1000).toFixed(1) + 's',
+                x1 + 4, y + h / 2 + 3);
+        }
+        MON.hitBlocks.push({ x1: x1, x2: x2, y1: y, y2: y + h, seg: s });
+    });
+
+    // 无数据提示
+    if (!MON.segs.length) {
+        g.fillStyle = '#3a4a68';
+        g.font = '13px sans-serif';
+        g.textAlign = 'center';
+        g.fillText('等待语音通联…（FMO/RAW）', W / 2, H / 2);
+    }
+    MON.raf = requestAnimationFrame(drawWaterfall);
+}
+
+document.getElementById('wf').addEventListener('click', function(ev) {
+    var cv = ev.currentTarget;
+    var r = cv.getBoundingClientRect();
+    var mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    var blocks = MON.hitBlocks || [];
+    for (var i = blocks.length - 1; i >= 0; i--) {
+        var b = blocks[i];
+        if (mx >= b.x1 && mx <= b.x2 && my >= b.y1 && my <= b.y2) {
+            stopCurrentAudio();
+            MON.queue = [];
+            ensureAudio();
+            playSegment(b.seg);
+            return;
+        }
+    }
+});
+
+document.getElementById('mon-clear').addEventListener('click', function() {
+    MON.segs = [];
+    MON.queue = [];
+    stopCurrentAudio();
+});
+
+// ---- 启停 ----
+function monitorStart() {
+    MON.openTime = Date.now() / 1000;
+    MON.firstPoll = true;
+    monPollStatus();
+    monPollSegments();
+    monPollBeacons();
+    livePoll();
+    if (!MON.pollTimer) {
+        MON.pollTimer = setInterval(function() {
+            monPollStatus();
+            monPollSegments();
+        }, 2000);
+    }
+    if (!MON.beaconTimer) {
+        MON.beaconTimer = setInterval(monPollBeacons, 5000);
+    }
+    if (!LIVE.timer) {
+        LIVE.timer = setInterval(livePoll, 1000);
+    }
+    if (!MON.raf) MON.raf = requestAnimationFrame(drawWaterfall);
+}
+
+function monitorStop() {
+    if (MON.pollTimer) { clearInterval(MON.pollTimer); MON.pollTimer = null; }
+    if (MON.beaconTimer) { clearInterval(MON.beaconTimer); MON.beaconTimer = null; }
+    if (LIVE.timer) { clearInterval(LIVE.timer); LIVE.timer = null; }
+    if (MON.raf) { cancelAnimationFrame(MON.raf); MON.raf = null; }
+    stopCurrentAudio();
+    MON.queue = [];
+}
+</script>
+</body>
+</html>
