@@ -104,6 +104,61 @@ class EmqxError(Exception):
         self.kind = kind      # timeout / network / http / not_configured
 
 
+def rfc3339(epoch_or_str):
+    """
+    把时间转成 EMQX `until` 要求的 RFC3339 格式（**必须带时区**）。
+
+    实测 EMQX 5.8.9：
+      "2026-10-05T03:00:00+08:00"  → 200 ✓
+      "2026-10-05 03:00:00"        → 400 matched_no_union_member
+      "infinity"                   → 200 ✓（永久）
+    传数字表示"多少小时之后"，传字符串则：
+      - "infinity" / 空 → 原样返回
+      - 已是 RFC3339 → 原样返回
+      - 旧格式 "YYYY-MM-DD HH:MM:SS" → 补本地时区
+    """
+    if epoch_or_str in (None, ""):
+        return "infinity"
+    if isinstance(epoch_or_str, (int, float)):
+        epoch = time.time() + float(epoch_or_str) * 3600.0
+    else:
+        s = str(epoch_or_str).strip()
+        if s.lower() == "infinity":
+            return "infinity"
+        if "T" in s and ("+" in s[10:] or s.endswith("Z")):
+            return s
+        # 旧格式（无时区）→ 解析成 epoch 再补时区
+        try:
+            epoch = time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+        except Exception:  # noqa: BLE001
+            try:
+                epoch = time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+            except Exception:  # noqa: BLE001
+                return "infinity"
+    lt = time.localtime(epoch)
+    base = time.strftime("%Y-%m-%dT%H:%M:%S", lt)
+    off = time.strftime("%z", lt)          # +0800
+    if off:
+        off = off[:3] + ":" + off[3:]      # +08:00
+    return base + off
+
+
+def is_ip_like(value):
+    """判断是否像 IP 地址（EMQX 的 peerhost 封禁必须给合法 IP）"""
+    s = str(value or "").strip()
+    if not s:
+        return False
+    if ":" in s:                            # IPv6
+        return all(c in "0123456789abcdefABCDEF:." for c in s)
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
 class EmqxClient(object):
     """EMQX 5.x REST 客户端。无状态 + 每请求独立 opener，线程安全。"""
 
@@ -313,11 +368,17 @@ class EmqxClient(object):
 
     def ban(self, who, reason="", as_type="username", until=None):
         """
-        拉黑（幂等）。until=None → 显式 "infinity"（永久）。
+        拉黑（幂等）。until 支持：
+          数字  → 多少小时之后失效（自动转 RFC3339，带本地时区）
+          None  → "infinity"（永久；慎用）
+          字符串 → RFC3339 / "infinity" / 旧格式（自动补时区）
+        as_type ∈ username / clientid / peerhost（peerhost 必须是合法 IP）。
         返回 (ok, error)；ALREADY_EXISTS 视为成功。
         """
+        if as_type == "peerhost" and not is_ip_like(who):
+            return False, "peerhost 必须是合法 IP，收到: %r" % (who,)
         body = {"as": as_type, "who": who, "reason": reason or "",
-                "until": "infinity" if until in (None, "", 0) else until}
+                "until": rfc3339(until)}
         try:
             self._json("POST", "/api/v5/banned", body=body, expect=(200, 201, 204))
             return True, None

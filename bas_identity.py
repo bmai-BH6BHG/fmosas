@@ -93,6 +93,17 @@ DEFAULT_POLICY = {
     "app_confirm_rounds": 2,
     # 拉黑时长（小时）；None = 永久。默认 24 小时 —— 误封可自愈，不再出现 infinity
     "ban_hours": 24,
+    # ---------------- 假证书 / 认证失败的反滥用（现场要求：假证书要封）----------------
+    # 原则：**绝不按"客户端自称的呼号"封禁** —— 攻击者可以拿别人的呼号配假证书，
+    #       按呼号封等于帮他栽赃（把无辜用户封掉）。因此封的是：
+    #         ① 发起连接的 clientid（精确到那个客户端）
+    #         ② 反复尝试的 peerhost（IP），到阈值才封，且短时
+    #       呼号只用于**留证**，用于事后人工处理。
+    "fake_cert_ban_clientid": True,     # 假证书 → 封该 clientid
+    "fake_cert_callsign_ban": False,    # 是否按呼号封（默认关，防栽赃；慎开）
+    "fake_cert_ip_ban_after": 10,       # 同一 IP 在窗口内失败多少次后封 IP
+    "fake_cert_window_sec": 300,        # 统计窗口（秒）
+    "fake_cert_ip_ban_hours": 1,        # 封 IP 时长（小时，短时可自愈）
     # 拉黑白名单（永不自动封）：管理员/骨干台呼号
     "ban_whitelist": [],
     # 同一呼号在窗口内最多自动封几次（防刷）

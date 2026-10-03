@@ -1897,6 +1897,7 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         username = body.get('username', '')
         password = body.get('password', '')
         clientid = str(body.get('clientid') or '')
+        peerhost = str(body.get('peerhost') or '')
         if not username or not password:
             self.send_json({'result': 'deny', 'reason': '缺少 username 或 password'})
             return
@@ -1940,6 +1941,19 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 print("[AUTH] 拒绝: %s | username(len=%d)=%r" % (
                     result.get('reason', '未知原因'),
                     len(username), username[:80]))
+                # 假证书/验签失败 → 留证 + 反滥用（封 clientid / 反复尝试的 IP）。
+                # 注意：**不按呼号封**（防栽赃），呼号只用于留证与人工核查。
+                try:
+                    svc = getattr(self.__class__, 'bas_service', None)
+                    if svc is not None and hasattr(svc, 'record_auth_rejection'):
+                        r = svc.record_auth_rejection(
+                            username, clientid, peerhost, result.get('reason', ''))
+                        if r.get('banned_clientid') or r.get('banned_peerhost'):
+                            print("[AUTH] 反滥用处置: clientid封=%s IP封=%s 假证书来源=%s"
+                                  % (r.get('banned_clientid'), r.get('banned_peerhost'),
+                                     peerhost or '-'))
+                except Exception as _e_rec:  # noqa: BLE001
+                    print("[AUTH] 拒绝事件记录失败（不影响认证）: %s" % _e_rec)
             self.send_json(result)
         except Exception as e:
             self.send_json({'result': 'deny', 'reason': '认证异常: ' + str(e)}, 500)

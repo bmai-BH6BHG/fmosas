@@ -261,8 +261,9 @@ def build_sas_authn(url, listener_id=None, name="fmo-sas-http", ssl_enable=False
         # clientid 必须传给 SAS：APP 签名是"连接绑定式"的
         #   FMO-APP-mqtt:{ts}:{callsign}:{userPubkey}:{clientid}
         # 少了它就只剩未绑定的 HTTP 式签名（可被重放到别的连接）
+        # peerhost 用于假证书反滥用：按 IP 统计反复尝试（不按呼号封，防栽赃）
         "body": {"username": "${username}", "password": "${password}",
-                 "clientid": "${clientid}"},
+                 "clientid": "${clientid}", "peerhost": "${peerhost}"},
         "pool_size": 8,
         "connect_timeout": "5s",
         "request_timeout": "5s",

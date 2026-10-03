@@ -30,6 +30,7 @@ import time
 
 import bas_fmo_parser as parser_mod
 from bas_identity import IdentityPolicy, PASS, WARN, KICK, DEFAULT_POLICY
+import bas_emqx
 from bas_emqx import EmqxClient, EmqxError, EmqxPoller, get_lan_ip
 from bas_audit_db import AuditDB, now_text, ts10
 
@@ -89,6 +90,7 @@ class AuditService(object):
         self._prev = {}                 # clientid -> 上轮计数器基线
         self._dup_uid_track = {}        # uid -> 连续轮数
         self._app_track = {}            # clientid -> 非本 APP 连续轮数
+        self._auth_fail_track = {}      # peerhost -> [失败时间戳]（假证书反滥用）
         self._fail_times = []           # FAIL 落库限流
         self._last_cleanup = 0.0
         self._last_collect = 0.0
@@ -170,16 +172,142 @@ class AuditService(object):
         return bool(self.sas_has_any())
 
     def _ban_recorder(self, callsign, reason, hours):
-        until = None
-        if hours:
-            until = time.strftime("%Y-%m-%d %H:%M:%S",
-                                  time.localtime(time.time() + float(hours) * 3600))
+        # 注意：EMQX 的 until 必须是 RFC3339 带时区（实测 5.8.9 只认这个或 "infinity"），
+        # 由 bas_emqx.rfc3339 统一格式化；这里直接传"小时数"。
+        until = bas_emqx.rfc3339(hours)
         ok, err, kicked = self.emqx.ban_username(callsign, reason, until)
         if ok:
-            self.db.add_blacklist_event("ban", callsign, reason, until or "infinity",
+            self.db.add_blacklist_event("ban", callsign, reason, until,
                                         "身份控制", "username")
             self._bump("bans")
         return bool(ok)
+
+    def _ban_any(self, who, reason, hours, as_type="username"):
+        """
+        按指定维度封禁并踢下线：as_type ∈ username / clientid / peerhost。
+        （EMQX 支持这三种。假证书处置用 clientid/peerhost，避免按呼号栽赃）
+        """
+        if not who:
+            return False
+        if as_type == "peerhost" and not bas_emqx.is_ip_like(who):
+            return False        # EMQX 只接受合法 IP；非法值直接放弃（避免误封）
+        until = bas_emqx.rfc3339(hours)
+        ok, err = self.emqx.ban(who, reason, as_type, until)
+        if ok:
+            # 踢下线（clientid 直接踢；peerhost 按 IP 找连接）
+            try:
+                if as_type == "clientid":
+                    self.emqx.kick_clients([who])
+                else:
+                    rows = self.emqx.list_clients(limit=2000)
+                    ids = []
+                    for r in rows:
+                        if as_type == "peerhost" and r.get("ip_address") != who:
+                            continue
+                        if as_type == "username" and r.get("username") != who:
+                            continue
+                        if r.get("clientid"):
+                            ids.append(r["clientid"])
+                    if ids:
+                        self.emqx.kick_clients(ids)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.db.add_blacklist_event("ban", who, reason, until,
+                                            "反滥用", as_type)
+            except Exception:  # noqa: BLE001
+                pass
+            self._bump("bans")
+        return bool(ok)
+
+    def record_auth_rejection(self, callsign="", clientid="", peerhost="", reason=""):
+        """
+        /auth 拒绝一次连接时调用（假证书、验签失败、吊销、根不受信任等）。
+
+        做两件事：
+          1) **留证**：写审计行，scene=fake_cert，记下自称的呼号 / clientid / IP
+          2) **反滥用**：
+               - 封该 clientid（精确到那个客户端，不伤别人）
+               - 同一 IP 在窗口内失败达阈值 → 短暂封 IP
+             ⚠️ **绝不按呼号封**：攻击者可用别人的呼号配假证书来栽赃，
+                按呼号封等于替他把无辜用户封掉。呼号只用于留证与人工核查。
+
+        返回 {"recorded":bool,"banned_clientid":bool,"banned_peerhost":bool,"note":str}
+        """
+        out = {"recorded": False, "banned_clientid": False,
+               "banned_peerhost": False, "note": ""}
+        cs = (callsign or "").strip().upper()
+        cid = (clientid or "").strip()
+        ip = (peerhost or "").strip()
+        reason = reason or "认证失败"
+
+        # 情形分类：只有"凭证类"失败才算攻击（空请求/服务器自身错误不算）
+        # 注意：实测 EMQX/SAS 的拒绝原因五花八门（如 "Int CA 验证异常: 'sn'"、
+        #      "根 CA 不受信任（公钥=...）"、"proof 签名验证失败"、"证书已被吊销"），
+        #      所以这里用"非攻击原因"排除法 + 宽松的凭证关键词。
+        not_attack = ("缺少 username", "缺少 username 或 password", "CA 管理器未初始化",
+                      "认证异常", "内部错误", "数据库未初始化")
+        cred_kw = ("CA", "proof", "签名", "证书", "不受信任", "解析失败",
+                   "验签", "吊销", "公钥")
+        attack = (not any(k in reason for k in not_attack)
+                  and any(k in reason for k in cred_kw))
+        if not attack:
+            out["note"] = "非凭证类失败，仅记录不处置"
+            return out
+
+        # 1) 留证
+        try:
+            self.db.write_audit_packet({
+                "ts": now_text(True), "topic": "", "clientid": cid,
+                "conn_callsign": cs, "conn_uid": "",
+                "verdict": KICK, "scene": "fake_cert",
+                "reason": "认证被拒（假证书/验签失败）: %s | 自称呼号=%s clientid=%s ip=%s"
+                          % (reason, cs or "-", cid or "-", ip or "-"),
+                "confidence": 0.9, "source": "auth",
+            })
+            out["recorded"] = True
+            self._bump("fake_cert_attempts")
+        except Exception as e:  # noqa: BLE001
+            out["note"] = "留证失败: %s" % e
+
+        # 2) 封 clientid（精确打击，不涉呼号）
+        if self.policy.cfg.get("fake_cert_ban_clientid", True) and cid:
+            try:
+                if self._ban_any(cid, "假证书/认证失败: %s" % reason,
+                                 self.policy.cfg.get("ban_hours"),
+                                 as_type="clientid"):
+                    out["banned_clientid"] = True
+            except Exception as e:  # noqa: BLE001
+                out["note"] += " | 封 clientid 失败: %s" % e
+
+        # 3) 同 IP 反复尝试 → 短时封 IP
+        if ip:
+            now = time.time()
+            win = float(self.policy.cfg.get("fake_cert_window_sec", 300) or 300)
+            rec = self._auth_fail_track.get(ip) or []
+            rec = [t for t in rec if now - t < win]
+            rec.append(now)
+            self._auth_fail_track[ip] = rec
+            need = int(self.policy.cfg.get("fake_cert_ip_ban_after", 10) or 0)
+            if need > 0 and len(rec) >= need:
+                try:
+                    if self._ban_any(ip, "同一 IP 反复使用假证书（%d 次/%ds）"
+                                     % (len(rec), int(win)),
+                                     self.policy.cfg.get("fake_cert_ip_ban_hours", 1),
+                                     as_type="peerhost"):
+                        out["banned_peerhost"] = True
+                        self._auth_fail_track[ip] = []
+                except Exception as e:  # noqa: BLE001
+                    out["note"] += " | 封 IP 失败: %s" % e
+
+        # 4) 可选：按呼号封（默认关；开启前务必理解栽赃风险）
+        if self.policy.cfg.get("fake_cert_callsign_ban") and cs:
+            try:
+                self._ban_recorder(cs, "假证书（按呼号封，已开启 fake_cert_callsign_ban）",
+                                   self.policy.cfg.get("ban_hours"))
+            except Exception:  # noqa: BLE001
+                pass
+        return out
 
     def _bump(self, key, n=1):
         with self._lock:
