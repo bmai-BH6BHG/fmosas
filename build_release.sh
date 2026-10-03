@@ -473,7 +473,7 @@ cp -a "$REPO/dist/VERSION"             "$UPLOAD/VERSION"
 # BAS 子渠道：bas/ 下的文件进 <BASE>/bas/（一键安装脚本 + 旧系统扫描/迁移模块）
 mkdir -p "$UPLOAD/bas"
 MISSING_BAS=""
-for BF in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py VERSION; do
+for BF in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py bas_diagnose.py VERSION; do
     if [ -f "$REPO/bas/$BF" ]; then
         cp -a "$REPO/bas/$BF" "$UPLOAD/bas/$BF"
     else
