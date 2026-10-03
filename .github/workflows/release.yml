@@ -109,15 +109,19 @@ jobs:
             out/MANIFEST.txt
             out/checksums.txt
 
-      - name: 追加 BAS 子目录资产（bas/*）
+      - name: 追加 BAS 资产（扁平名，避免与主资产撞名）
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
         run: |
           set -e
-          # 文件夹形式不会展开，必须逐个上传（保持 bas/ 前缀，客户端按 bas/xxx 取用）
-          for f in out/bas/*; do
-            [ -f "$f" ] || continue
-            echo "上传 $f"
-            gh release upload "$TAG" "$f" --clobber
-          done
+          # 注意：GitHub Release 会把资产名里的 "bas/" 前缀压平，导致 bas-install.sh 变成
+          # install.sh 与主脚本撞名、且 /download/bas/xxx 取不到。因此这里显式用扁平名：
+          #   bas-install.sh / bas-uninstall.sh / bas-migrate.py / bas-emqx-auth.py / bas-version.txt
+          [ -f out/bas/install-bas.sh ]   && gh release upload "$TAG" out/bas/install-bas.sh#bas-install.sh   --clobber
+          [ -f out/bas/uninstall-bas.sh ] && gh release upload "$TAG" out/bas/uninstall-bas.sh#bas-uninstall.sh --clobber
+          [ -f out/bas/bas_migrate.py ]   && gh release upload "$TAG" out/bas/bas_migrate.py#bas-migrate.py   --clobber
+          [ -f out/bas/bas_emqx_auth.py ] && gh release upload "$TAG" out/bas/bas_emqx_auth.py#bas-emqx-auth.py --clobber
+          [ -f out/bas/VERSION ]          && gh release upload "$TAG" out/bas/VERSION#bas-version.txt        --clobber
+          echo "--- 复核 BAS 资产 ---"
+          gh release view "$TAG" --json assets -q '.assets[].name' | grep '^bas-' || true

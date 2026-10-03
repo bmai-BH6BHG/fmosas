@@ -110,8 +110,8 @@ TMP="$(mktemp -d)"
 # ══════════════════════════════════════════════════════════════
 info ""
 info "[1/7] 扫描本机原有的 SAS / FAS ..."
-curl -fsSL "$BASE_URL/bas/bas_migrate.py" -o "$TMP/bas_migrate.py" 2>/dev/null \
-    || die "下载扫描模块失败（$BASE_URL/bas/bas_migrate.py）"
+curl -fsSL "$BASE_URL/bas-migrate.py" -o "$TMP/bas_migrate.py" 2>/dev/null \
+    || die "下载扫描模块失败（$BASE_URL/bas-migrate.py）"
 
 SCAN_JSON="$TMP/scan.json"
 "$PY" "$TMP/bas_migrate.py" --json > "$SCAN_JSON" 2>"$TMP/scan.err" || {
@@ -240,7 +240,7 @@ fi
 # ══════════════════════════════════════════════════════════════
 info ""
 info "[5/7] 识别 MQTT(EMQX) 并把客户端认证指向本服务 ..."
-curl -fsSL "$BASE_URL/bas/bas_emqx_auth.py" -o "$TMP/bas_emqx_auth.py" 2>/dev/null || \
+curl -fsSL "$BASE_URL/bas-emqx-auth.py" -o "$TMP/bas_emqx_auth.py" 2>/dev/null || \
     cp "$INSTALL_DIR/bas_emqx_auth.py" "$TMP/bas_emqx_auth.py" 2>/dev/null || true
 
 # 认证 URL：用本机地址 + 分系统公网端口（EMQX 与分系统同机场景）
@@ -315,6 +315,6 @@ echo "  首次使用：EMQX → 认证(Authentication) → HTTP 认证，URL 填
 echo "            http://<本机IP>:$SUBSYS_PORT/auth （注意是「认证」不是「授权」）"
 echo "  日志     : journalctl -u ${SVC:-fmo-subsystem} -f"
 echo "  再跑一次 : 可安全重跑（幂等）"
-echo "  卸载     : curl -fsSL $BASE_URL/bas/uninstall-bas.sh | sudo bash"
+echo "  卸载     : curl -fsSL $BASE_URL/uninstall-bas.sh | sudo bash"
 echo "======================================"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

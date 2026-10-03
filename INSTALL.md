@@ -2,6 +2,61 @@
 
 > 由 BH6BHG 提供 ｜ 适用于群晖 DSM 7、Ubuntu / Debian / CentOS / Alpine 等 Linux
 
+---
+
+## 零、BAS 一键安装（推荐：认证 + 审计一体）
+
+**BAS = SAS（认证）+ FAS（审计）融为一体的单一服务**：一个进程、一个端口、一次登录、一个数据库，
+审计能力已用 Python 内嵌，不再需要 .NET 运行时、不再占用 9527、也不再有"FAS 把 SAS 合法呼号拉黑"的问题。
+
+一条命令（会自动做完整迁移）：
+
+```bash
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-install.sh | sudo bash
+```
+
+它会按顺序执行：
+
+1. **扫描**本机原有的 SAS（分系统认证）与 FAS（.NET 审计）：服务单元、安装目录、数据库、CA 私钥、端口
+2. **备份**旧数据（数据库 / CA 私钥 / 配置 → `/var/backups/fmo-bas/bas-migrate-<时间>.tar.gz`）
+3. **卸载**旧系统（含清理 EMQX 上旧 FAS 的规则与桥接；SAS 的 `/auth` 端点保留不动）
+4. **安装**新 BAS（单进程，含内嵌审计模块）
+5. **识别 MQTT(EMQX)** 并把客户端认证指向本服务端口（默认 `35928/auth`；改动前备份认证链，可回滚）
+6. 重启并用 `/api/health`、`/auth`、审计界面做**联合自检**
+
+**先只看不动手**（只读扫描，不需要 sudo）：
+
+```bash
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-install.sh | bash -s -- --scan-only
+```
+
+装完：
+
+| 用途 | 地址 |
+|---|---|
+| APP 调用 / EMQX 认证钩子 | `http://<公网IP>:35928`（认证 URL：`http://<IP>:35928/auth`） |
+| 审计界面（内网） | `http://<内网IP>:35929/admin/bas` |
+| 注册系统 / SAS 配置 | `http://<内网IP>:35929/admin` |
+
+卸载：
+
+```bash
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninstall-bas.sh | sudo bash            # 保留数据
+curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninstall-bas.sh | sudo bash -s -- --purge  # 彻底删除
+```
+
+> **身份控制默认是 `warn` 模式**：逐包核对身份、可疑事件全部留证并进入「待审救援」队列，
+> **不会自动封人**。观察一段时间确认无误封后，再到审计界面 → 设置 → 身份控制策略里切到 `ban`。
+
+常用参数：`--scan-only`（只扫描）`--keep-old`（不卸载旧系统）`--no-backup`（跳过备份）
+`--purge`（卸载旧 FAS 时删低权用户）`--yes`（不交互）。
+
+---
+
+## 一、只装分系统（认证端）
+
+如果只要原来的分系统（不含审计界面），用下面这个入口。
+
 本项目的部署方式已改为**网络拉取一键部署**：服务器上不需要预先上传任何文件，
 只要一条 `curl` 命令，脚本会自动下载部署包、校验 SHA256、安装依赖、生成配置、
 注册开机自启并自检。
