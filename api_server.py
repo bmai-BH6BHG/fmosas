@@ -483,6 +483,110 @@ def app_signature_ok(body):
     return False
 
 
+# ---------------------------------------------------------------------------
+# APP 密钥绑定（MQTT 连接级）：确认连接确实来自「持有 APP 私钥的本 APP」
+# ---------------------------------------------------------------------------
+# 与 HTTP 侧 app_signature 的区别：HTTP 的签名信息是
+#     FMO-APP-auth:{ts}:{callsign}:{pubkey}
+# 只能证明"发请求的是真 APP"，可以被抓包后**重放到另一条 MQTT 连接**上。
+# 因此 MQTT 侧用连接绑定式签名，把 clientid 与用户证书公钥一起签进去：
+#     FMO-APP-mqtt:{ts}:{callsign}:{userPubkeyB64}:{clientid}
+# 这样签名只对这一条连接有效；配合 300 秒时间窗，重放基本不可行。
+# 校验通过 → client_attrs.app_verified="1"（EMQX 会写到连接上，审计据此判定"本 APP"）。
+APP_MQTT_AUTH_PREFIX = "FMO-APP-mqtt"
+
+
+def _pw_data_of(password):
+    """把 MQTT password（base64url(JSON)）解成 dict；失败返回 None。"""
+    if not password or b64url_decode is None:
+        return None
+    try:
+        raw = b64url_decode(str(password))
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return None
+
+
+def _user_pubkey_of(pw_data):
+    """从证书包里取用户证书公钥（b64url，32 字节 Ed25519）。"""
+    try:
+        cert = ((pw_data or {}).get('certPackage') or {}).get('userCert') or {}
+        pk = ((cert.get('subject') or {}).get('publicKey')) or ''
+        return str(pk)
+    except Exception:
+        return ''
+
+
+def verify_app_mqtt_signature(password, clientid, callsign, log=None):
+    """
+    校验 MQTT 连接携带的 APP 签名。
+
+    返回 {"ok":bool, "present":bool, "mode":str, "reason":str}
+      mode = "bound"    连接绑定式签名校验通过（最强，推荐）
+             "legacy"   只用了 HTTP 式签名（能证明是真 APP，但未绑定连接）
+             "invalid"  带了签名但校验失败（可能被篡改/重放/时间窗过期）
+             "none"     没有带签名
+    """
+    out = {"ok": False, "present": False, "mode": "none", "reason": "未提供 app_signature"}
+    cfg = get_dmrid_config()
+    pubkeys = get_app_pubkeys(cfg)
+    if not pubkeys:
+        out["reason"] = "服务端未配置 dmrid.app_pubkey（APP 签名校验未启用）"
+        return out
+    pw_data = _pw_data_of(password)
+    if not pw_data:
+        out["reason"] = "password 不是合法的 base64url(JSON)，无法读取 APP 签名"
+        return out
+    sig = pw_data.get('app_signature') or pw_data.get('appSignature')
+    ts = pw_data.get('app_timestamp', pw_data.get('appTimestamp'))
+    if not sig or ts in (None, ''):
+        return out
+    out["present"] = True
+    out["reason"] = "签名存在但校验失败"
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        out["mode"] = "invalid"
+        out["reason"] = "app_timestamp 不是整数"
+        return out
+    window = int(cfg.get('app_timestamp_window', 300) or 300)
+    # 允许 5 秒的时钟偏移
+    if abs(time.time() - ts) > (window + 5):
+        out["mode"] = "invalid"
+        out["reason"] = "app_timestamp 超出 %d 秒时间窗（服务端与 APP 时钟不同步？）" % window
+        return out
+    try:
+        sig_bytes = b64url_decode(str(sig))
+    except Exception:
+        out["mode"] = "invalid"
+        out["reason"] = "app_signature 不是合法 base64url"
+        return out
+
+    cs = str(callsign or '').strip().upper()
+    pub_b64 = _user_pubkey_of(pw_data) or str(clientid or '')
+    cid = str(clientid or '')
+    candidates = [
+        ("bound", "%s:%d:%s:%s:%s" % (APP_MQTT_AUTH_PREFIX, ts, cs, pub_b64, cid)),
+        # 兼容：APP 尚未改造前，可直接复用 HTTP 式签名（弱一档，未绑定连接）
+        ("legacy", "%s:%d:%s:%s" % (APP_AUTH_PREFIX, ts, cs, pub_b64)),
+    ]
+    for mode, msg in candidates:
+        for pk_b64 in pubkeys:
+            try:
+                pk = b64url_decode(pk_b64)
+                if len(pk) == 32 and ed25519_verify(pk, msg.encode('utf-8'), sig_bytes):
+                    out.update({"ok": True, "mode": mode,
+                                "reason": "APP 签名校验通过（%s）" % mode})
+                    if log:
+                        log("[AUTH] APP 签名通过: callsign=%s mode=%s clientid=%s"
+                            % (cs, mode, cid))
+                    return out
+            except Exception:
+                continue
+    out["mode"] = "invalid"
+    return out
+
+
 def dmrid_login(login_id, password):
     """
     调用 DMRID 国服后端 POST /api/auth/login 校验账号密码。
@@ -1742,6 +1846,7 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
         username = body.get('username', '')
         password = body.get('password', '')
+        clientid = str(body.get('clientid') or '')
         if not username or not password:
             self.send_json({'result': 'deny', 'reason': '缺少 username 或 password'})
             return
@@ -1750,10 +1855,29 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
         try:
             result = authenticate(username, password, ca_mgr, sas_db)
+
+            # ---- APP 密钥绑定：确认连接来自「持有 APP 私钥的本 APP」----
+            # 结果写进 client_attrs → EMQX 会挂到连接上 → 审计据此判定"本 APP"
+            if result.get('result') == 'allow':
+                app = verify_app_mqtt_signature(password, clientid, username, log=print)
+                attrs = result.setdefault('client_attrs', {})
+                attrs['app_verified'] = '1' if app['ok'] else '0'
+                attrs['app_sig'] = app['mode']
+                # require_client_signature=true 时，没有有效 APP 签名直接拒绝
+                if SAS_RUNTIME_CONFIG.get('require_client_signature') and not app['ok']:
+                    print("[AUTH] 拒绝: require_client_signature=true 且 %s（callsign=%s clientid=%s）"
+                          % (app['reason'], username, clientid or '-'))
+                    self.send_json({
+                        'result': 'deny',
+                        'reason': '需要有效 APP 签名（require_client_signature=true）: ' + app['reason'],
+                    })
+                    return
+
             if result.get('result') == 'allow':
                 attrs = result.get('client_attrs', {})
-                print("[AUTH] 通过: callsign=%s uid=%s" % (
-                    attrs.get('callsign'), attrs.get('uid')))
+                print("[AUTH] 通过: callsign=%s uid=%s app_verified=%s(%s) clientid=%s" % (
+                    attrs.get('callsign'), attrs.get('uid'),
+                    attrs.get('app_verified'), attrs.get('app_sig'), clientid or '-'))
             else:
                 # 诊断：拒绝时打印客户端原始 username（前 80 字符 repr），
                 # 便于定位客户端凭证格式错误（如编码/字段不符）

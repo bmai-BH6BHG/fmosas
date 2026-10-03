@@ -81,6 +81,10 @@ DEFAULT_POLICY = {
     "app_exempt_prefixes": ["FMO-MONITOR", "fmo-web-", "fmo-web"],
     # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP
     "app_require_attrs": True,
+    # 是否强制要求「APP 密钥签名」验证通过（client_attrs.app_verified == "1"）。
+    # False（默认）= 没有签名时按"前缀+证书身份"启发式判定，兼容 APP 未改造；
+    # True          = 只有通过 APP 私钥签名的连接才算本 APP（最强，需 APP 已发版）。
+    "app_require_signature": False,
     # 连续 N 轮确认才处置（防抖：重连瞬间会有短暂的无属性状态）
     "app_confirm_rounds": 2,
     # 拉黑时长（小时）；None = 永久。默认 24 小时 —— 误封可自愈，不再出现 infinity
@@ -276,11 +280,28 @@ class IdentityPolicy(object):
         """
         cid = str((client or {}).get("clientid") or "")
         attrs = (client or {}).get("client_attrs") or {}
-        cs = normalize_callsign(attrs.get("callsign") if isinstance(attrs, dict) else "")
-        uid = normalize_uid(attrs.get("uid") if isinstance(attrs, dict) else "")
+        if not isinstance(attrs, dict):
+            attrs = {}
+        cs = normalize_callsign(attrs.get("callsign"))
+        uid = normalize_uid(attrs.get("uid"))
+        app_verified = str(attrs.get("app_verified") or "")
+        app_sig = str(attrs.get("app_sig") or "")
 
         if self._prefix_hit(cid, "app_exempt_prefixes"):
             return False, True, "内部客户端（豁免）: %s" % cid
+
+        # 最强证据：APP 私钥签名校验通过（client_attrs 由 SAS 验签后写入，
+        # 客户端伪造不出来）。签名绑定了 clientid 与用户证书公钥。
+        if app_verified == "1":
+            return True, False, "本 APP（APP 密钥签名已验证: %s, clientid=%s）" % (
+                app_sig or "ok", cid)
+
+        # 要求强制签名时：没有有效签名就不算本 APP
+        if self.cfg.get("app_require_signature"):
+            return False, False, "未通过 APP 密钥签名（app_verified=%s, app_sig=%s）: %s" % (
+                app_verified or "无", app_sig or "none", cid or "(空)")
+
+        # 回退（兼容 APP 尚未改造）：前缀 + SAS 证书身份
         if not self._prefix_hit(cid, "app_clientid_prefixes"):
             return False, False, "clientid 不是 APP 形态: %s" % (cid or "(空)")
         if self.cfg.get("app_require_attrs", True) and not (cs and uid):

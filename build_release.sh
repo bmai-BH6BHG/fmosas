@@ -235,6 +235,7 @@ copy_path API.md 0
 copy_path INSTALL.md 0
 copy_path 部署教程.md 0
 copy_path CONTRACT.md 0
+copy_path APP-APPKEY-BINDING.md 0
 # 注意：dist/VERSION 必须在下面的 "rm -rf ... $STAGE/dist" 剪枝之后放入 staging，
 #       否则会被一并删除（发布包需要它，客户端安装脚本会优先读取站根 VERSION）。
 for F in "$REPO"/dmrid_*.md; do

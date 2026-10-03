@@ -193,6 +193,9 @@ def pubkey_from_seed(seed: bytes) -> bytes:
 KDF_SALT_PREFIX = "FMO-DMRID-v1"
 BIND_KEY_PROOF_PREFIX = "FMO-DMRID-bind:"
 APP_AUTH_PREFIX = "FMO-APP-auth"
+# MQTT 连接绑定式 APP 签名的消息前缀（把 clientid + 用户证书公钥签进去，
+# 使签名只对这一条连接有效；HTTP 的 APP_AUTH_PREFIX 签名未绑定连接）
+APP_MQTT_AUTH_PREFIX = "FMO-APP-mqtt"
 
 
 def derive_keypair(identifier, password, algorithm="pbkdf2",
@@ -244,6 +247,35 @@ def build_app_signature(app_seed, timestamp, callsign, pubkey_b64) -> str:
     msg = ("%s:%d:%s:%s" % (APP_AUTH_PREFIX, int(timestamp),
                             str(callsign).strip().upper(),
                             str(pubkey_b64).strip())).encode("utf-8")
+    return b64url_encode(ed25519_sign(seed, msg))
+
+
+def build_app_signature_mqtt(app_seed, timestamp, callsign, user_pubkey_b64,
+                             clientid) -> str:
+    """
+    生成 **MQTT 连接绑定式** APP 签名（base64url）。
+
+    与 build_app_signature（HTTP /api/cert/bind 用）的区别：把 clientid 与
+    用户证书公钥一起签进消息，签名只对**这一条连接**有效，防止把 HTTP 请求上
+    抓到的签名重放到别的 MQTT 连接上。
+
+        message = UTF8("FMO-APP-mqtt:{timestamp}:{callsign}:{userPubkeyB64}:{clientid}")
+        signature = Ed25519_sign(app_seed, message)
+
+    参数：
+      app_seed        APP 的 Ed25519 私钥 seed（32B bytes 或 base64url 字符串）
+      timestamp       unix 秒（服务端 ±app_timestamp_window，默认 300 秒）
+      callsign        MQTT username（明文呼号，会转大写）
+      user_pubkey_b64 用户证书里的公钥 subject.publicKey（base64url，32B）
+      clientid        MQTT clientid（原样，不做大小写转换）
+    """
+    seed = b64url_decode(app_seed) if isinstance(app_seed, str) else bytes(app_seed)
+    if len(seed) != 32:
+        raise ValueError("app_seed 必须为 32 字节")
+    msg = ("%s:%d:%s:%s:%s" % (APP_MQTT_AUTH_PREFIX, int(timestamp),
+                               str(callsign).strip().upper(),
+                               str(user_pubkey_b64).strip(),
+                               str(clientid))).encode("utf-8")
     return b64url_encode(ed25519_sign(seed, msg))
 
 

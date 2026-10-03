@@ -258,7 +258,11 @@ def build_sas_authn(url, listener_id=None, name="fmo-sas-http", ssl_enable=False
         "method": "post",
         "url": url,
         "headers": {"content-type": "application/json"},
-        "body": {"username": "${username}", "password": "${password}"},
+        # clientid 必须传给 SAS：APP 签名是"连接绑定式"的
+        #   FMO-APP-mqtt:{ts}:{callsign}:{userPubkey}:{clientid}
+        # 少了它就只剩未绑定的 HTTP 式签名（可被重放到别的连接）
+        "body": {"username": "${username}", "password": "${password}",
+                 "clientid": "${clientid}"},
         "pool_size": 8,
         "connect_timeout": "5s",
         "request_timeout": "5s",
@@ -351,22 +355,44 @@ def switch_auth(cli, target_url, sas_url_hint="", force_all=False, dry_run=True,
                     scope, a.get("id"), a.get("backend")))
             continue
 
-        # ---- 真正的替换：先删后建，但**建失败立刻把旧配置恢复回去** ----
-        # （旧实现删了不建/建失败就留在"无认证"状态，把服务搞挂过；这里必须能回滚）
-        backup_cfgs = [snapshot_authn(a, lid) for a in sas_items]
-        for a in sas_items:
-            try:
-                cli._json("DELETE", "/api/v5/authentication/%s" % a.get("id"))  # noqa: SLF001
-                res["changed"].append("%s: 已删除旧认证 %s (url=%s)" % (
-                    scope, a.get("id"), a.get("url")))
-            except EmqxError as e:
-                res["errors"].append("%s: 删除 %s 失败: %s" % (scope, a.get("id"), e))
-
-        # 认证器 id 由 mechanism:backend 推导（password_based:http），
-        # 同一作用域只能有一个，所以先删干净再建。
+        # ---- 优先「原地更新」(PUT)：实测 EMQX 5.8 支持 ----
+        # 这一步不会出现"认证链空档期"，比"删了再建"安全得多（真机验证：HTTP 204）。
         cfg = build_sas_authn(target_url)
         created = False
         err_msg = None
+        backup_cfgs = []          # 退路分支里才填充；无旧认证时保持空
+
+        def _try_put(target_id):
+            try:
+                cli._json("PUT", "/api/v5/authentication/%s" % target_id,  # noqa: SLF001
+                          body=cfg)
+                return True, None
+            except EmqxError as e:  # noqa: BLE001
+                return False, str(e)
+
+        if sas_items:
+            first_id = sas_items[0].get("id")
+            if first_id:
+                ok_put, put_err = _try_put(first_id)
+                if ok_put:
+                    created = True
+                    res["changed"].append("%s: 原地更新认证 %s → %s（不断开认证）" % (
+                        scope, first_id, target_url))
+                else:
+                    res.setdefault("notes", []).append(
+                        "%s: PUT 原地更新失败，回退到「删除+重建」: %s" % (scope, put_err))
+
+        if not created and sas_items:
+            # ---- 退路：先删后建，但**建失败立刻把旧配置恢复回去** ----
+            # （旧实现删了不建/建失败就留在"无认证"状态，把服务搞挂过；这里必须能回滚）
+            backup_cfgs = [snapshot_authn(a, lid) for a in sas_items]
+            for a in sas_items:
+                try:
+                    cli._json("DELETE", "/api/v5/authentication/%s" % a.get("id"))  # noqa: SLF001
+                    res["changed"].append("%s: 已删除旧认证 %s (url=%s)" % (
+                        scope, a.get("id"), a.get("url")))
+                except EmqxError as e:
+                    res["errors"].append("%s: 删除 %s 失败: %s" % (scope, a.get("id"), e))
 
         def _try_create(body):
             try:

@@ -96,6 +96,24 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(204, {})
         return self._send(404, {"code": "NOT_FOUND"})
 
+    def do_PUT(self):
+        """EMQX 5.8 实测支持原地更新认证器（HTTP 204）"""
+        if not STATE.get("allow_put", True):
+            return self._send(405, {"code": "METHOD_NOT_ALLOWED"})
+        path = self.path.split("?")[0]
+        body = self._body()
+        STATE["requests"].append(("PUT", path, body))
+        aid = path.rsplit("/", 1)[-1]
+        for key in ["global"] + [l["id"] for l in STATE["listeners"]]:
+            lst = STATE.get(key, [])
+            for i, a in enumerate(lst):
+                if a.get("id") == aid:
+                    new = dict(body)
+                    new["id"] = aid
+                    lst[i] = new
+                    return self._send(204, {})
+        return self._send(404, {"code": "NOT_FOUND"})
+
 
 class SasStub(BaseHTTPRequestHandler):
     """假的 SAS /auth：对任何请求都回 deny（证明"服务活着"）"""
@@ -218,6 +236,33 @@ class EmqxAuthSwitchTests(unittest.TestCase):
         self.assertFalse(any(m == "DELETE" for (m, *_) in STATE["requests"]),
                          "绝不能发删除请求")
 
+    def test_prefers_inplace_update(self):
+        """
+        ★ 有旧认证时优先「原地更新」(PUT)：认证链不出现空档，也不发 DELETE。
+        （真机验证：EMQX 5.8.9 PUT 返回 204）
+        """
+        STATE["allow_put"] = True
+        r = ea.switch_auth(self.cli, self.target_url(), dry_run=False)
+        self.assertEqual([], r["errors"], r["errors"])
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(any(m == "PUT" for (m, *_) in STATE["requests"]),
+                        "应优先 PUT 原地更新: %s" % STATE["requests"])
+        self.assertFalse(any(m == "DELETE" for (m, *_) in STATE["requests"]),
+                         "原地更新路径不应删除任何认证器")
+        urls = [a.get("url") for a in STATE["global"]]
+        self.assertIn(self.target_url(), urls)
+
+    def test_falls_back_to_recreate_when_put_unsupported(self):
+        """EMQX 不支持 PUT（老版本）时回退到删除+重建，且必须成功"""
+        STATE["allow_put"] = False
+        try:
+            r = ea.switch_auth(self.cli, self.target_url(), dry_run=False)
+        finally:
+            STATE["allow_put"] = True
+        self.assertEqual([], r["errors"], r["errors"])
+        self.assertTrue(r["ok"], r)
+        self.assertIn(self.target_url(), [a.get("url") for a in STATE["global"]])
+
     def test_dry_run_changes_nothing(self):
         before = json.dumps(STATE["global"], sort_keys=True)
         r = ea.switch_auth(self.cli, self.target_url(), dry_run=True)
@@ -248,8 +293,10 @@ class EmqxAuthSwitchTests(unittest.TestCase):
 
     def test_rollback_when_create_fails(self):
         """
-        ★ 建失败必须自动回滚：模拟"能删但建不上"，验证旧配置被恢复、服务不处于无认证状态
+        ★ PUT 原地更新也失败、重建也失败 → 必须自动回滚恢复旧配置，
+        绝不能留在"无认证"状态（这正是之前把用户服务器搞挂的场景）。
         """
+        STATE["allow_put"] = False
         orig_json = self.cli._json
         calls = {"n": 0}
 
@@ -265,6 +312,7 @@ class EmqxAuthSwitchTests(unittest.TestCase):
             r = ea.switch_auth(self.cli, self.target_url(), dry_run=False)
         finally:
             self.cli._json = orig_json
+            STATE["allow_put"] = True
         self.assertFalse(r["ok"])
         self.assertTrue(r.get("rolled_back"), "必须回滚: %s" % r)
         # 认证链里必须仍有可用认证（回滚恢复的那条）
