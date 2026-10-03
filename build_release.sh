@@ -218,6 +218,12 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py; do
     copy_path "$F" 1
 done
+# BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）
+for F in bas_fmo_parser.py bas_emqx.py bas_identity.py bas_audit_db.py \
+         bas_audit.py bas_http.py bas_migrate.py bas_emqx_auth.py; do
+    copy_path "$F" 1
+done
+copy_path tests 0
 copy_path admin 1
 for F in config.default.json config.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh uploads/.gitkeep; do
@@ -464,6 +470,48 @@ cp -a "$OUT_FLAT"                      "$UPLOAD/fmo-subsystem.tar.gz"
 cp -a "$DIST/fmo-subsystem.tar.gz.sha256" "$UPLOAD/fmo-subsystem.tar.gz.sha256"
 cp -a "$REPO/dist/VERSION"             "$UPLOAD/VERSION"
 
+# BAS 子渠道：bas/ 下的文件进 <BASE>/bas/（一键安装脚本 + 旧系统扫描/迁移模块）
+mkdir -p "$UPLOAD/bas"
+MISSING_BAS=""
+for BF in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py VERSION; do
+    if [ -f "$REPO/bas/$BF" ]; then
+        cp -a "$REPO/bas/$BF" "$UPLOAD/bas/$BF"
+    else
+        MISSING_BAS="$MISSING_BAS $BF"
+    fi
+done
+# 上传的脚本必须是 LF（否则 Linux 上 bash 会报 bad interpreter）
+for BF in install-bas.sh uninstall-bas.sh bas_emqx_auth.py; do
+    if [ -f "$UPLOAD/bas/$BF" ]; then
+        if grep -q $'\r' "$UPLOAD/bas/$BF" 2>/dev/null; then
+            tr -d '\r' < "$UPLOAD/bas/$BF" > "$UPLOAD/bas/$BF.lf" && mv "$UPLOAD/bas/$BF.lf" "$UPLOAD/bas/$BF"
+            echo "      [BAS] 已把 $BF 的 CRLF 转为 LF"
+        fi
+        chmod +x "$UPLOAD/bas/$BF"
+    fi
+done
+# BAS 安装脚本里的分发地址注入（与 install.sh 同规则：只替换占位行，行数不变）
+if [ -n "$BASE_URL" ] && [ -f "$UPLOAD/bas/install-bas.sh" ]; then
+    if grep -qE '^[[:space:]]*DEFAULT_BASE_URL=' "$UPLOAD/bas/install-bas.sh"; then
+        ESC_BAS="$(printf '%s' "$BASE_URL" | sed 's/[&|\\]/\\&/g')"
+        sed "s|^[[:space:]]*DEFAULT_BASE_URL=.*|DEFAULT_BASE_URL=\"$ESC_BAS\"|" \
+            "$UPLOAD/bas/install-bas.sh" > "$UPLOAD/bas/install-bas.sh.new"
+        cat "$UPLOAD/bas/install-bas.sh.new" > "$UPLOAD/bas/install-bas.sh"
+        rm -f "$UPLOAD/bas/install-bas.sh.new"
+        if grep -qF "DEFAULT_BASE_URL=\"$BASE_URL\"" "$UPLOAD/bas/install-bas.sh"; then
+            echo "      [BAS] 已注入地址: DEFAULT_BASE_URL=\"$BASE_URL\""
+        else
+            warn "[BAS] 地址注入校验失败，请人工检查 bas/install-bas.sh"
+        fi
+    else
+        warn "[BAS] install-bas.sh 未找到 DEFAULT_BASE_URL= 行，跳过注入"
+    fi
+fi
+if [ -n "$MISSING_BAS" ]; then
+    warn "BAS 渠道缺少文件（未进上传目录）:$MISSING_BAS"
+    warn "  提示：bas/ 下应包含 install-bas.sh / uninstall-bas.sh / bas_migrate.py / VERSION"
+fi
+
 # 上传文件夹自检：关键文件齐全、且不含任何敏感/运行时文件
 for NEED in install.sh uninstall.sh "$TARNAME" "$TARNAME.sha256" fmo-subsystem.tar.gz fmo-subsystem.tar.gz.sha256 VERSION; do
     [ -s "$UPLOAD/$NEED" ] || die "上传文件夹缺少 $NEED，已中止"
@@ -492,6 +540,10 @@ echo "      把它里面的内容整个传到分发地址根目录即可，不�
 for F in install.sh uninstall.sh "$TARNAME" "$TARNAME.sha256" fmo-subsystem.tar.gz fmo-subsystem.tar.gz.sha256 VERSION; do
     printf '        %8s  %s\n' "$(file_size "$UPLOAD/$F")" "$F"
 done
+echo "      bas/ 子目录（BAS = SAS + FAS 融合，单独一条命令）："
+for F in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py VERSION; do
+    [ -f "$UPLOAD/bas/$F" ] && printf '        %8s  bas/%s\n' "$(file_size "$UPLOAD/bas/$F")" "$F"
+done
 echo ""
 echo "  （dist/ 下的 MANIFEST.txt / CONTRACT.md 等为留档文件，不必上传，已在包内）"
 echo "  包 SHA256   : $HASH"
@@ -499,7 +551,9 @@ echo "  文件数      : $FILECOUNT（自检 + 解包复核均通过）"
 echo ""
 echo "  客户端安装（上传完成后）："
 if [ -n "$BASE_URL" ]; then
-    echo "    curl -fsSL $BASE_URL/install.sh | sudo bash"
+    echo "    FMO 分系统      : curl -fsSL $BASE_URL/install.sh | sudo bash"
+    echo "    BAS 一键安装    : curl -fsSL $BASE_URL/bas/install-bas.sh | sudo bash"
+    echo "      （自动扫描旧 SAS/FAS → 备份 → 卸载 → 安装新 BAS）"
     echo "  客户端卸载："
     echo "    curl -fsSL $BASE_URL/uninstall.sh | sudo bash"
 else

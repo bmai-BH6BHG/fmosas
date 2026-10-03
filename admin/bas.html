@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BAS 审计 · FMO</title>
+<link rel="stylesheet" href="/admin/bas.css">
+</head>
+<body>
+<div id="login" class="login-mask hidden">
+  <div class="login-card">
+    <h2>BAS 审计控制台</h2>
+    <p class="muted" id="login-hint">请输入管理员账号</p>
+    <div id="setup-fields" class="hidden">
+      <label>设置管理员账号<input id="su-user" autocomplete="username"></label>
+      <label>设置密码（≥6 位）<input id="su-pass" type="password" autocomplete="new-password"></label>
+      <button class="btn primary" id="btn-setup">创建管理员</button>
+    </div>
+    <div id="login-fields">
+      <label>账号<input id="li-user" autocomplete="username"></label>
+      <label>密码<input id="li-pass" type="password" autocomplete="current-password"></label>
+      <button class="btn primary" id="btn-login">登录</button>
+    </div>
+    <p class="err" id="login-err"></p>
+  </div>
+</div>
+
+<header class="top">
+  <div class="brand">BAS <span class="muted">认证 + 审计</span></div>
+  <nav id="nav"></nav>
+  <div class="top-right">
+    <span id="policy-badge" class="badge" title="身份控制策略模式">—</span>
+    <button class="btn ghost" id="btn-logout">退出</button>
+  </div>
+</header>
+
+<main>
+  <!-- 总览 -->
+  <section id="tab-status" class="tab">
+    <div class="grid" id="cards"></div>
+    <h3>服务与链路</h3>
+    <div id="status-detail" class="panel"></div>
+  </section>
+
+  <!-- 在线 -->
+  <section id="tab-online" class="tab hidden">
+    <div class="row">
+      <h3>在线客户端</h3>
+      <span class="muted" id="online-count"></span>
+      <button class="btn ghost" data-reload="online">刷新</button>
+    </div>
+    <div class="panel table-wrap"><table id="t-online"></table></div>
+  </section>
+
+  <!-- 排行榜 -->
+  <section id="tab-leaderboard" class="tab hidden">
+    <div class="row">
+      <h3>呼号流量排行榜</h3>
+      <label class="inline">起<input type="datetime-local" id="lb-since"></label>
+      <label class="inline">止<input type="datetime-local" id="lb-until"></label>
+      <label class="inline">分组
+        <select id="lb-group"><option value="callsign">呼号</option><option value="clientid">clientid</option></select>
+      </label>
+      <button class="btn" data-reload="leaderboard">查询</button>
+      <button class="btn ghost" id="lb-csv">导出 CSV</button>
+    </div>
+    <div class="panel table-wrap"><table id="t-lb"></table></div>
+    <div id="lb-detail"></div>
+  </section>
+
+  <!-- 主题统计 -->
+  <section id="tab-topics" class="tab hidden">
+    <div class="row">
+      <h3>主题统计（FMO/RAW 发包时间轴）</h3>
+      <label class="inline">主题<input id="tp-topic" placeholder="FMO/RAW"></label>
+      <label class="inline">粒度
+        <select id="tp-bucket">
+          <option value="10s">10 秒</option><option value="1m" selected>1 分钟</option>
+          <option value="5m">5 分钟</option><option value="1h">1 小时</option>
+        </select>
+      </label>
+      <button class="btn" data-reload="topics">查询</button>
+      <button class="btn ghost" id="tp-csv">导出 CSV</button>
+    </div>
+    <div class="panel">
+      <div class="muted">每根柱子 = 一个时间桶；hover 看该桶 Top 呼号</div>
+      <div id="timeline" class="timeline"></div>
+    </div>
+    <div class="panel table-wrap"><table id="t-topics"></table></div>
+  </section>
+
+  <!-- 身份审计 -->
+  <section id="tab-audit" class="tab hidden">
+    <div class="row">
+      <h3>身份审计事件</h3>
+      <label class="inline">判决
+        <select id="au-verdict">
+          <option value="">全部</option><option value="KICK">KICK 伪造</option>
+          <option value="WARN">WARN 告警</option><option value="FAIL">FAIL 非法包</option>
+        </select>
+      </label>
+      <label class="inline">呼号<input id="au-callsign" placeholder="BG5ESN"></label>
+      <button class="btn" data-reload="audit">查询</button>
+    </div>
+    <div class="panel table-wrap"><table id="t-audit"></table></div>
+  </section>
+
+  <!-- 黑名单 -->
+  <section id="tab-blacklist" class="tab hidden">
+    <div class="row">
+      <h3>黑名单</h3>
+      <input id="bl-who" placeholder="呼号" class="narrow">
+      <input id="bl-reason" placeholder="原因（留痕）">
+      <input id="bl-hours" placeholder="时长(小时，空=永久)" class="narrow">
+      <button class="btn danger" id="bl-ban">拉黑并踢下线</button>
+      <button class="btn ghost" data-reload="blacklist">刷新</button>
+    </div>
+    <div class="panel table-wrap"><table id="t-bl"></table></div>
+    <h3>操作留痕</h3>
+    <div class="panel table-wrap"><table id="t-blh"></table></div>
+  </section>
+
+  <!-- 待审救援 -->
+  <section id="tab-quarantine" class="tab hidden">
+    <div class="row">
+      <h3>待审队列（疑似误封，一键放行）</h3>
+      <select id="q-status"><option value="pending">待处理</option><option value="released">已放行</option><option value="">全部</option></select>
+      <button class="btn ghost" data-reload="quarantine">刷新</button>
+    </div>
+    <div class="panel">
+      <p class="muted">默认策略下不会自动封人：可疑事件先进入这里。确认是误判就点「放行」（自动解封 + 留痕）。</p>
+    </div>
+    <div class="panel table-wrap"><table id="t-quarantine"></table></div>
+  </section>
+
+  <!-- 健康 -->
+  <section id="tab-health" class="tab hidden">
+    <div class="row"><h3>服务器与 EMQX 健康</h3><button class="btn ghost" data-reload="health">刷新</button></div>
+    <div class="grid" id="health-cards"></div>
+    <div class="panel table-wrap"><table id="t-health"></table></div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-settings" class="tab hidden">
+    <h3>EMQX 连接</h3>
+    <div class="panel form">
+      <label>EMQX 地址<input id="st-url" placeholder="http://127.0.0.1:18083"></label>
+      <label>API Key<input id="st-key" placeholder="EMQX Dashboard → 系统设置 → API 密钥"></label>
+      <label>API Secret<input id="st-secret" type="password" placeholder="留空表示不修改"></label>
+      <label>主题<input id="st-topic" placeholder="FMO/RAW"></label>
+      <label>本机 webhook 地址<input id="st-webhook" placeholder="自动填本机 IP:管理口"></label>
+      <div class="row">
+        <button class="btn" id="st-save">保存</button>
+        <button class="btn primary" id="st-apply">保存并创建规则链路</button>
+        <button class="btn ghost" id="st-teardown">移除规则链路</button>
+      </div>
+      <div class="muted small">收数口：<code id="st-ingest">/api/ingest</code>（EMQX 规则 body 里的 token 自动带上）</div>
+    </div>
+
+    <h3>MQTT 认证接管（把 EMQX 的客户端认证指到本服务）</h3>
+    <div class="panel form">
+      <div class="muted small" id="aa-status">未检测。点「预览改动」先看会改什么（不会动线上配置）。</div>
+      <label class="inline">目标认证 URL（留空自动用本机 IP + 部署端口）
+        <input id="aa-target" placeholder="http://192.168.1.10:35928/auth">
+      </label>
+      <label class="checkbox"><input type="checkbox" id="aa-force"> 强制把所有 HTTP 认证都视为 SAS（默认只处理像 SAS 的）</label>
+      <div class="row">
+        <button class="btn" id="aa-preview">预览改动（dry-run）</button>
+        <button class="btn primary" id="aa-apply">执行接管</button>
+      </div>
+      <pre class="muted small" id="aa-log" style="white-space:pre-wrap;max-height:180px;overflow:auto"></pre>
+    </div>
+
+    <h3>身份控制策略（误封相关，可随时调）</h3>
+    <div class="panel form">
+      <label>运行模式
+        <select id="po-mode">
+          <option value="warn">warn：只告警留证，绝不自动封人（推荐）</option>
+          <option value="ban">ban：按策略自动封禁</option>
+          <option value="off">off：完全关闭身份审计</option>
+        </select>
+      </label>
+      <label class="checkbox"><input type="checkbox" id="po-auto"> 允许自动拉黑（ban 模式下才生效）</label>
+      <label>UID 不一致时
+        <select id="po-uid">
+          <option value="warn">warn 降级告警（避免误封，推荐）</option>
+          <option value="kick">kick 判为伪造（上游 FAS 行为，易误封）</option>
+        </select>
+      </label>
+      <label>连接身份只剩一半时
+        <select id="po-partial">
+          <option value="warn">warn 只告警（推荐）</option>
+          <option value="kick">kick 判为伪造</option>
+        </select>
+      </label>
+      <label>白名单呼号（永不自动封，逗号分隔）<input id="po-wl" placeholder="BH6BHG,BG5ESN"></label>
+      <label>每小时自动封禁上限<input id="po-rate" type="number" min="0" class="narrow"></label>
+      <label>拉黑时长（小时，空=永久）<input id="po-hours" class="narrow"></label>
+      <label class="checkbox"><input type="checkbox" id="po-sas"> SAS 库不可用时仍允许封人（不建议）</label>
+      <div class="row">
+        <button class="btn primary" id="po-save">保存策略</button>
+        <span class="muted small" id="po-hint"></span>
+      </div>
+    </div>
+  </section>
+</main>
+<script src="/admin/bas.js"></script>
+</body>
+</html>

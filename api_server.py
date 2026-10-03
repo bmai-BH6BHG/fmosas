@@ -87,6 +87,18 @@ except Exception as _e_cg:
     _CERT_GEN_AVAILABLE = False
     print("[INIT] cert_gen 模块加载失败（国服ID绑定功能不可用）: %s" % _e_cg)
 
+# ==================== BAS：内嵌 FAS 审计子系统（Python 重写，无 .NET 依赖）====================
+# 把原 FAS（.NET）的审计能力并入本进程：EMQX 对接、逐包身份核对、黑名单、
+# 排行榜、主题统计、在线列表、健康监控、待审救援。路由见 bas_http.py。
+try:
+    from bas_http import init_bas
+    _BAS_AVAILABLE = True
+    print("[INIT] bas_http 模块加载成功（审计子系统可用）")
+except Exception as _e_bas:
+    init_bas = None
+    _BAS_AVAILABLE = False
+    print("[INIT] bas_http 模块加载失败（审计子系统不可用）: %s" % _e_bas)
+
 # ==================== 全局配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = None  # 稍后在 CONFIG 加载后基于域名/IP 动态设置
@@ -779,6 +791,9 @@ PUBLIC_POST_PATHS = frozenset({
     '/auth',
     '/api/cert/bind',
     '/api/sync/peer', '/api/sync/report',
+    # BAS：EMQX 规则引擎的 webhook 投递口（用 X-Ingest-Token 自校验，
+    # 公网口必须放行，否则 EMQX 在别的机器上投递会被白名单 403）
+    '/api/ingest',
 })
 
 # ==================== 请求处理器 ====================
@@ -797,6 +812,8 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
     sas_db = None        # sas_server.Database 实例
     sas_config = None    # SAS 配置 dict
     monitor = None       # monitor.VoiceMonitor 实例（语音/信标监控线程）
+    bas_http = None      # bas_http.BasHttp 实例（内嵌 FAS 审计子系统）
+    bas_service = None   # bas_audit.AuditService 实例
     public_only = False  # 公网端口处理器（PublicApiHandler）置 True，启用白名单拦截
 
     # 静默日志输出（避免刷屏），保留错误日志
@@ -872,6 +889,40 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             raise ValueError('请求体超过大小限制（%d MB）' % (MAX_BODY_SIZE // 1024 // 1024))
         return self.rfile.read(content_length)
 
+    # ---------- 路由：BAS 审计子系统（内嵌 FAS，Python 重写版）----------
+    def handle_bas_routes(self, method, path, parsed):
+        """
+        把 BAS 路由交给 bas_http.BasHttp 处理。返回 True 表示已响应。
+        覆盖：POST /api/ingest（公网 webhook）、/api/bas/*、/admin/bas*（审计界面）。
+        """
+        bas = getattr(self.__class__, 'bas_http', None)
+        if bas is None:
+            # 未启用审计子系统时，明确告知而不是静默 404
+            if path.startswith('/api/bas/') or path == '/api/ingest':
+                self.send_json({'ok': False,
+                                'error': '审计子系统(BAS)未启用或初始化失败'}, 503)
+                return True
+            return False
+        if not (path.startswith('/api/bas/') or path == '/api/ingest'
+                or path.startswith('/admin/bas')):
+            return False
+
+        body = None
+        if method in ('POST', 'PUT', 'DELETE'):
+            raw = b''
+            try:
+                raw = self.read_body()
+            except ValueError as e:
+                self.send_json({'ok': False, 'error': str(e)}, 413)
+                return True
+            if raw:
+                try:
+                    body = json.loads(raw.decode('utf-8'))
+                except Exception:
+                    body = None
+        query = parse_qs(parsed.query) if parsed and parsed.query else {}
+        return bas.handle(self, method, path, query, body)
+
     # ---------- 路由：GET ----------
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -879,6 +930,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
 
         # ---- 公网端口白名单拦截 ----
         if self._public_blocked('GET', path):
+            return
+
+        # ---- BAS 审计路由分发（内嵌 FAS，Python 版）----
+        if self.handle_bas_routes('GET', path, parsed):
             return
 
         # ---- SAS 路由分发（先检查新增路由，匹配则处理；不匹配则走原有逻辑）----
@@ -1009,6 +1064,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if self._handle_sas_routes('DELETE', path):
             return
 
+        # ---- BAS 审计路由（会话语令登出等）----
+        if self.handle_bas_routes('DELETE', path, parsed):
+            return
+
         self.send_json({'ok': False, 'error': '路径不存在'}, 404)
 
     # ---------- 路由：POST ----------
@@ -1018,6 +1077,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
 
         # ---- 公网端口白名单拦截 ----
         if self._public_blocked('POST', path):
+            return
+
+        # ---- BAS 审计路由分发（/api/ingest 与 /api/bas/*）----
+        if self.handle_bas_routes('POST', path, parsed):
             return
 
         # ---- SAS 路由分发 ----
@@ -2442,6 +2505,24 @@ def main():
     # ---- 初始化分布式同步引擎（后台线程）----
     sync_engine = init_sync_service()
 
+    # ---- 初始化 BAS 审计子系统（内嵌 FAS：EMQX 审计/黑名单/统计，纯 Python）----
+    bas_service, bas_http = None, None
+    if _BAS_AVAILABLE:
+        try:
+            bas_cfg = dict(CONFIG)
+            bas_cfg['admin_port'] = port + 1
+            sas_db_path = (sas_config or {}).get('db_path')
+            bas_service, bas_http = init_bas(
+                bas_cfg, BASE_DIR,
+                users_db_path=DB_PATH,
+                sas_db_path=sas_db_path,
+                logger=print)
+        except Exception as e:
+            print("[INIT] BAS 审计子系统初始化异常: %s" % e)
+            bas_service, bas_http = None, None
+    else:
+        print("[INIT] BAS 审计子系统: 未启用（bas_http 模块不可用）")
+
     # ---- 初始化语音/信标监控线程（MQTT 抄收 + 上报总系统）----
     monitor = None
     if _MONITOR_AVAILABLE and _SAS_AVAILABLE:
@@ -2457,12 +2538,14 @@ def main():
     else:
         print("[INIT] 语音监控: 未启用（monitor 或 SAS 模块不可用）")
 
-    # ---- 把 SAS / Sync / Monitor 对象注入 ApiHandler 类属性 ----
+    # ---- 把 SAS / Sync / Monitor / BAS 对象注入 ApiHandler 类属性 ----
     ApiHandler.sas_db = sas_db
     ApiHandler.ca_mgr = ca_mgr
     ApiHandler.sas_config = sas_config
     ApiHandler.sync_engine = sync_engine  # SyncApiMixin 通过 self.__class__.sync_engine 访问
     ApiHandler.monitor = monitor
+    ApiHandler.bas_http = bas_http
+    ApiHandler.bas_service = bas_service
 
     # 上报后台线程已由 sync_engine 接管（init_sync_service 内部启动），
     # 不再单独启动旧 report_loop，避免双通道重复上报。
@@ -2494,6 +2577,13 @@ def main():
     print("  公网 API 端口: %d（仅 APP/同步白名单，管理接口已隔离）" % port)
     print("  管理端口: %d（内网，勿映射公网）" % admin_port)
     print("  管理后台: http://内网IP:%d/admin" % admin_port)
+    if bas_service is not None:
+        print("  BAS 审计: 已内嵌（http://内网IP:%d/admin/bas）  策略模式=%s" % (
+            admin_port, bas_service.policy.mode()))
+        print("            EMQX 收数口: POST /api/ingest（X-Ingest-Token 自校验）")
+        print("            身份控制: %s" % ("启用" if bas_service.identity_control_enabled() else "关闭"))
+    else:
+        print("  BAS 审计: 未启用")
     print("  数据库:   %s" % DB_PATH)
     print("  上传目录: %s" % UPLOAD_DIR)
     print("  在线判定: 最后心跳 %d 秒内为在线" % ONLINE_TIMEOUT)
@@ -2523,6 +2613,12 @@ def main():
             admin_server.server_close()
         except Exception:
             pass
+        # 停止 BAS 审计采集线程
+        if bas_service is not None:
+            try:
+                bas_service.stop()
+            except Exception as e:
+                print("[BAS] 停止审计线程异常: %s" % e)
         # 停止语音监控线程
         if monitor is not None:
             try:

@@ -99,3 +99,8 @@ jobs:
             out/VERSION
             out/MANIFEST.txt
             out/checksums.txt
+            out/bas/install-bas.sh
+            out/bas/uninstall-bas.sh
+            out/bas/bas
+            out/bas/VERSION
+            out/bas/fas.json
