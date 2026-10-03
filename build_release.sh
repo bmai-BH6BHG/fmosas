@@ -220,7 +220,7 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
 done
 # BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）
 for F in bas_fmo_parser.py bas_emqx.py bas_identity.py bas_audit_db.py \
-         bas_audit.py bas_http.py bas_migrate.py bas_emqx_auth.py; do
+         bas_audit.py bas_http.py bas_migrate.py bas_emqx_auth.py bas_diagnose.py; do
     copy_path "$F" 1
 done
 copy_path tests 0

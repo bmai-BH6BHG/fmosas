@@ -444,6 +444,11 @@ class BasHttp(object):
                          "policy": self.svc.policy_snapshot()})
             return True
 
+        # ---- EMQX 身份链路诊断（client_attrs 为什么没下发）----
+        if sub == "diagnose" and method == "GET":
+            h.send_json({"ok": True, "report": self._diagnose()})
+            return True
+
         # ---- MQTT(EMQX) 认证接管 ----
         if sub == "emqx-auth" and method == "GET":
             h.send_json({"ok": True, "result": self._auth_switch(dry_run=True,
@@ -522,6 +527,25 @@ class BasHttp(object):
         return True
 
     # ---------------- 辅助 ----------------
+    def _diagnose(self):
+        """身份链路诊断：client_attrs 没下发的原因（版本/请求体/认证器/SAS 可达性）。"""
+        import bas_diagnose as dg
+        import glob
+        port = int((self.svc.config or {}).get("port") or 35928)
+        sas_url = "http://127.0.0.1:%d/auth" % port
+        dbs = glob.glob(os.path.join(self.base_dir, "*_audit.db"))
+        audit_db = dbs[0] if dbs else None
+        try:
+            r = dg.diagnose(
+                emqx_url=self.db.get_setting("emqx_url", ""),
+                key=self.db.get_setting("emqx_api_key", ""),
+                secret=self.db.get_setting("emqx_api_secret", ""),
+                sas_url=sas_url, base_dir=self.base_dir, audit_db=audit_db)
+            return {"ok": r["ok"], "findings": r["findings"], "facts": r["facts"],
+                    "sas_url": sas_url}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e), "findings": [], "facts": {}}
+
     def _auth_switch(self, dry_run=True, force_all=False, target_url=None):
         """
         识别 MQTT(EMQX) 并把客户端认证指向本服务端口。

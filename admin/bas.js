@@ -417,6 +417,36 @@
     api('teardown-rule', { method: 'POST' }).then(function (j) { alert(j.ok ? '已移除' : '失败'); });
   });
 
+  /* ---------------- 身份链路诊断 ---------------- */
+  $('dg-run').addEventListener('click', function () {
+    $('dg-log').textContent = '诊断中（会读取 EMQX 认证配置并探测 SAS /auth）...';
+    api('diagnose').then(function (j) {
+      var r = j.report || {};
+      var lines = [];
+      if (r.error) lines.push('诊断异常: ' + r.error);
+      (r.findings || []).forEach(function (f) {
+        var tag = f.level === 'fatal' ? '✗ 必须修' : (f.level === 'warn' ? '! 建议修' : '✓');
+        lines.push(tag + '  [' + f.code + '] ' + f.title);
+        if (f.detail) lines.push('      现象: ' + f.detail);
+        if (f.fix) lines.push('      修法: ' + f.fix);
+      });
+      var ft = r.facts || {};
+      lines.push('');
+      lines.push('EMQX: ' + (ft.emqx_url || '-') + '  版本=' + (ft.emqx_version || '-') +
+        '  可达=' + ft.emqx_reachable);
+      lines.push('HTTP 认证器数量: ' + (ft.http_authn_count === undefined ? '-' : ft.http_authn_count));
+      (ft.authn_detail || []).forEach(function (a) {
+        lines.push('  · ' + a.id + '  method=' + a.method + '  body键=' + (a.body_keys || []).join(','));
+      });
+      if (ft.other_authn && ft.other_authn.length) {
+        lines.push('其它认证器: ' + ft.other_authn.map(function (x) { return x.backend; }).join(','));
+      }
+      if (ft.audit_scenes_24h) lines.push('近 24h 审计场景: ' + JSON.stringify(ft.audit_scenes_24h));
+      $('dg-log').textContent = lines.join('\n');
+      $('dg-sum').textContent = r.ok ? '链路正常' : '发现问题，见下方【修法】';
+    }).catch(function (e) { $('dg-log').textContent = '请求失败: ' + e; });
+  });
+
   /* ---------------- MQTT 认证接管 ---------------- */
   function authSwitch(dry) {
     api('emqx-auth' + (dry ? '' : ''), {

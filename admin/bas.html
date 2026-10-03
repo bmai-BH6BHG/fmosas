@@ -157,6 +157,17 @@
       <div class="muted small">收数口：<code id="st-ingest">/api/ingest</code>（EMQX 规则 body 里的 token 自动带上）</div>
     </div>
 
+    <h3>身份链路诊断（为什么 client_attrs 没下发）</h3>
+    <div class="panel form">
+      <div class="muted small">若审计日志反复出现「连接无身份属性」，点下面按钮：会检查 EMQX 版本、
+        HTTP 认证的请求体、是否有别的认证器抢跑、SAS /auth 可达性，并直接给出修法。</div>
+      <div class="row">
+        <button class="btn primary" id="dg-run">运行诊断</button>
+        <span class="muted small" id="dg-sum"></span>
+      </div>
+      <pre class="muted small" id="dg-log" style="white-space:pre-wrap;max-height:260px;overflow:auto"></pre>
+    </div>
+
     <h3>MQTT 认证接管（把 EMQX 的客户端认证指到本服务）</h3>
     <div class="panel form">
       <div class="muted small" id="aa-status">未检测。点「预览改动」先看会改什么（不会动线上配置）。</div>

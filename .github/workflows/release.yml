@@ -123,6 +123,7 @@ jobs:
           cp out/bas/uninstall-bas.sh  up/bas-uninstall.sh
           cp out/bas/bas_migrate.py    up/bas-migrate.py
           cp out/bas/bas_emqx_auth.py  up/bas-emqx-auth.py
+          cp out/bas/bas_diagnose.py   up/bas-diagnose.py
           cp out/bas/VERSION           up/bas-version.txt
           ls -l up/
           for f in up/*; do

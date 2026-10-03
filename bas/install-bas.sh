@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.3.2"
+BAS_VERSION="1.4.0"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -298,6 +298,50 @@ case "$CODE" in
 esac
 BASRS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((SUBSYS_PORT+1))/admin/bas" 2>/dev/null || echo 000)"
 if [ "$BASRS" = "200" ]; then ok "      审计界面可用（/admin/bas）"; else err "      审计界面异常（HTTP $BASRS）"; FAIL=$((FAIL+1)); fi
+
+# ---- 身份链路诊断：client_attrs 是否真的会下发（这是身份审计能否生效的前提）----
+DIAG="$INSTALL_DIR/bas_diagnose.py"
+[ -f "$DIAG" ] || DIAG="$TMP/bas_diagnose.py"
+if [ ! -f "$DIAG" ]; then
+    curl -fsSL "$BASE_URL/bas-diagnose.py" -o "$TMP/bas_diagnose.py" 2>/dev/null && DIAG="$TMP/bas_diagnose.py"
+fi
+if [ -f "$DIAG" ]; then
+    info "      身份链路诊断（client_attrs 下发）..."
+    DIAG_JSON="$("$PY" "$DIAG" --diagnose --json --base-dir "$INSTALL_DIR" \
+                 --sas-url "http://127.0.0.1:$SUBSYS_PORT/auth" 2>/dev/null || true)"
+    if [ -z "$DIAG_JSON" ]; then
+        warn "      诊断未能运行（可稍后手工执行：$PY $DIAG --diagnose --base-dir $INSTALL_DIR）"
+    else
+        # EMQX 尚未配置属于正常状态（可留到界面里配），不算安装失败
+        DIAG_STATE="$("$PY" - "$DIAG_JSON" <<'PYEOF' 2>/dev/null || echo unknown
+import json, sys
+try:
+    r = json.loads(sys.argv[1])
+except Exception:
+    print("unknown"); raise SystemExit
+codes = {f.get("code") for f in (r.get("findings") or [])}
+if r.get("ok"):
+    print("ok")
+elif codes & {"EMQX_CFG_MISSING", "EMQX_UNREACHABLE"}:
+    print("unconfigured")     # 还没配 EMQX，属正常
+else:
+    print("problem")
+PYEOF
+)"
+        case "$DIAG_STATE" in
+            ok)
+                ok "      client_attrs 链路正常（EMQX 会把 SAS 下发的身份挂到连接上）" ;;
+            unconfigured)
+                warn "      尚未配置 EMQX（或 EMQX 不可达）：装好后到审计界面→设置 填地址与密钥，"
+                warn "      然后点「运行诊断」即可；未配置期间身份审计只做统计与留证。" ;;
+            *)
+                "$PY" "$DIAG" --diagnose --base-dir "$INSTALL_DIR" \
+                    --sas-url "http://127.0.0.1:$SUBSYS_PORT/auth" 2>&1 | sed 's/^/      /'
+                warn "      身份链路有问题：拿不到连接身份时，身份审计只能留证、不能判定伪造。"
+                FAIL=$((FAIL+1)) ;;
+        esac
+    fi
+fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo ""
