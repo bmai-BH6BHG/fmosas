@@ -201,5 +201,50 @@ class PolicyIntegrationTests(unittest.TestCase):
         self.assertTrue(ok, "APP 未改造时应回退到证书身份判定")
 
 
+class ExemptionTests(unittest.TestCase):
+    """内部服务/面板在强制模式下必须豁免，否则自家监控会被打死"""
+
+    def setUp(self):
+        self._saved = dict(api.SAS_RUNTIME_CONFIG)
+        api.SAS_RUNTIME_CONFIG['require_client_signature'] = True
+
+    def tearDown(self):
+        api.SAS_RUNTIME_CONFIG.clear()
+        api.SAS_RUNTIME_CONFIG.update(self._saved)
+
+    def test_monitor_callsign_exempt(self):
+        ok, why = api.app_signature_exempt("SERVER", "FMO-MONITOR-sub-x")
+        self.assertTrue(ok)
+        self.assertIn("内部服务呼号", why)
+
+    def test_monitor_prefix_exempt(self):
+        ok, _ = api.app_signature_exempt("BH6BHG", "FMO-MONITOR-sub-x")
+        self.assertTrue(ok)
+
+    def test_web_panel_prefix_exempt(self):
+        ok, _ = api.app_signature_exempt("BH6BHG", "fmo-web-ptt-abc")
+        self.assertTrue(ok)
+
+    def test_normal_app_client_not_exempt(self):
+        ok, why = api.app_signature_exempt("BH6BHG", "FMO-BH6BHG-1075-B373")
+        self.assertFalse(ok)
+        self.assertEqual("", why)
+
+    def test_case_insensitive_callsign(self):
+        ok, _ = api.app_signature_exempt("server", "whatever")
+        self.assertTrue(ok)
+
+    def test_custom_exempt_list_respected(self):
+        api.SAS_RUNTIME_CONFIG['client_signature_exempt_callsigns'] = ['ADMIN']
+        ok, _ = api.app_signature_exempt("ADMIN", "x")
+        self.assertTrue(ok)
+        ok2, _ = api.app_signature_exempt("SERVER", "x")
+        self.assertFalse(ok2, "自定义列表应覆盖默认值")
+
+    def test_defaults_present_in_config_template(self):
+        for k in ('client_signature_exempt_callsigns', 'client_signature_exempt_prefixes'):
+            self.assertIn(k, api.DEFAULT_SAS_RUNTIME_CONFIG)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

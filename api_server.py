@@ -368,6 +368,13 @@ def init_sync_service():
 DEFAULT_SAS_RUNTIME_CONFIG = {
     'allowed_callsigns': [],        # 允许的呼号白名单（空表示不限制）
     'require_client_signature': False,  # 是否强制客户端签名
+    # 强制 APP 签名时，这些内部服务/面板**豁免**（它们不是 APP，没有 APP 私钥）：
+    #   SERVER          监控/语音服务用的呼号
+    #   FMO-MONITOR*    监控子客户端
+    #   fmo-web-*       网页 PTT 面板
+    # 不豁免的话，一开强制就会把自家监控/网页打死。
+    'client_signature_exempt_callsigns': ['SERVER'],
+    'client_signature_exempt_prefixes': ['FMO-MONITOR', 'fmo-web-'],
     'auto_trust_local_ca': True,    # 自动信任本地 Root CA
     'uid_range': {'start': 1, 'end': 200000},
     'issuing_countries': ['CN'],
@@ -494,6 +501,34 @@ def app_signature_ok(body):
 # 这样签名只对这一条连接有效；配合 300 秒时间窗，重放基本不可行。
 # 校验通过 → client_attrs.app_verified="1"（EMQX 会写到连接上，审计据此判定"本 APP"）。
 APP_MQTT_AUTH_PREFIX = "FMO-APP-mqtt"
+
+# 内部服务/面板豁免：它们不是 APP，拿不到 APP 私钥，强制签名时必须放行
+# （否则一开 require_client_signature，自家监控与网页 PTT 立刻掉线）
+DEFAULT_SIGNATURE_EXEMPT_CALLSIGNS = ['SERVER']
+DEFAULT_SIGNATURE_EXEMPT_PREFIXES = ['FMO-MONITOR', 'fmo-web-']
+
+
+def app_signature_exempt(callsign, clientid):
+    """
+    判断该连接是否豁免 APP 签名要求（内部服务/面板）。
+    返回 (是否豁免, 原因)
+    """
+    rt = SAS_RUNTIME_CONFIG or {}
+    cs = str(callsign or '').strip().upper()
+    cid = str(clientid or '')
+    exempt_cs = rt.get('client_signature_exempt_callsigns')
+    if exempt_cs is None:
+        exempt_cs = DEFAULT_SIGNATURE_EXEMPT_CALLSIGNS
+    exempt_pf = rt.get('client_signature_exempt_prefixes')
+    if exempt_pf is None:
+        exempt_pf = DEFAULT_SIGNATURE_EXEMPT_PREFIXES
+    for x in (exempt_cs or []):
+        if cs and cs == str(x).strip().upper():
+            return True, "内部服务呼号 %s" % cs
+    for p in (exempt_pf or []):
+        if p and cid.startswith(str(p)):
+            return True, "内部客户端前缀 %s" % p
+    return False, ""
 
 
 def _pw_data_of(password):
@@ -1864,14 +1899,20 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 attrs['app_verified'] = '1' if app['ok'] else '0'
                 attrs['app_sig'] = app['mode']
                 # require_client_signature=true 时，没有有效 APP 签名直接拒绝
+                # （内部服务/面板豁免：它们没有 APP 私钥）
                 if SAS_RUNTIME_CONFIG.get('require_client_signature') and not app['ok']:
-                    print("[AUTH] 拒绝: require_client_signature=true 且 %s（callsign=%s clientid=%s）"
-                          % (app['reason'], username, clientid or '-'))
-                    self.send_json({
-                        'result': 'deny',
-                        'reason': '需要有效 APP 签名（require_client_signature=true）: ' + app['reason'],
-                    })
-                    return
+                    exempt, why_ex = app_signature_exempt(username, clientid)
+                    if exempt:
+                        attrs['app_exempt'] = '1'
+                        print("[AUTH] 内部客户端豁免 APP 签名: %s（%s）" % (username, why_ex))
+                    else:
+                        print("[AUTH] 拒绝: require_client_signature=true 且 %s（callsign=%s clientid=%s）"
+                              % (app['reason'], username, clientid or '-'))
+                        self.send_json({
+                            'result': 'deny',
+                            'reason': '需要有效 APP 签名（require_client_signature=true）: ' + app['reason'],
+                        })
+                        return
 
             if result.get('result') == 'allow':
                 attrs = result.get('client_attrs', {})
