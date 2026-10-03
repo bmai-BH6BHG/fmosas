@@ -474,8 +474,17 @@ cp -a "$REPO/dist/VERSION"             "$UPLOAD/VERSION"
 mkdir -p "$UPLOAD/bas"
 MISSING_BAS=""
 for BF in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py bas_diagnose.py VERSION; do
-    if [ -f "$REPO/bas/$BF" ]; then
+    # 单一来源：优先取仓库根的当前文件（bas/ 只是打包产物目录，不再手工同步，
+    # 否则会出现"根目录已修好、bas/ 里还是旧版"的静默旧包事故）
+    if [ -f "$REPO/$BF" ]; then
+        cp -a "$REPO/$BF" "$UPLOAD/bas/$BF"
+        if [ -f "$REPO/bas/$BF" ] && ! cmp -s "$REPO/$BF" "$REPO/bas/$BF"; then
+            # 顺手同步回 bas/，避免下次有人误用旧副本
+            cp -a "$REPO/$BF" "$REPO/bas/$BF"
+        fi
+    elif [ -f "$REPO/bas/$BF" ]; then
         cp -a "$REPO/bas/$BF" "$UPLOAD/bas/$BF"
+        echo "      [BAS] 注意：$BF 只存在于 bas/（根目录没有），已按 bas/ 打包"
     else
         MISSING_BAS="$MISSING_BAS $BF"
     fi

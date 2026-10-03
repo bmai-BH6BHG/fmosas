@@ -220,9 +220,12 @@ class AuditServiceE2ETests(unittest.TestCase):
         self.assertEqual(WARN, rows[0]["verdict"])
 
     def test_no_client_attrs_is_warn_only(self):
-        """连接完全没有身份（EMQX 未下发 client_attrs）→ 只告警留证。"""
+        """
+        连接完全没有身份（无 client_attrs、username 为空、clientid 里也提不出呼号）
+        → 只告警留证。注意：只要 username/clientid 能推出呼号，就会走降级身份路径。
+        """
         body = {
-            "topic": "FMO/RAW/BG5ESN", "username": "BG5ESN", "clientid": "cid-1",
+            "topic": "FMO/RAW/unknown", "username": "", "clientid": "device-9527",
             "payload": base64.b64encode(build_packet("BG5ESN", 12345)).decode(),
         }
         self.svc.ingest(self.db.get_ingest_token(), body)
@@ -230,6 +233,19 @@ class AuditServiceE2ETests(unittest.TestCase):
         rows = self.db.query_audit_packets()
         self.assertEqual(1, len(rows))
         self.assertEqual("both_missing", rows[0]["scene"])
+        self.assertIn("BG5ESN", rows[0]["reason"])   # 记下包内声明身份
+
+    def test_username_fallback_marks_degraded_and_passes(self):
+        """没有 client_attrs 但有 username → 降级身份取 username，呼号一致即 PASS。"""
+        body = {
+            "topic": "FMO/RAW/BG5ESN", "username": "BG5ESN", "clientid": "device-1",
+            "payload": base64.b64encode(build_packet("BG5ESN", 12345)).decode(),
+        }
+        self.svc.ingest(self.db.get_ingest_token(), body)
+        self.assertEqual([], STUB.bans)
+        self.assertEqual(0, len(self.db.query_audit_packets()), "身份一致 → PASS 不落库")
+        self.assertGreaterEqual(self.svc.stats().get("degraded_identity", 0), 1,
+                                "应记录降级身份计数，便于发现 EMQX 没下发 client_attrs")
 
     # ---------------- 伪造：默认只入待审，切 ban 后才真封 ----------------
     def test_forged_callsign_quarantined_by_default(self):
@@ -252,7 +268,9 @@ class AuditServiceE2ETests(unittest.TestCase):
         self._webhook("BG5ESN", "12345", "BG9BAD", 777)
         self.assertEqual(1, len(STUB.bans), "ban 模式下应执行拉黑")
         self.assertEqual("BG5ESN", STUB.bans[0]["who"])
-        self.assertEqual("infinity", STUB.bans[0]["until"])
+        # ★ 封禁必须有期限：默认 ban_hours=24，绝不再出现 infinity（误封可自愈）
+        self.assertNotEqual("infinity", STUB.bans[0]["until"], "不得再永久封禁")
+        self.assertTrue(STUB.bans[0]["until"], "应有到期时间")
         self.assertEqual([["cid-1"]], STUB.kicks, "拉黑后必须踢下线")
 
     def test_whitelist_protects_admin(self):
@@ -362,19 +380,35 @@ class AuditServiceE2ETests(unittest.TestCase):
             conn.close()
         self.assertEqual(1, row[0], "send_pkt 负差分必须标记重连")
 
-    def test_duplicate_uid_needs_three_rounds(self):
-        """同 uid 多连接：连续 3 轮确认后才处置（防重连风暴误封）。"""
+    def test_duplicate_uid_from_app_is_allowed(self):
+        """
+        ★ 现场要求：从本 APP 上来的连接，**即使 uid 相同（多设备/多开）也允许登录**。
+        clientid 形如 FMO-<呼号>-<uid>-<hex> 且带 SAS 证书身份 → 一律放行，绝不封。
+        """
         STUB.clients = [
-            {"clientid": "c1", "username": "BG5ESN", "client_attrs": {"callsign": "BG5ESN", "uid": "12345"}},
-            {"clientid": "c2", "username": "BG5ESN", "client_attrs": {"callsign": "BG5ESN", "uid": "12345"}},
+            {"clientid": "FMO-BG5ESN-12345-AAAA", "username": "BG5ESN",
+             "client_attrs": {"callsign": "BG5ESN", "uid": "12345"}},
+            {"clientid": "FMO-BG5ESN-12345-BBBB", "username": "BG5ESN",
+             "client_attrs": {"callsign": "BG5ESN", "uid": "12345"}},
+            {"clientid": "FMO-BG5ESN-12345-CCCC", "username": "BG5ESN",
+             "client_attrs": {"callsign": "BG5ESN", "uid": "12345"}},
         ]
-        for _ in range(2):
+        for _ in range(5):
             self.svc.collect_once()
-            self.assertEqual(0, len(self.db.query_audit_packets()), "未满 3 轮不得处置")
-        self.svc.collect_once()
+        self.assertEqual([], STUB.bans, "本 APP 多设备被误封: %s" % STUB.bans)
         rows = self.db.query_audit_packets()
-        self.assertEqual(1, len(rows))
+        self.assertTrue(rows, "应留一条「本 APP 多设备」记录（便于统计多开）")
         self.assertEqual("dup_identity", rows[0]["scene"])
+        self.assertEqual(PASS, rows[0]["verdict"], "本 APP 多设备必须判 PASS（放行）")
+
+    def test_non_app_client_is_banned(self):
+        """不是本 APP 上来的（无证书身份 / clientid 非 APP 形态）→ 封死。"""
+        STUB.clients = [{"clientid": "hacker-9527", "username": "BADGUY",
+                         "client_attrs": {}}]
+        for _ in range(3):
+            self.svc.collect_once()
+        self.assertTrue(STUB.bans, "非本 APP 连接必须被处置")
+        self.assertEqual("BADGUY", STUB.bans[0]["who"])
 
     def test_cleanup_runs_in_collect_path(self):
         self.db.upsert_minute_stat({"clientid": "old", "ts": "2020-01-01 00:00:00"})

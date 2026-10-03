@@ -178,29 +178,95 @@ def inspect(cli, sas_url_hint=""):
             "target_active": any(i["already_target"] for i in items)}
 
 
-def build_sas_authn(url, listener_id=None, name="fmo-sas-http", ssl_enable=False):
+def preflight_target(url, timeout=6):
+    """
+    预检：目标认证 URL 必须真的能应答，否则绝不动线上配置。
+    SAS 的 /auth 对空请求会返回 400/401 + {"result":"deny",...}，这就算"活着"。
+    返回 {"ok":bool,"status":int,"detail":str,"body":str}
+    """
+    import urllib.error
+    import urllib.request
+    payload = json.dumps({"username": "BAS_PREFLIGHT", "password": "x"}).encode()
+    req = urllib.request.Request(url, data=payload, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+            return {"ok": True, "status": r.status, "detail": "可达（HTTP %d）" % r.status,
+                    "body": body[:200]}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        # 400/401/403 也算服务在（它明确回应了），只有 5xx/0 才算不可用
+        ok = e.code < 500
+        return {"ok": ok, "status": e.code,
+                "detail": "可达（HTTP %d）" % e.code if ok else "服务异常（HTTP %d）" % e.code,
+                "body": body[:200]}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "status": 0, "detail": "连不上: %s" % e, "body": ""}
+
+
+def snapshot_authn(a, listener_id=None):
+    """
+    把现有认证器快照成"可重新 POST 的创建体"，用于建失败时回滚恢复。
+
+    只保留 schema 白名单字段：EMQX 的 GET 会返回一堆只读/派生字段
+    （id / status / metrics / enable_pipelining / ciphers / versions ...），
+    原样回传会被 400 拒绝。
+    """
+    src = a or {}
+    cfg = {
+        "mechanism": src.get("mechanism") or "password_based",
+        "backend": src.get("backend") or "http",
+        "enable": bool(src.get("enable", True)),
+    }
+    for k in ("method", "url", "headers", "body", "pool_size",
+              "connect_timeout", "request_timeout", "max_retries",
+              "password_hash_algorithm", "user_id_type", "bootstrap_file",
+              "bootstrap_type", "acl", "precondition"):
+        if src.get(k) not in (None, "", {}, []):
+            cfg[k] = src[k]
+    # ssl 必须是**对象**且只带 enable（EMQX 5.8.9 实测：布尔值报
+    # bad_value_for_struct；带 verify/ciphers 等会被 schema 拒绝）
+    ssl_src = src.get("ssl")
+    if isinstance(ssl_src, dict):
+        cfg["ssl"] = {"enable": bool(ssl_src.get("enable", False))}
+    else:
+        cfg["ssl"] = {"enable": bool(ssl_src)}
+    return cfg
+
+
+def build_sas_authn(url, listener_id=None, name="fmo-sas-http", ssl_enable=False,
+                    allow_anonymous=False):
     """
     构造 HTTP 认证器配置（密码认证 → HTTP 后端 → POST JSON）。
-    注意：body 里必须传 username/password（EMQX 占位符），SAS 才能验签。
+
+    字段依据**实测**的 EMQX 5.8.9 schema（这些坑都踩过，别再改回去）：
+      * body 里必须有 mechanism；**不能**带 type / listener_id（会报
+        unknown_fields: "listener_id,type"）
+      * ssl 必须是对象且只带 enable —— 布尔值报 bad_value_for_struct，
+        带 verify 等键也可能被拒
+      * method 必须小写 post
+      * body 必须含 username/password 两个键，否则 SAS 收到空凭据 → 全部 deny
+      * 认证器 id 由 mechanism:backend 推导（→ password_based:http），
+        同一作用域只能有一个，所以"改指向"必须删旧再建，且**建失败必须回滚**
+      * 全局链对各监听器生效（tcp:default 等），不需要也不能传 listener_id
     """
     cfg = {
-        "type": "password_based",
-        "backend": "http",
         "mechanism": "password_based",
+        "backend": "http",
         "enable": True,
         "method": "post",
         "url": url,
-        "headers": {"content-type": "application/json", "accept": "application/json"},
-        "body": {"username": "${username}", "password": "${password}",
-                 "clientid": "${clientid}", "peerhost": "${peerhost}"},
+        "headers": {"content-type": "application/json"},
+        "body": {"username": "${username}", "password": "${password}"},
         "pool_size": 8,
         "connect_timeout": "5s",
         "request_timeout": "5s",
-        "ssl": {"enable": bool(ssl_enable), "verify": "verify_peer"},
+        "ssl": {"enable": bool(ssl_enable)},
     }
-    if listener_id:
-        cfg["listener_id"] = listener_id
-    _ = name
+    if allow_anonymous:
+        cfg["allow_anonymous"] = True
+    _ = (listener_id, name)
     return cfg
 
 
@@ -256,58 +322,115 @@ def switch_auth(cli, target_url, sas_url_hint="", force_all=False, dry_run=True,
         for a in chain:
             if _is_http_sas(a, sas_url_hint, False) and a.get("url") == target_url:
                 already_at_target = True
-        deleted_any = False
-        for a in chain:
-            if not _is_http_sas(a, sas_url_hint, force_all):
+        if already_at_target:
+            res["skipped"].append("%s: 已存在指向目标的认证，跳过" % scope)
+            continue
+
+        # 这个 scope 里"像 SAS 的"那些项（要动的）与"不能动的"分开
+        sas_items = [a for a in chain if _is_http_sas(a, sas_url_hint, force_all)]
+        keep_items = [a for a in chain if a not in sas_items]
+
+        # ---- 预检：目标 URL 必须真的能应答，否则什么都不做 ----
+        if not dry_run:
+            pre = preflight_target(target_url)
+            res.setdefault("preflight", pre)
+            if not pre["ok"]:
+                res["errors"].append(
+                    "%s: 目标认证服务预检未通过（%s），本次不做任何改动"
+                    % (scope, pre["detail"]))
+                continue
+
+        if dry_run:
+            for a in sas_items:
+                res["changed"].append("[DRY] %s: 将替换认证 %s (url=%s) → %s" % (
+                    scope, a.get("id"), a.get("url"), target_url))
+            if not sas_items:
+                res["changed"].append("[DRY] %s: 将新建 HTTP 认证 → %s" % (scope, target_url))
+            for a in keep_items:
                 res["skipped"].append("%s: 保留非 SAS 认证项 %s(%s)" % (
                     scope, a.get("id"), a.get("backend")))
-                continue
-            if a.get("url") == target_url:
-                res["skipped"].append("%s: %s 已指向目标，跳过" % (scope, a.get("id")))
-                continue
-            if dry_run:
-                res["changed"].append("[DRY] %s: 将删除旧认证 %s (url=%s) 并新建指向 %s" % (
-                    scope, a.get("id"), a.get("url"), target_url))
-                deleted_any = True
-                continue
+            continue
+
+        # ---- 真正的替换：先删后建，但**建失败立刻把旧配置恢复回去** ----
+        # （旧实现删了不建/建失败就留在"无认证"状态，把服务搞挂过；这里必须能回滚）
+        backup_cfgs = [snapshot_authn(a, lid) for a in sas_items]
+        for a in sas_items:
             try:
                 cli._json("DELETE", "/api/v5/authentication/%s" % a.get("id"))  # noqa: SLF001
                 res["changed"].append("%s: 已删除旧认证 %s (url=%s)" % (
                     scope, a.get("id"), a.get("url")))
-                deleted_any = True
             except EmqxError as e:
                 res["errors"].append("%s: 删除 %s 失败: %s" % (scope, a.get("id"), e))
-        if already_at_target:
-            continue
-        if dry_run and not deleted_any:
-            # 该 scope 既没有目标认证、也没有可删的 SAS 项 → 仍需新建
-            pass
-        # 每次都用一个带时间戳的认证器名，避免与刚删除的项撞名（EMQX already_exists）
-        aname = "fmo-sas-http" if not deleted_any else "fmo-sas-http-%d" % int(time.time())
-        cfg = build_sas_authn(target_url, listener_id=lid, name=aname)
-        if dry_run:
-            res["changed"].append("[DRY] %s: 将新建 HTTP 认证 → %s" % (scope, target_url))
-            continue
-        try:
-            cli._json("POST", "/api/v5/authentication", body=cfg)  # noqa: SLF001
+
+        # 认证器 id 由 mechanism:backend 推导（password_based:http），
+        # 同一作用域只能有一个，所以先删干净再建。
+        cfg = build_sas_authn(target_url)
+        created = False
+        err_msg = None
+
+        def _try_create(body):
+            try:
+                cli._json("POST", "/api/v5/authentication", body=body)  # noqa: SLF001
+                return True, None
+            except EmqxError as e:  # noqa: BLE001
+                return False, str(e)
+
+        created, err_msg = _try_create(cfg)
+        # 409 already_exists：说明同 id 的项还在（可能是没被识别出的 SAS 项）→ 删掉重试一次
+        if not created and err_msg and ("already_exists" in err_msg.lower()
+                                        or "409" in err_msg):
+            for aid in ("password_based:http",):
+                try:
+                    cli._json("DELETE", "/api/v5/authentication/%s" % aid)  # noqa: SLF001
+                    res["changed"].append("%s: 删除同 id 冲突项 %s 后重试" % (scope, aid))
+                except EmqxError:
+                    pass
+            created, err_msg = _try_create(cfg)
+
+        if created:
             res["changed"].append("%s: 已新建 HTTP 认证 → %s" % (scope, target_url))
-        except EmqxError as e:
-            msg = str(e)
-            if "already_exists" in msg.lower():
-                res["skipped"].append("%s: 认证已存在" % scope)
-            else:
-                res["errors"].append("%s: 新建认证失败: %s" % (scope, msg))
+            # 建后立刻校验：URL 必须真的等于目标，否则按失败处理并回滚
+            try:
+                chk = inspect(cli, target_url)
+                if not chk["target_active"]:
+                    created = False
+                    err_msg = "新建后校验失败：认证链里没有指向 %s 的项" % target_url
+                    res["errors"].append("%s: %s" % (scope, err_msg))
+            except EmqxError as e:
+                res["errors"].append("%s: 建后校验异常: %s" % (scope, e))
+        else:
+            res["errors"].append("%s: 新建认证失败: %s" % (scope, err_msg))
+
+        # 建失败 → 把刚才删掉的恢复回来，绝不留"无认证"状态
+        if not created and backup_cfgs:
+            log("[认证接管] 新建失败，正在回滚恢复原有认证（%d 项）..." % len(backup_cfgs))
+            restored = 0
+            for bcfg in backup_cfgs:
+                try:
+                    cli._json("POST", "/api/v5/authentication", body=bcfg)  # noqa: SLF001
+                    restored += 1
+                except EmqxError as e2:
+                    res["errors"].append("回滚恢复失败: %s" % e2)
+            res["rolled_back"] = restored
+            if restored == len(backup_cfgs) and restored > 0:
+                res["changed"].append("%s: 已回滚恢复原有认证配置（服务保持可用）" % scope)
+            res["ok"] = False
+        elif not created and not backup_cfgs:
+            # 本来就没有可恢复的项 → 更要明确报警：此刻该 scope 无认证
+            log("[认证接管] 新建失败且无可回滚项 —— 该作用域当前处于无认证状态，请立即处理！")
+            res["errors"].append(
+                "%s: 新建失败且无旧配置可回滚，该监听器可能处于无认证状态，请立即检查" % scope)
 
     # 复核
     try:
         after = inspect(cli, target_url)
         res["after"] = after["items"]
-        res["ok"] = after["target_active"] and not res["errors"]
+        res["ok"] = bool(after["target_active"]) and not res["errors"]
     except EmqxError as e:
         res["errors"].append("复核失败: %s" % e)
     res["rollback_hint"] = (
-        "如需回滚：审计界面 → 设置 → could restore from emqx_authn_backup；"
-        "或手动在 EMQX Dashboard → 访问控制 → 认证 里改回原 URL")
+        "已备份原认证配置（emqx_authn_backup）；"
+        "如需回滚可运行 restore_auth(备份)，或在 EMQX Dashboard → 访问控制 → 认证 里手工改回")
     return res
 
 

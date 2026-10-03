@@ -380,7 +380,19 @@ class BasHttp(object):
                 offset=int((q.get("offset") or ["0"])[0]))})
             return True
 
-        # ---- 黑名单 ----
+        # ---- EMQX 实际封禁名单（关键：审计封的人在 EMQX 里，界面必须能看到并解开）----
+        if sub == "banned" and method == "GET":
+            rows, err = self._emqx_banned()
+            h.send_json({"ok": err is None, "error": err, "rows": rows})
+            return True
+        if sub == "banned/unban" and method == "POST":
+            body = body or {}
+            who = str(body.get("who") or "").strip()
+            ok, err = self.svc.unban(who, "admin")
+            h.send_json({"ok": ok, "error": err})
+            return True
+
+        # ---- 兼容：审计库里记的黑名单 ----
         if sub == "blacklist" and method == "GET":
             h.send_json({"ok": True, "active": self.db.active_blacklist()})
             return True
@@ -527,6 +539,32 @@ class BasHttp(object):
         return True
 
     # ---------------- 辅助 ----------------
+    def _emqx_banned(self):
+        """
+        读 EMQX 里**真实的**封禁名单（审计封的人就在这儿）。
+        解锁界面以前只读审计库自己的黑名单表，导致"明明被封却看不到、解不了"。
+        """
+        try:
+            cli = self.svc.emqx
+            if cli is None or not getattr(cli, "url", ""):
+                return [], "EMQX 未配置"
+            payload = cli._json("GET", "/api/v5/banned")  # noqa: SLF001
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            out = []
+            for b in (rows or []):
+                if not isinstance(b, dict):
+                    continue
+                out.append({
+                    "as": b.get("as"), "who": b.get("who"), "by": b.get("by"),
+                    "reason": b.get("reason"), "until": b.get("until"),
+                    "at": b.get("at"),
+                    # 下面两个字段来自审计库，方便判断"这条封是谁、为什么"
+                    "is_forever": str(b.get("until") or "").lower() == "infinity",
+                })
+            return out, None
+        except Exception as e:  # noqa: BLE001
+            return [], str(e)
+
     def _diagnose(self):
         """身份链路诊断：client_attrs 没下发的原因（版本/请求体/认证器/SAS 可达性）。"""
         import bas_diagnose as dg

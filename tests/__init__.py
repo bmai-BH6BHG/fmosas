@@ -12,3 +12,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# 自检脚本的真实文件路径（部分测试要把它当独立脚本跑）
+BAS_DIAGNOSE = os.path.join(ROOT, "bas_diagnose.py")

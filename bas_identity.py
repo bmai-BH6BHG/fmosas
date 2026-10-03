@@ -62,8 +62,29 @@ DEFAULT_POLICY = {
     "uid_mismatch_verdict": WARN,
     # 连接侧只拿到 uid、没有 callsign 时的判决：warn（默认）/ kick
     "partial_attr_verdict": WARN,
-    # 拉黑时长（小时）；None = 永久（FAS 默认永久）
-    "ban_hours": None,
+    # 同一 uid 出现在多个在线连接时的判决：warn（默认，安全）/ kick（严格）
+    # ⚠️ 多设备/多开用同一个 uid 是**正常现象**（实测：同一用户 3 个 clientid
+    #    FMO-BH6BHG-1075-FB08/B373/8F43 被旧默认判成"重复登录"永久封禁）。
+    #    所以只有"同一 uid 对应**不同呼号**"才算可疑，且默认只告警不封人。
+    "dup_uid_verdict": WARN,
+    # ---------------- 「只许本 APP 上来」策略（按现场要求新增）----------------
+    # 判定"来自本 APP"的两个条件（都满足才算）：
+    #   1) clientid 命中 app_clientid_prefixes（默认 FMO-，APP 的 clientid 形如
+    #      FMO-BH6BHG-1075-B373）
+    #   2) 带 SAS 认证下发的 client_attrs.callsign/uid（= 持有本系统签发的证书；
+    #      clientid 可以伪造，证书不能）
+    # 满足条件 → 即使同 uid 多连接（多设备/多开）也**一律放行**；
+    # 不满足 → 按 app_only_verdict 处置（off/warn/ban）。
+    "app_only_verdict": "ban",
+    "app_clientid_prefixes": ["FMO-"],
+    # 内部客户端前缀：监控/网页面板等，不受"只许本 APP"限制
+    "app_exempt_prefixes": ["FMO-MONITOR", "fmo-web-", "fmo-web"],
+    # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP
+    "app_require_attrs": True,
+    # 连续 N 轮确认才处置（防抖：重连瞬间会有短暂的无属性状态）
+    "app_confirm_rounds": 2,
+    # 拉黑时长（小时）；None = 永久。默认 24 小时 —— 误封可自愈，不再出现 infinity
+    "ban_hours": 24,
     # 拉黑白名单（永不自动封）：管理员/骨干台呼号
     "ban_whitelist": [],
     # 同一呼号在窗口内最多自动封几次（防刷）
@@ -233,12 +254,52 @@ class IdentityPolicy(object):
             return "uid_diff", "SAS 记录 UID=%s，包头声明 UID=%s" % (rec_uid, want)
         return "ok", "SAS 记录匹配（UID=%s）" % (rec_uid or "-")
 
+    # ---------------- 「只许本 APP 上来」判定 ----------------
+    def _prefix_hit(self, clientid, key):
+        cid = str(clientid or "")
+        for p in (self.cfg.get(key) or []):
+            if p and cid.startswith(str(p)):
+                return True
+        return False
+
+    def client_is_app(self, client):
+        """
+        判断一个在线连接是否"来自本 APP"。
+
+        必须同时满足（app_require_attrs 为 True 时）：
+          1) clientid 命中 app_clientid_prefixes（默认 FMO-）
+          2) 带 SAS 认证下发的 client_attrs.callsign 与 uid
+             —— clientid 谁都能伪造，**证书不能**，所以这一条是关键证据
+        命中 app_exempt_prefixes 的内部客户端（监控/网页面板）直接视为放行。
+
+        返回 (是否本APP, 是否豁免, 原因)
+        """
+        cid = str((client or {}).get("clientid") or "")
+        attrs = (client or {}).get("client_attrs") or {}
+        cs = normalize_callsign(attrs.get("callsign") if isinstance(attrs, dict) else "")
+        uid = normalize_uid(attrs.get("uid") if isinstance(attrs, dict) else "")
+
+        if self._prefix_hit(cid, "app_exempt_prefixes"):
+            return False, True, "内部客户端（豁免）: %s" % cid
+        if not self._prefix_hit(cid, "app_clientid_prefixes"):
+            return False, False, "clientid 不是 APP 形态: %s" % (cid or "(空)")
+        if self.cfg.get("app_require_attrs", True) and not (cs and uid):
+            return False, False, "没有 SAS 证书身份（client_attrs 为空）: %s" % cid
+        return True, False, "本 APP（clientid=%s 证书身份=%s/%s）" % (cid, cs or "-", uid or "-")
+
+    def app_only_verdict(self):
+        v = str(self.cfg.get("app_only_verdict", "off")).lower()
+        return v if v in ("off", "warn", "ban") else "warn"
+
     # ---------------- 主判决 ----------------
-    def decide(self, raw_payload, parsed, conn_callsign, conn_uid, client_id=None):
+    def decide(self, raw_payload, parsed, conn_callsign, conn_uid, client_id=None,
+               degraded=False):
         """
         raw_payload : bytes|None（webhook 解出的原始载荷）
         parsed      : bas_fmo_parser.ParseResult | None（解析失败传 None/ok=False）
-        conn_callsign/conn_uid : 连接身份（来自 client_attrs）
+        conn_callsign/conn_uid : 连接身份（优先来自 client_attrs；缺失时可能是降级来源）
+        degraded    : True 表示连接身份不是来自 client_attrs（如 username/clientid 兜底）。
+                      **降级身份只能用于核对与留证，绝不作为封人依据。**
         返回 Decision
         """
         mode = self.mode()
@@ -259,24 +320,47 @@ class IdentityPolicy(object):
         pkt_cs = normalize_callsign(parsed.callsign)
         pkt_uid = normalize_uid(parsed.uid)
 
-        # 2) 连接侧完全没有身份：无法比对，只记录（对齐 FAS 原行为，但明确提示链路问题）
+        # 2) 连接侧完全没有身份：无法比对 → 只记录包内声明身份（便于事后取证/申诉）
         if not conn_cs and not conn_u:
             self._attr_missing_streak += 1
             hint = ""
             if self._attr_missing_streak >= 10:
-                hint = "（连续 %d 次，疑似 EMQX 未把 SAS 的 client_attrs 下发到连接，请检查认证配置）" % self._attr_missing_streak
+                hint = ("（连续 %d 次，疑似 EMQX 未把 SAS 的 client_attrs 下发到连接，"
+                        "请检查认证配置）" % self._attr_missing_streak)
+            who = pkt_cs or "未知"
             return Decision(WARN, SCENE_BOTH_MISSING,
-                            "连接无身份属性，无法比对，仅留证%s" % hint,
+                            "连接无身份属性，无法比对；包内声明 %s(UID %s) 仅留证%s" % (
+                                who, pkt_uid or "-", hint),
                             action="record", confidence=0.2)
         self._attr_missing_streak = 0
 
-        # 3) 连接侧只有一半身份（FAS 原实现会在这里误判 KICK —— 缺陷2）
-        #    只拿到 uid 没有 callsign 时无法做呼号比对，绝不据此封人
+        # 3) 连接侧只有一半身份
+        #    FAS 原实现会在这里直接 KICK（缺陷2）。更常见的情形是：
+        #    EMQX 没下发 client_attrs，我们用 username/clientid 兜底 → 只有呼号没有 uid。
+        #    此时**仍必须用呼号核对**，否则统计/排行榜里永远看不到这个人（现场现象）。
         if not conn_cs or not conn_u:
+            if conn_cs and pkt_cs:
+                if pkt_cs == conn_cs:
+                    note = "呼号一致（%s），UID 缺失无法比对" % conn_cs
+                    if degraded:
+                        note += "；连接身份来自降级来源（EMQX 未下发 client_attrs）"
+                    return Decision(PASS, SCENE_PASS, note, action="none",
+                                    confidence=0.5 if degraded else 0.7)
+                sc, sc_msg = self.sas_check(conn_cs, pkt_uid)
+                v = str(self.cfg.get("partial_attr_verdict", WARN)).lower()
+                verdict = KICK if (v == "kick" and not degraded) else WARN
+                reason = ("连接身份不完整（callsign=%s uid 缺失），且包头呼号 %s 与之不符；%s"
+                          % (conn_cs, pkt_cs, sc_msg))
+                if degraded:
+                    reason += "；连接身份来自降级来源（EMQX 未下发 client_attrs），仅留证不封禁"
+                d = Decision(verdict, SCENE_ATTR_MISSING, reason,
+                             action="record", confidence=0.4)
+                return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc, degraded)
             v = str(self.cfg.get("partial_attr_verdict", WARN)).lower()
-            verdict = KICK if v == "kick" else WARN
+            verdict = KICK if (v == "kick" and not degraded) else WARN
             return Decision(verdict, SCENE_ATTR_MISSING,
-                            "连接身份不完整（callsign=%r uid=%r），无法完成比对" % (conn_cs or None, conn_u or None),
+                            "连接身份不完整（callsign=%r uid=%r），无法完成比对" % (
+                                conn_cs or None, conn_u or None),
                             action="record", confidence=0.4)
 
         # 4) 呼号比对
@@ -287,49 +371,62 @@ class IdentityPolicy(object):
         uid_known = bool(pkt_uid) and bool(conn_u)
 
         if cs_ok and (uid_ok or not uid_known):
-            scene = SCENE_PASS if uid_ok else SCENE_PASS
             note = "身份一致（呼号=%s UID=%s）" % (conn_cs, conn_u) if uid_ok else \
                    "呼号一致，UID 缺失无法比对（呼号=%s）" % conn_cs
-            return Decision(PASS, scene, note, action="none", confidence=1.0 if uid_ok else 0.8)
+            if degraded:
+                note += "；注意：连接身份来自降级来源（EMQX 未下发 client_attrs）"
+            return Decision(PASS, SCENE_PASS, note, action="none",
+                            confidence=0.6 if degraded else (1.0 if uid_ok else 0.8))
 
         if cs_ok and uid_known and not uid_ok:
             # 呼号对得上、UID 对不上 —— 最常见的误封来源
             sc, sc_msg = self.sas_check(conn_cs, pkt_uid)
             v = str(self.cfg.get("uid_mismatch_verdict", WARN)).lower()
             verdict = KICK if v == "kick" else WARN
-            reason = ("呼号一致但 UID 不一致：包头 %s / 连接 %s；%s" % (pkt_uid, conn_u, sc_msg))
-            # SAS 交叉校验：包头 uid 与签发记录一致 → 极可能是设备端用了新的 uid → 只告警
-            if sc == "uid_diff" or sc == "ok" or sc == "unknown" or sc == "unavailable":
-                verdict = WARN if v != "kick" else KICK
+            reason = "呼号一致但 UID 不一致：包头 %s / 连接 %s；%s" % (pkt_uid, conn_u, sc_msg)
             conf = 0.5 if sc in ("uid_diff", "unknown") else 0.3
             if sc == "revoked":
                 verdict, conf = KICK, 0.9
+            if degraded:
+                # 降级身份不可信，不允许判成 KICK
+                verdict, conf = WARN, min(conf, 0.35)
+                reason += "；连接身份来自降级来源，不作为封禁依据"
             d = Decision(verdict, SCENE_UID_MISMATCH, reason, action="record", confidence=conf)
-            return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc)
+            return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc, degraded)
 
-        # 6) 呼号不符 → 明确伪造
+        # 6) 呼号不符 → 明确伪造（降级身份时只告警）
         sc, sc_msg = self.sas_check(conn_cs, pkt_uid)
         if sc == "unknown":
-            reason = ("包头呼号 %s ≠ 连接呼号 %s；且 %s" % (pkt_cs, conn_cs, sc_msg))
+            reason = "包头呼号 %s ≠ 连接呼号 %s；且 %s" % (pkt_cs, conn_cs, sc_msg)
             d = Decision(KICK, SCENE_SAS_UNKNOWN, reason, action="record", confidence=0.95)
         elif sc == "revoked":
             d = Decision(KICK, SCENE_SAS_UNKNOWN,
                          "连接呼号 %s 的证书已吊销（%s）" % (conn_cs, sc_msg),
                          action="record", confidence=0.95)
         elif sc == "unavailable":
-            # SAS 库读不到/还是空库：呼号不符这件事本身仍可疑，但**不能算伪造证据**
-            reason = ("包头呼号 %s ≠ 连接呼号 %s；%s" % (pkt_cs, conn_cs, sc_msg))
+            reason = "包头呼号 %s ≠ 连接呼号 %s；%s" % (pkt_cs, conn_cs, sc_msg)
             d = Decision(WARN, SCENE_SAS_UNAVAILABLE, reason, action="record", confidence=0.5)
         else:
-            reason = ("包头呼号 %s ≠ 连接呼号 %s（%s）" % (pkt_cs, conn_cs, sc_msg))
+            reason = "包头呼号 %s ≠ 连接呼号 %s（%s）" % (pkt_cs, conn_cs, sc_msg)
             d = Decision(KICK, SCENE_FORGED, reason, action="record", confidence=0.9)
-        return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc)
+        if degraded:
+            d.verdict = WARN
+            d.confidence = min(d.confidence, 0.4)
+            d.reason += "；连接身份来自降级来源（EMQX 未下发 client_attrs），仅留证不封禁"
+        return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc, degraded)
 
     # ---------------- 动作：是否真的封 ----------------
-    def _maybe_ban(self, decision, conn_cs, conn_u, pkt_cs, pkt_uid, sas_status):
+    def _maybe_ban(self, decision, conn_cs, conn_u, pkt_cs, pkt_uid, sas_status,
+                   degraded=False):
         mode = self.mode()
         if decision.verdict != KICK:
             decision.action = "record"
+            return decision
+
+        # 降级身份（EMQX 未下发 client_attrs，身份来自 username/clientid 兜底）绝不可封人
+        if degraded:
+            decision.action = "record"
+            decision.reason += "；连接身份为降级来源，禁止自动封禁"
             return decision
 
         # 以下任一条件不满足 → 只告警留证，不封人

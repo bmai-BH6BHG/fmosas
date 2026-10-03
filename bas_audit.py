@@ -24,6 +24,7 @@ BAS · 审计服务（把 FAS 的 TopicIngestService + CollectorService + 判定
 
 import base64
 import json
+import re
 import threading
 import time
 
@@ -37,6 +38,20 @@ HEALTH_INTERVAL = 60           # 健康快照周期
 CLEAN_INTERVAL = 600           # 清理最小间隔（秒），上游 10 分钟
 FAIL_RATE_LIMIT = 100          # FAIL 类事件每 60 秒最多落库条数（对齐上游）
 DUP_UID_ROUNDS = 3             # 同 uid 多连接连续确认轮数（对齐上游）
+
+# clientid 里带呼号的常见形态：FMO-BH8GDV-4-5817 / fmo_BH8GDV_xxx / BH8GDV-4-1234
+_CALLSIGN_IN_CID = re.compile(r"(?:^|[^A-Z0-9])([A-Z]{1,2}\d[A-Z]{1,4})(?![A-Z0-9])")
+
+
+def _callsign_from_clientid(clientid):
+    """
+    从 clientid 里提取呼号（兜底用）。实测 APP 的 clientid 形如 FMO-BH8GDV-4-5817，
+    可作为 client_attrs 缺失时的降级身份来源；命中即返回大写呼号，否则空串。
+    """
+    if not clientid:
+        return ""
+    m = _CALLSIGN_IN_CID.search(str(clientid).upper())
+    return m.group(1) if m else ""
 
 
 class AuditService(object):
@@ -73,6 +88,7 @@ class AuditService(object):
         self._threads = []
         self._prev = {}                 # clientid -> 上轮计数器基线
         self._dup_uid_track = {}        # uid -> 连续轮数
+        self._app_track = {}            # clientid -> 非本 APP 连续轮数
         self._fail_times = []           # FAIL 落库限流
         self._last_cleanup = 0.0
         self._last_collect = 0.0
@@ -242,20 +258,57 @@ class AuditService(object):
         if not topic or not clientid:
             return
 
+        # ---- 身份来源兜底（关键）----
+        # client_attrs 是"可信身份"（SAS 认证写入）。但实测很多环境 EMQX 不下发它
+        # （版本 <5.7、认证器 body 没配等）→ 此前会整条审计链失效。
+        # 因此按可信度依次兜底，并记录来源，判决时据此降低置信度（不当作伪造证据）。
+        attr_cs = callsign
+        attr_uid = uid
+        cs_src = "client_attrs" if callsign else ""
+        uid_src = "client_attrs" if uid else ""
+        if not callsign:
+            if isinstance(username, str) and username and username.upper() != "UNDEFINED":
+                cs_src = "username(降级)"
+                callsign = username
+            else:
+                guess = _callsign_from_clientid(clientid)
+                if guess:
+                    callsign = guess
+                    cs_src = "clientid(降级)"
+        if not uid:
+            uid_src = ""
+        # 兜底身份不可信：明确标记，让策略层不据此判伪造/封人
+        degraded = bool(callsign) and cs_src != "client_attrs"
+
+        if self._stats.get("identity_sources") is None:
+            self._stats["identity_sources"] = {}
+        self._stats["identity_sources"][cs_src or "none"] = \
+            self._stats["identity_sources"].get(cs_src or "none", 0) + 1
+        if degraded:
+            self._bump("degraded_identity")
+        _ = (attr_cs, attr_uid, uid_src)
+
         # ① 主题统计（10 秒桶）
         if str(self.db.get_setting("topic_enabled", "0")) != "0":
             self.db.add_topic_stat(topic, clientid, username, callsign, uid, 1, nbytes)
 
         # ② 逐包身份审计
         if raw:
-            self._audit_packet(raw, topic, callsign, uid, clientid, username)
+            self._audit_packet(raw, topic, callsign, uid, clientid, username,
+                               degraded=degraded, cs_src=cs_src)
 
-    def _audit_packet(self, raw, topic, conn_callsign, conn_uid, clientid, username):
+    def _audit_packet(self, raw, topic, conn_callsign, conn_uid, clientid, username,
+                      degraded=False, cs_src=""):
         parsed = parser_mod.parse(raw)
         if not self.identity_control_enabled():
             return
 
-        decision = self.policy.decide(raw, parsed, conn_callsign, conn_uid, clientid)
+        decision = self.policy.decide(raw, parsed, conn_callsign, conn_uid, clientid,
+                                      degraded=degraded)
+        # 兜底来源要写进原因，便于事后审计
+        if cs_src and cs_src != "client_attrs":
+            decision.reason = "%s；连接身份来源=%s（EMQX 未下发 client_attrs）" % (
+                decision.reason, cs_src)
 
         # 判决计数
         if decision.verdict == KICK:
@@ -293,8 +346,13 @@ class AuditService(object):
             "ban": decision.ban, "source": "packet",
         })
 
-        # 低置信度/未封禁的可疑事件进入待审队列（误封救援的关键）
-        if decision.verdict == KICK and not decision.ban:
+        # 可疑事件进待审队列（误封救援的关键）：
+        #   * 判 KICK 但没真封 → 必须进待审
+        #   * 判 WARN 的伪造/UID 不符/未知呼号 → 也进待审（否则降级身份下的可疑事件没人能看到）
+        suspicious_scenes = ("forged", "uid_mismatch", "sas_unknown", "non_app_client",
+                             "attr_missing", "dup_identity")
+        if (not decision.ban) and (decision.verdict == KICK
+                                   or decision.scene in suspicious_scenes):
             self.db.add_quarantine({
                 "created_at": now_text(True),
                 "conn_callsign": conn_callsign, "conn_uid": conn_uid,
@@ -352,8 +410,14 @@ class AuditService(object):
             if cid not in live:
                 self._prev.pop(cid, None)
 
-        # 重复身份检测（同 uid 多连接；连续 DUP_UID_ROUNDS 轮确认）
+        # 重复身份检测（同 uid 多连接）
+        # 规则：**来自本 APP 的连接（有 SAS 证书身份）即使同 uid 多连接也放行**；
+        #       同 uid 里有非本 APP 的连接 → 按下面「只许本 APP」规则处置。
         self._detect_duplicate_identity(clients)
+
+        # 「只许本 APP 上来」：不是本 APP 的连接（无证书身份 / clientid 非 APP 形态）
+        # 连续确认后按 app_only_verdict 处置（默认 ban）。
+        self._enforce_app_only(clients)
 
         # 健康快照 + 清理（清理挂在采集成功路径内，但按时间间隔独立触发）
         self._write_health()
@@ -368,10 +432,79 @@ class AuditService(object):
         self._last_collect_error = None
         return True, None
 
+    def _enforce_app_only(self, clients):
+        """
+        只许本 APP 上来。
+
+        本 APP 的判定见 IdentityPolicy.client_is_app：
+          clientid 命中 FMO- 前缀 **且** 带 SAS 证书下发的 client_attrs(callsign/uid)。
+        不是本 APP 的连接（含"伪造成 FMO- 形态但没有证书身份"的冒充者）：
+          连续 app_confirm_rounds 轮确认后，按 app_only_verdict 处置（默认 ban）。
+        内部客户端（FMO-MONITOR / fmo-web-*）豁免。
+        """
+        verdict_cfg = self.policy.app_only_verdict()
+        if verdict_cfg == "off":
+            self._app_track.clear()
+            return
+        rounds_need = max(1, int(self.policy.cfg.get("app_confirm_rounds", 2) or 2))
+        seen = set()
+        for c in clients:
+            cid = str(c.get("clientid") or "")
+            if not cid:
+                continue
+            is_app, exempt, why = self.policy.client_is_app(c)
+            if is_app or exempt:
+                self._app_track.pop(cid, None)
+                continue
+            seen.add(cid)
+            n = self._app_track.get(cid, 0) + 1
+            self._app_track[cid] = n
+            if n < rounds_need:
+                continue
+            self._app_track[cid] = 0
+            who = (c.get("username") or (c.get("client_attrs") or {}).get("callsign")
+                   or cid)
+            reason = "非本 APP 客户端（%s）；按策略处置" % why
+            self.db.write_audit_packet({
+                "ts": now_text(True), "topic": "", "clientid": cid,
+                "conn_callsign": str(who), "conn_uid": str(
+                    (c.get("client_attrs") or {}).get("uid") or ""),
+                "verdict": KICK if verdict_cfg == "ban" else WARN,
+                "scene": "non_app_client", "reason": reason,
+                "confidence": 0.8, "source": "collector",
+            })
+            if verdict_cfg == "ban" and not self.policy.in_whitelist(who):
+                try:
+                    kicked = self.policy.ban_recorder(
+                        who, reason, self.policy.cfg.get("ban_hours"))
+                    if kicked:
+                        self._bump("banned")
+                except Exception as e:  # noqa: BLE001
+                    self._last_collect_error = "app_only ban: %s" % e
+            else:
+                self.db.add_quarantine({
+                    "created_at": now_text(True), "conn_callsign": str(who),
+                    "scene": "non_app_client", "reason": reason,
+                    "confidence": 0.8,
+                })
+                self._bump("quarantined")
+        for cid in list(self._app_track.keys()):
+            if cid not in seen:
+                self._app_track.pop(cid, None)
+
     def _detect_duplicate_identity(self, clients):
         """
-        同一 uid 出现在多个在线连接 → 疑似凭证泄露。
-        连续 DUP_UID_ROUNDS 轮确认后才处置（EMQX keepalive 期间新旧 clientid 会短暂并存）。
+        同一 uid 出现在多个在线连接。
+
+        ⚠️ 重要：**多设备/多开用同一个 uid 是正常的**。
+        实测事故：同一用户 3 个 clientid（FMO-BH6BHG-1075-FB08/B373/8F43）同 uid=1075，
+        被旧逻辑判成"UID 重复登录"→ 直接 until=infinity 永久封禁，导致用户登不上，
+        而解锁界面读的是自己的黑名单表、看不到 EMQX 里这条封禁 → 无从解锁。
+
+        因此现在的判定规则（可配置）：
+          * 同一 uid + **同一个呼号** 的多个连接 → 视为正常多设备，只记一条 WARN，不封、不入待审
+          * 同一 uid 对应**不同呼号** → 疑似凭证共享/伪造，按 dup_uid_verdict（默认 warn）处置
+          * 只有显式把 dup_uid_verdict 配成 kick/ban 且 mode=ban+auto_ban 时才会真的封
         """
         by_uid = {}
         for c in clients:
@@ -384,30 +517,65 @@ class AuditService(object):
             if len(rows) < 2:
                 continue
             seen.add(uid)
+            names = sorted({(r.get("callsign") or r.get("username") or "") for r in rows} - {""})
+            # 本 APP 判定：有 SAS 证书身份的连接才算"本 APP"
+            app_flags = [self.policy.client_is_app(r)[0] for r in rows]
+            all_app = all(app_flags)
+            # 全部都是本 APP → 无论 uid 是否相同、连接有多少个，**一律放行**
+            # （现场要求：APP 上来的即使 UID 一样也允许登录）
+            if all_app:
+                if len(rows) >= 3:
+                    self.db.write_audit_packet({
+                        "ts": now_text(True), "topic": "",
+                        "clientid": ",".join(r.get("clientid", "") for r in rows),
+                        "conn_callsign": ",".join(names), "conn_uid": uid,
+                        "verdict": PASS, "scene": "dup_identity",
+                        "reason": "本 APP 多设备在线（%d 个连接）—— 放行" % len(rows),
+                        "confidence": 0.0, "source": "collector",
+                    })
+                self._dup_uid_track[uid] = 0
+                continue
+            # 同 uid 只对应一个呼号 → 多设备正常行为，不升级处置
+            suspicious = len(names) > 1
+            if not suspicious and len(rows) < 4:
+                # 记录一次（便于统计多开），但明确标注为正常
+                self._dup_uid_track[uid] = 0
+                continue
             n = self._dup_uid_track.get(uid, 0) + 1
             self._dup_uid_track[uid] = n
             if n < DUP_UID_ROUNDS:
                 continue
-            # 确认泄露：按策略处置
-            names = sorted({(r.get("callsign") or r.get("username") or "") for r in rows} - {""})
-            reason = "重复身份: uid=%s 同时有 %d 个连接（呼号 %s）" % (uid, len(rows), ",".join(names))
+            cids = ",".join(r.get("clientid", "") for r in rows)
+            if not suspicious:
+                reason = ("同一呼号 %s 多设备在线（%d 个连接：%s）—— 正常多开，仅记录"
+                          % (",".join(names), len(rows), cids))
+                verdict, conf = WARN, 0.2
+            else:
+                reason = ("同一 uid=%s 对应多个呼号（%s），疑似凭证共享/伪造（连接 %s）"
+                          % (uid, ",".join(names), cids))
+                verdict, conf = WARN, 0.7
             self.db.write_audit_packet({
-                "ts": now_text(True), "topic": "", "clientid": ",".join(
-                    r.get("clientid", "") for r in rows),
+                "ts": now_text(True), "topic": "",
+                "clientid": cids,
                 "conn_callsign": ",".join(names), "conn_uid": uid,
-                "verdict": KICK, "scene": "dup_identity", "reason": reason,
-                "confidence": 0.85, "source": "collector",
+                "verdict": verdict, "scene": "dup_identity", "reason": reason,
+                "confidence": conf, "source": "collector",
             })
-            if self.policy.mode() == "ban" and self.policy.cfg.get("auto_ban"):
+            # 只有"不同呼号共用 uid"且策略显式要求时才封；同呼号多开永不封
+            want_ban = (suspicious
+                        and str(self.policy.cfg.get("dup_uid_verdict", WARN)).lower() in ("ban", "kick")
+                        and self.policy.mode() == "ban"
+                        and self.policy.cfg.get("auto_ban"))
+            if want_ban:
                 for nm in names:
                     if self.policy.in_whitelist(nm):
                         continue
                     self._ban_recorder(nm, reason, self.policy.cfg.get("ban_hours"))
-            else:
+            elif suspicious:
                 self.db.add_quarantine({
                     "created_at": now_text(True), "conn_callsign": ",".join(names),
                     "conn_uid": uid, "scene": "dup_identity", "reason": reason,
-                    "confidence": 0.85,
+                    "confidence": conf,
                 })
                 self._bump("quarantined")
             self._dup_uid_track[uid] = 0

@@ -97,17 +97,42 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"code": "NOT_FOUND"})
 
 
+class SasStub(BaseHTTPRequestHandler):
+    """假的 SAS /auth：对任何请求都回 deny（证明"服务活着"）"""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        body = json.dumps({"result": "deny", "reason": "缺少 username 或 password"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class EmqxAuthSwitchTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.sas = ThreadingHTTPServer(("127.0.0.1", 0), SasStub)
+        cls.sas_port = cls.sas.server_address[1]
+        threading.Thread(target=cls.sas.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
-        cls.srv.shutdown()
-        cls.srv.server_close()
+        cls.srv.shutdown(); cls.srv.server_close()
+        cls.sas.shutdown(); cls.sas.server_close()
+
+    def target_url(self):
+        return "http://127.0.0.1:%d/auth" % self.sas_port
 
     def setUp(self):
         STATE["global"] = [
@@ -157,7 +182,7 @@ class EmqxAuthSwitchTests(unittest.TestCase):
 
     # ---------------- 切换 ----------------
     def test_switch_points_to_new_port(self):
-        target = "http://127.0.0.1:35928/auth"
+        target = self.target_url()
         r = ea.switch_auth(self.cli, target, dry_run=False)
         self.assertEqual([], r["errors"], r["errors"])
         self.assertTrue(r["ok"], r)
@@ -173,10 +198,29 @@ class EmqxAuthSwitchTests(unittest.TestCase):
         self.assertEqual("${username}", body.get("username"))
         self.assertEqual("${password}", body.get("password"))
         self.assertEqual("post", posts[0].get("method"))
+        self.assertIsInstance(posts[0].get("ssl"), dict, "ssl 必须是对象")
+        self.assertIs(False, posts[0]["ssl"].get("enable"), "ssl.enable 必须是布尔 false")
+        self.assertEqual("password_based", posts[0].get("mechanism"), "必须带 mechanism 字段")
+        self.assertNotIn("type", posts[0], "不能带 type（EMQX 会报 unknown_fields）")
+        self.assertNotIn("listener_id", posts[0], "不能带 listener_id（EMQX 会报 unknown_fields）")
+
+    def test_preflight_blocks_change_when_target_down(self):
+        """
+        ★ 安全阀：目标认证服务不可达时，**绝不能删掉线上配置**
+        （这正是之前把用户服务器搞挂的原因：删了旧认证、新建又失败）
+        """
+        before = json.dumps(STATE["global"], sort_keys=True)
+        r = ea.switch_auth(self.cli, "http://127.0.0.1:59998/auth", dry_run=False)
+        self.assertFalse(r["ok"])
+        self.assertTrue(any("预检" in e for e in r["errors"]), r["errors"])
+        self.assertEqual(before, json.dumps(STATE["global"], sort_keys=True),
+                         "预检失败时配置必须原封不动")
+        self.assertFalse(any(m == "DELETE" for (m, *_) in STATE["requests"]),
+                         "绝不能发删除请求")
 
     def test_dry_run_changes_nothing(self):
         before = json.dumps(STATE["global"], sort_keys=True)
-        r = ea.switch_auth(self.cli, "http://127.0.0.1:35928/auth", dry_run=True)
+        r = ea.switch_auth(self.cli, self.target_url(), dry_run=True)
         self.assertEqual([], r["errors"])
         self.assertTrue(any("[DRY]" in x for x in r["changed"]))
         self.assertEqual(before, json.dumps(STATE["global"], sort_keys=True),
@@ -184,12 +228,12 @@ class EmqxAuthSwitchTests(unittest.TestCase):
         self.assertFalse(any(m == "DELETE" for (m, *_) in STATE["requests"]))
 
     def test_idempotent_when_already_target(self):
-        target = "http://127.0.0.1:35928/auth"
+        target = self.target_url()
         ea.switch_auth(self.cli, target, dry_run=False)
         STATE["requests"] = []
         r = ea.switch_auth(self.cli, target, dry_run=False)
         self.assertTrue(r["ok"])
-        self.assertTrue(any("无需改动" in x or "跳过" in x for x in r["skipped"]))
+        self.assertTrue(any("跳过" in x for x in r["skipped"]))
         self.assertFalse(any(m == "POST" for (m, *_) in STATE["requests"]),
                          "已指向目标时不应再新建")
 
@@ -197,15 +241,40 @@ class EmqxAuthSwitchTests(unittest.TestCase):
         STATE["global"].append({"id": "password_based:built_in:x", "type": "password_based",
                                 "backend": "built_in_database", "mechanism": "password_based",
                                 "enable": True})
-        r = ea.switch_auth(self.cli, "http://127.0.0.1:35928/auth", dry_run=False)
+        r = ea.switch_auth(self.cli, self.target_url(), dry_run=False)
         self.assertEqual([], r["errors"])
         backends = [a.get("backend") for a in STATE["global"]]
         self.assertIn("built_in_database", backends, "非 SAS 认证必须保留")
 
+    def test_rollback_when_create_fails(self):
+        """
+        ★ 建失败必须自动回滚：模拟"能删但建不上"，验证旧配置被恢复、服务不处于无认证状态
+        """
+        orig_json = self.cli._json
+        calls = {"n": 0}
+
+        def flaky(method, path, **kw):
+            if method == "POST" and path == "/api/v5/authentication":
+                calls["n"] += 1
+                if calls["n"] == 1:          # 只让"新建"失败一次，回滚要能成功
+                    raise ea.EmqxError("HTTP 400: schema validation failed (模拟建失败)")
+            return orig_json(method, path, **kw)
+
+        self.cli._json = flaky
+        try:
+            r = ea.switch_auth(self.cli, self.target_url(), dry_run=False)
+        finally:
+            self.cli._json = orig_json
+        self.assertFalse(r["ok"])
+        self.assertTrue(r.get("rolled_back"), "必须回滚: %s" % r)
+        # 认证链里必须仍有可用认证（回滚恢复的那条）
+        self.assertTrue(STATE["global"], "回滚后不能处于无认证状态！")
+        self.assertIn("回滚恢复", " ".join(r["changed"]))
+
     def test_backup_saved_to_db_and_rollback(self):
         from bas_audit_db import AuditDB
         db = AuditDB(os.path.join(self.dbdir, "audit.db"))
-        r = ea.switch_auth(self.cli, "http://127.0.0.1:35928/auth", dry_run=False, db=db)
+        r = ea.switch_auth(self.cli, self.target_url(), dry_run=False, db=db)
         self.assertTrue(r["backup"], "必须返回备份")
         saved = db.get_setting("emqx_authn_backup")
         self.assertIn("old_sas", saved, "备份里应含旧认证项")
@@ -213,24 +282,24 @@ class EmqxAuthSwitchTests(unittest.TestCase):
         # 回滚：删除现在的、按备份重建
         rr = ea.restore_auth(self.cli, saved, dry_run=False)
         self.assertEqual([], rr["errors"], rr["errors"])
-        ids = [a.get("id") for a in STATE["global"]]
-        self.assertTrue(any("old_sas" in str(i) or a.get("url") == "http://127.0.0.1:35928/auth"
-                            for i, a in zip(ids, STATE["global"])),
+        self.assertTrue(any(a.get("url") == "http://127.0.0.1:35000/auth"
+                            for a in STATE["global"]),
                         "回滚后应恢复原认证: %s" % STATE["global"])
 
     def test_switch_reports_error_when_emqx_unreachable(self):
         cli = EmqxClient("127.0.0.1:59999", "k", "s")
-        r = ea.switch_auth(cli, "http://127.0.0.1:35928/auth", dry_run=False)
+        r = ea.switch_auth(cli, self.target_url(), dry_run=False)
         self.assertFalse(r["ok"])
         self.assertTrue(r["errors"])
 
     def test_target_url_hint_detects_already_active(self):
         """inspect 传入目标 URL 提示时，应能判断"已经指向目标"。"""
+        target = self.target_url()
         STATE["global"] = [
             {"id": "password_based:http:new", "type": "password_based", "backend": "http",
-             "mechanism": "password_based", "url": "http://127.0.0.1:35928/auth", "enable": True},
+             "mechanism": "password_based", "url": target, "enable": True},
         ]
-        info = ea.inspect(self.cli, sas_url_hint="http://127.0.0.1:35928/auth")
+        info = ea.inspect(self.cli, sas_url_hint=target)
         self.assertTrue(info["target_active"], info["items"])
         self.assertEqual(1, info["sas_like_count"])
 
