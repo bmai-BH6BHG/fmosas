@@ -68,26 +68,35 @@ jobs:
           echo "--- 资产 sha256 校验 ---"
           (cd out && sha256sum -c fmo-subsystem-1.*.tar.gz.sha256 && sha256sum -c fmo-subsystem.tar.gz.sha256)
 
-      - name: 发布 Release
+      - name: 发布 Release（主资产）
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          name: FMO 分系统 v${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
+          name: FMO 分系统 / BAS ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            一键安装（Linux / 群晖）：
+            FMO 分系统（认证）与 BAS（认证+审计一体）发布包。
+
+            一键安装（Linux / 群晖，会自动扫描旧 SAS/FAS → 备份 → 卸载 → 安装新 BAS）：
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/bas/install-bas.sh | sudo bash
+            ```
+
+            只看本机原有系统（不做任何改动）：
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/bas/install-bas.sh | sudo bash -s -- --scan-only
+            ```
+
+            只装分系统（认证端）：
 
             ```bash
             curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
             ```
 
-            一键卸载（默认保留数据）：
-
-            ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/uninstall.sh | sudo bash
-            ```
-
+            卸载（默认保留数据）：把上面 `install.sh` 换成 `uninstall.sh`。
             详细说明见仓库内 `INSTALL.md`。
           files: |
             out/install.sh
@@ -99,8 +108,16 @@ jobs:
             out/VERSION
             out/MANIFEST.txt
             out/checksums.txt
-            out/bas/install-bas.sh
-            out/bas/uninstall-bas.sh
-            out/bas/bas
-            out/bas/VERSION
-            out/bas/fas.json
+
+      - name: 追加 BAS 子目录资产（bas/*）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
+        run: |
+          set -e
+          # 文件夹形式不会展开，必须逐个上传（保持 bas/ 前缀，客户端按 bas/xxx 取用）
+          for f in out/bas/*; do
+            [ -f "$f" ] || continue
+            echo "上传 $f"
+            gh release upload "$TAG" "$f" --clobber
+          done
