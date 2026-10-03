@@ -204,5 +204,90 @@ class FakeCertTests(unittest.TestCase):
                       "盗用呼号（包内声明别人）必须被封")
 
 
+class SasCrossCheckSemanticsTests(unittest.TestCase):
+    """
+    本机 SAS/用户库**不是权威**（现场：国服派生证书不在本机表里；
+    本机表还把在用的 BH6BHG 记成 uid=0/revoked=1）。
+    因此本机查询结果永远不能单独导致封禁。
+    """
+
+    def _policy(self, lookup):
+        from bas_identity import IdentityPolicy
+        p = IdentityPolicy(policy={"mode": "ban", "auto_ban": True})
+        self.bans = []
+        p.sas_lookup = lookup
+        p.sas_has_any = lambda: True
+        p.ban_recorder = lambda cs, r, h: (self.bans.append(cs), True)[1]
+        return p
+
+    @staticmethod
+    def _pkt(callsign, uid):
+        import struct
+        from bas_fmo_parser import crc32, HEAD_SIZE
+        frame = bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        raw = bytearray(HEAD_SIZE + len(frame))
+        struct.pack_into("<H", raw, 0, 2)
+        struct.pack_into("<I", raw, 6, uid)
+        raw[10:22] = callsign.encode()[:12].ljust(12, b"\x00")
+        struct.pack_into("<I", raw, 30, len(raw))
+        struct.pack_into("<I", raw, 36, crc32(frame))
+        raw[HEAD_SIZE:] = frame
+        return bytes(raw)
+
+    def _decide(self, lookup, pkt_cs, pkt_uid, conn_cs="BH6BHG", conn_uid="1075"):
+        from bas_fmo_parser import parse
+        p = self._policy(lookup)
+        raw = self._pkt(pkt_cs, pkt_uid)
+        return p.decide(raw, parse(raw), conn_cs, conn_uid, "cid", degraded=False)
+
+    # ---- 合法连接：本机库说什么都不该封 ----
+    def test_unknown_in_local_db_is_not_forgery(self):
+        """★ 国服/信任链证书不在本机表 → 身份一致必须 PASS，绝不封"""
+        d = self._decide(lambda cs: None, "BH6BHG", 1075)
+        self.assertEqual("PASS", d.verdict)
+        self.assertFalse(d.ban)
+        self.assertEqual([], self.bans)
+
+    def test_local_revoked_record_is_not_trusted(self):
+        """★ 本机表把在用的号记成 revoked=1（旧数据）→ 不得据此封"""
+        d = self._decide(lambda cs: {"uid": 0, "revoked": True}, "BH6BHG", 1075)
+        self.assertEqual("PASS", d.verdict)
+        self.assertFalse(d.ban)
+        self.assertEqual([], self.bans)
+
+    def test_local_uid_zero_mismatch_is_not_ban(self):
+        """本机表 uid=0 与包内 1075 不同（旧数据）→ 不得据此封"""
+        d = self._decide(lambda cs: {"uid": 0, "revoked": False}, "BH6BHG", 1075)
+        self.assertEqual("PASS", d.verdict)
+        self.assertFalse(d.ban)
+
+    # ---- 真伪造：包内声明别的呼号 → 必须封 ----
+    def test_real_forgery_still_banned(self):
+        d = self._decide(lambda cs: None, "BG9BAD", 1075)
+        self.assertEqual(KICK, d.verdict)
+        self.assertTrue(d.ban)
+        self.assertEqual(["BH6BHG"], self.bans)
+
+    def test_forgery_reason_mentions_local_db_is_reference_only(self):
+        d = self._decide(lambda cs: None, "BG9BAD", 1075)
+        self.assertIn("已验签证书", d.reason)
+        self.assertIn("不作为伪造证据", d.reason)
+
+    # ---- 可选开关：只有在管理员明确要求时才按本机库升级判定 ----
+    def test_opt_in_kick_on_unknown(self):
+        from bas_fmo_parser import parse
+        p = self._policy(lambda cs: None)
+        p.cfg["sas_unknown_verdict"] = "kick"
+        raw = self._pkt("BG9BAD", 1075)
+        d = p.decide(raw, parse(raw), "BH6BHG", "1075", "cid", degraded=False)
+        self.assertEqual("sas_unknown", d.scene)
+
+    def test_defaults_are_conservative(self):
+        from bas_identity import IdentityPolicy
+        p = IdentityPolicy()
+        self.assertEqual("warn", str(p.cfg.get("sas_unknown_verdict")).lower())
+        self.assertEqual("warn", str(p.cfg.get("sas_local_revoked_verdict")).lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

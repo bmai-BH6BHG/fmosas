@@ -280,21 +280,82 @@ class AuditServiceE2ETests(unittest.TestCase):
         self._webhook("BG5ESN", "12345", "BG9BAD", 777)
         self.assertEqual([], STUB.bans, "白名单呼号不得被自动封")
 
-    def test_empty_sas_db_must_not_mass_kick(self):
+    def test_empty_sas_db_does_not_mass_kick(self):
         """
-        ★ 新装环境安全阀：SAS 库里还没有任何注册用户时，
-        "SAS 里查不到呼号"不能作为伪造证据，否则每个连接都会被判 KICK。
+        ★ 新装/无本机记录环境的安全阀：
+        本机 SAS 库空（或没有该呼号）时，"本机查不到"不能作为伪造证据。
+        身份一致的合法连接必须 PASS，不产生任何处置。
         """
         self.svc.sas_has_any = lambda: False
         self.svc.policy.sas_has_any = self.svc.sas_has_any
-        # 连接呼号在（空的）SAS 里查不到 + 包头声明另一个呼号
-        self._webhook("BG0NOPE", "1", "BG1FAKE", 2)
-        rows = self.db.query_audit_packets()
-        self.assertEqual(1, len(rows), "仍应留证")
-        self.assertEqual("sas_unavailable", rows[0]["scene"])
-        # 但场景降级为 WARN（sas 不可用 → 不封）
-        self.assertEqual(WARN, rows[0]["verdict"], "空 SAS 库时不得判 KICK")
+        self.svc.set_policy("mode", "ban")
+        self.svc.set_policy("auto_ban", "true")
+        self.svc.sas_lookup = lambda cs: None
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        # 连接身份与包头身份一致（都是本机库里没有的呼号）
+        self._webhook("BG0NOPE", "1", "BG0NOPE", 1)
+        self.assertEqual([], STUB.bans, "身份一致绝不能被封")
+        self.assertEqual([], self.db.query_audit_packets(), "PASS 不落库")
+
+    def test_local_db_absence_is_not_forgery_evidence(self):
+        """本机库查不到该呼号（国服/信任链证书的常态）→ 不能判伪造、不能封"""
+        self.svc.sas_lookup = lambda cs: None
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        self.svc.sas_has_any = lambda: True
+        self.svc.policy.sas_has_any = self.svc.sas_has_any
+        self.svc.set_policy("mode", "ban")
+        self.svc.set_policy("auto_ban", "true")
+        self._webhook("BH6XYZ", "1", "BH6XYZ", 1)     # 身份一致
         self.assertEqual([], STUB.bans)
+        rows = self.db.query_audit_packets()
+        self.assertEqual([], rows, "身份一致就是 PASS，不该有任何记录")
+
+    def test_sas_unknown_forged_is_high_confidence(self):
+        """
+        包内声明别的呼号 → 伪造（硬证据是"包内 ≠ 已验签证书身份"，
+        与"本机库查不到"无关）。
+        """
+        self.svc.sas_lookup = lambda cs: None
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        self._webhook("BG0NOPE", "1", "BG1FAKE", 2)   # 包里声明别的呼号
+        rows = self.db.query_audit_packets(verdict=KICK)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("forged", rows[0]["scene"])
+        self.assertGreaterEqual(rows[0]["confidence"], 0.8)
+        self.assertIn("已验签证书", rows[0]["reason"])
+
+    def test_opt_in_strict_mode_uses_local_db(self):
+        """管理员显式开启 sas_unknown_verdict=kick 时，才按本机库升级判定"""
+        self.svc.sas_lookup = lambda cs: None
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        self.svc.set_policy("sas_unknown_verdict", "kick")
+        self._webhook("BG0NOPE", "1", "BG1FAKE", 2)
+        rows = self.db.query_audit_packets(verdict=KICK)
+        self.assertEqual("sas_unknown", rows[0]["scene"])
+
+    def test_local_revoked_record_alone_is_not_ban(self):
+        """
+        ★ 本机表把呼号标为"已吊销"**不足以**封禁：
+        本机记录可能不是该设备当前使用的证书（实测：在用的 BH6BHG 在本机表里是 revoked=1）。
+        """
+        self.svc.sas_lookup = lambda cs: {"uid": 0, "revoked": True}
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        self.svc.set_policy("mode", "ban")
+        self.svc.set_policy("auto_ban", "true")
+        # 身份一致 → PASS
+        self._webhook("BH6REV", "1", "BH6REV", 1)
+        self.assertEqual([], STUB.bans)
+        self.assertEqual([], self.db.query_audit_packets())
+
+    def test_opt_in_local_revoked_can_kick(self):
+        """显式开启 sas_local_revoked_verdict=kick 时才按本机吊销记录处置"""
+        self.svc.sas_lookup = lambda cs: {"uid": 0, "revoked": True}
+        self.svc.policy.sas_lookup = self.svc.sas_lookup
+        self.svc.set_policy("sas_local_revoked_verdict", "kick")
+        self._webhook("BG0REV", "1", "BG5ESN", 12345)
+        rows = self.db.query_audit_packets(verdict=KICK)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("sas_unknown", rows[0]["scene"])
 
     def test_empty_sas_db_blocks_ban_even_in_ban_mode(self):
         """即使显式开了 ban 模式，SAS 库为空时也不得封人（ban_when_sas_unavailable 默认关）。"""
@@ -305,23 +366,6 @@ class AuditServiceE2ETests(unittest.TestCase):
         STUB.clients = [{"clientid": "cid-1", "username": "BG5ESN", "client_attrs": {}}]
         self._webhook("BG5ESN", "12345", "BG9BAD", 777)
         self.assertEqual([], STUB.bans, "SAS 库为空时宁可不封")
-
-    def test_sas_unknown_forged_is_high_confidence(self):
-        """SAS 里查不到的"连接呼号" → 高置信度伪造（仍按策略决定是否封）。"""
-        self._webhook("BG0NOPE", "1", "BG0NOPE", 1)   # 用不存在的呼号连接，包内身份一致
-        # 该场景本身是 PASS（包内=连接）→ 无事件；伪造场景如下
-        self._webhook("BG0NOPE", "1", "BG1FAKE", 2)   # 包里声明别的呼号
-        rows = self.db.query_audit_packets(verdict=KICK)
-        self.assertEqual(1, len(rows))
-        self.assertEqual("sas_unknown", rows[0]["scene"])
-        self.assertGreaterEqual(rows[0]["confidence"], 0.9)
-
-    def test_revoked_cert_is_kick(self):
-        """SAS 中证书已吊销的连接 → KICK（高置信度）。"""
-        self._webhook("BG0REV", "1", "BG5ESN", 12345)
-        rows = self.db.query_audit_packets(verdict=KICK)
-        self.assertEqual(1, len(rows))
-        self.assertGreaterEqual(rows[0]["confidence"], 0.9)
 
     # ---------------- FAIL（非法包）只留证 ----------------
     def test_bad_packet_is_fail_only(self):

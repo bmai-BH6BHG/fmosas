@@ -110,8 +110,16 @@ DEFAULT_POLICY = {
     "ban_rate_limit_per_hour": 3,
     # SAS 交叉校验不可用（库读不到）时是否仍然自动封人；默认 False=宁可不封
     "ban_when_sas_unavailable": False,
-    # 是否用 SAS 用户库做交叉校验
+    # 是否用 SAS 用户库做交叉校验（**仅作参考**：本机库不含国服/信任链签发的证书，
+    # 且可能是旧世代数据，因此其结果永不单独作为封禁依据）
     "sas_cross_check": True,
+    # 本机 SAS 库"查不到该呼号"时的判决：warn（默认，安全）/ kick。
+    # ⚠️ 强烈建议保持 warn：国服/信任链签发的证书不在本机表中，kick 会误封大量合法用户。
+    "sas_unknown_verdict": WARN,
+    # 本机 SAS 库把该呼号标记为"已吊销"时的判决：warn（默认）/ kick。
+    # ⚠️ 建议保持 warn：本机记录可能不是该设备当前使用的证书（实测本机表里
+    #    在用的 BH6BHG 是 uid=0 revoked=1）。真正的吊销以 /auth 按实际证书指纹判定为准。
+    "sas_local_revoked_verdict": WARN,
     # 审计事件写库限流（每秒最多几条，防刷库）
     "audit_rate_limit_per_sec": 50,
 }
@@ -236,15 +244,23 @@ class IdentityPolicy(object):
         wl = [normalize_callsign(x) for x in (self.cfg.get("ban_whitelist") or [])]
         return bool(cs) and cs in wl
 
-    # ---------------- SAS 交叉校验 ----------------
+    # ---------------- SAS 交叉校验（仅作**参考**，不作为封禁依据）----------------
     def sas_check(self, callsign, pkt_uid=None):
         """
+        查本机 SAS/用户库做**参考**交叉校验。
+
+        ⚠️ 重要：本机库**不是权威**。现场情况：
+          * 证书可由国服（DMRID）派生/签发，走官方根或信任链 —— **这些证书不在本机表里**
+          * 本机 certificates 表可能是旧世代数据（实测：在用的 BH6BHG 在表里是 uid=0 revoked=1）
+        因此"本机查不到""本机说已吊销"**都不能作为伪造/封禁依据**。
+        真正的权威是 /auth 时的**证书链验签 + 根信任 + 按实际指纹查吊销**。
+
         返回 (状态, 说明)：
-          ('ok', ...)        SAS 里有该呼号（uid 一致或未比较）
-          ('uid_diff', ...)  SAS 里的 uid 与包头声明不一致
-          ('revoked', ...)   SAS 里该呼号证书已吊销
-          ('unknown', ...)   SAS 库里没有该呼号
-          ('unavailable', …) SAS 库读不到（不可作为封人依据）
+          ('ok', ...)        本机库能对上
+          ('uid_diff', ...)  本机库的 uid 与包头声明不一致
+          ('revoked', ...)   本机库标记已吊销（可能与本设备实际证书无关，仅参考）
+          ('unknown', ...)   本机库里没有该呼号（很可能是国服/信任链证书 → 正常）
+          ('unavailable', …) 本机库读不到
           ('skipped', ...)   未启用交叉校验
         """
         if not self.cfg.get("sas_cross_check", True) or self.sas_lookup is None:
@@ -252,21 +268,25 @@ class IdentityPolicy(object):
         cs = normalize_callsign(callsign)
         if not cs:
             return "unknown", "呼号为空"
-        # 安全阀：SAS 库还没有任何注册记录时，"查不到"不能作为伪造证据
+        # 安全阀：本机库还没有任何注册记录时，"查不到"更不能作为证据
         if self.sas_has_any is not None:
             try:
                 if not self.sas_has_any():
-                    return "unavailable", "SAS 库尚无任何注册用户/证书，不能据'查不到'判伪造"
+                    return "unavailable", "本机 SAS 库尚无任何注册用户/证书，不能据'查不到'判伪造"
             except Exception as e:  # noqa: BLE001
-                return "unavailable", "SAS 库状态未知: %s" % e
+                return "unavailable", "本机 SAS 库状态未知: %s" % e
         try:
             rec = self.sas_lookup(cs)
         except Exception as e:  # noqa: BLE001
-            return "unavailable", "SAS 库不可用: %s" % e
+            return "unavailable", "本机 SAS 库不可用: %s" % e
         if not rec:
-            return "unknown", "SAS 用户/证书库中没有呼号 %s" % cs
+            return "unknown", ("本机 SAS/用户库中没有呼号 %s"
+                               "（本机库只含本机 CA 的签发记录；国服或信任链签发的证书不在其中，"
+                               "属正常情况，不作为伪造证据）" % cs)
         if rec.get("revoked"):
-            return "revoked", "SAS 中 %s 的证书已吊销" % cs
+            return "revoked", ("本机 SAS 库把 %s 标记为已吊销；"
+                               "但本机记录可能不是该设备当前使用的证书"
+                               "（以 /auth 按实际证书指纹的吊销判定为准）" % cs)
         rec_uid = normalize_uid(rec.get("uid"))
         want = normalize_uid(pkt_uid)
         if rec_uid and want and rec_uid != want:
@@ -442,21 +462,22 @@ class IdentityPolicy(object):
             d = Decision(verdict, SCENE_UID_MISMATCH, reason, action="record", confidence=conf)
             return self._maybe_ban(d, conn_cs, conn_u, pkt_cs, pkt_uid, sc, degraded)
 
-        # 6) 呼号不符 → 明确伪造（降级身份时只告警）
+        # 6) 呼号不符 → 伪造。
+        #    ⚠️ 判据只有一条是硬的：**包头声明的呼号 ≠ 连接（已验签证书）的呼号**。
+        #    本机 SAS 库的查询结果（查不到/标记吊销）**都不作为封禁依据** ——
+        #    国服/信任链签发的证书根本不在本机表里，本机表也可能是旧世代数据。
         sc, sc_msg = self.sas_check(conn_cs, pkt_uid)
-        if sc == "unknown":
-            reason = "包头呼号 %s ≠ 连接呼号 %s；且 %s" % (pkt_cs, conn_cs, sc_msg)
-            d = Decision(KICK, SCENE_SAS_UNKNOWN, reason, action="record", confidence=0.95)
-        elif sc == "revoked":
-            d = Decision(KICK, SCENE_SAS_UNKNOWN,
-                         "连接呼号 %s 的证书已吊销（%s）" % (conn_cs, sc_msg),
-                         action="record", confidence=0.95)
-        elif sc == "unavailable":
-            reason = "包头呼号 %s ≠ 连接呼号 %s；%s" % (pkt_cs, conn_cs, sc_msg)
-            d = Decision(WARN, SCENE_SAS_UNAVAILABLE, reason, action="record", confidence=0.5)
+        base = "包头呼号 %s ≠ 连接呼号 %s（连接身份来自已验签证书）" % (pkt_cs, conn_cs)
+        if sc == "revoked" and str(self.cfg.get("sas_local_revoked_verdict", WARN)).lower() == "kick":
+            d = Decision(KICK, SCENE_SAS_UNKNOWN, "%s；%s" % (base, sc_msg),
+                         action="record", confidence=0.9)
+        elif sc == "unknown" and str(self.cfg.get("sas_unknown_verdict", WARN)).lower() == "kick":
+            d = Decision(KICK, SCENE_SAS_UNKNOWN, "%s；%s" % (base, sc_msg),
+                         action="record", confidence=0.8)
         else:
-            reason = "包头呼号 %s ≠ 连接呼号 %s（%s）" % (pkt_cs, conn_cs, sc_msg)
-            d = Decision(KICK, SCENE_FORGED, reason, action="record", confidence=0.9)
+            # 默认：呼号不符本身就是伪造证据（KICK），但本机库的"查不到/已吊销"只写进原因
+            d = Decision(KICK, SCENE_FORGED, "%s；参考：%s" % (base, sc_msg),
+                         action="record", confidence=0.85)
         if degraded:
             d.verdict = WARN
             d.confidence = min(d.confidence, 0.4)
