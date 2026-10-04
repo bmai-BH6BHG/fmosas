@@ -91,6 +91,7 @@ class AuditService(object):
         self._dup_uid_track = {}        # uid -> 连续轮数
         self._app_track = {}            # clientid -> 非本 APP 连续轮数
         self._auth_fail_track = {}      # peerhost -> [失败时间戳]（假证书反滥用）
+        self._pass_log_track = {}       # clientid -> 上次记录 PASS 事件的时间（限流）
         self._fail_times = []           # FAIL 落库限流
         self._last_cleanup = 0.0
         self._last_collect = 0.0
@@ -154,6 +155,55 @@ class AuditService(object):
     def set_policy(self, key, value):
         self.db.set_policy(key, value)
         return self.reload_policy()
+
+    # ---------------- 管理操作（后台手动执行，不走自动封禁闸门） ----------------
+    def kick_client(self, clientid):
+        """把某个在线连接踢下线（只踢不封）"""
+        cid = str(clientid or "").strip()
+        if not cid:
+            return False, "缺少 clientid"
+        try:
+            ok, err = self.emqx.kick_clients([cid])
+            return bool(ok), err
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    def ban_ip(self, ip, hours=None, reason="管理员手动封禁 IP"):
+        """
+        按来源 IP 封禁（peerhost 维度）。
+        管理员手动操作 → 直接执行（不受 mode/auto_ban 闸门限制），默认 24 小时。
+        """
+        ip = str(ip or "").strip()
+        if not bas_emqx.is_ip_like(ip):
+            return False, "不是合法的 IP 地址"
+        hours = hours if hours not in (None, "", 0) else 24
+        try:
+            ok = self._ban_any(ip, str(reason), hours, as_type="peerhost")
+            return bool(ok), None if ok else "EMQX 封禁失败"
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    def whitelist_list(self):
+        return [str(x) for x in (self.policy.cfg.get("ban_whitelist") or [])]
+
+    def whitelist_add(self, callsign):
+        cs = str(callsign or "").strip().upper()
+        if not cs:
+            return False, "缺少呼号"
+        cur = self.whitelist_list()
+        if cs in cur:
+            return True, "已在白名单"
+        cur.append(cs)
+        self.db.set_policy("ban_whitelist", ",".join(cur))
+        self.reload_policy()
+        return True, None
+
+    def whitelist_remove(self, callsign):
+        cs = str(callsign or "").strip().upper()
+        cur = [x for x in self.whitelist_list() if str(x).upper() != cs]
+        self.db.set_policy("ban_whitelist", ",".join(cur))
+        self.reload_policy()
+        return True, None
 
     def policy_snapshot(self):
         p = dict(self.policy.cfg)
@@ -524,8 +574,33 @@ class AuditService(object):
         if decision.scene == "bad_packet":
             self._bump("audit_fail")
 
-        # PASS 不落库（对齐上游）；FAIL 限流（60 秒 100 条）
+        # ★ 通过的事件也要留证（用户要求：身份审计要看到**全部**事件，
+        #   不能只显示未通过的）。PASS 报文量大（语音帧每秒数条），按
+        #   每个 clientid 限流记录（默认 60 秒一条），既看得见又不刷爆库。
         if decision.verdict == PASS:
+            if self.policy.cfg.get("audit_pass_log", True) and self._pass_log_ok(clientid):
+                pkt_cs0 = pkt_uid0 = ""
+                if parsed is not None and getattr(parsed, "ok", False):
+                    pkt_cs0 = parsed.callsign
+                    pkt_uid0 = str(parsed.uid)
+                self.db.write_audit_packet({
+                    "ts": now_text(True), "topic": topic, "clientid": clientid,
+                    "conn_callsign": conn_callsign, "conn_uid": conn_uid,
+                    "pkt_callsign": pkt_cs0, "pkt_uid": pkt_uid0,
+                    "verdict": PASS, "scene": "pass",
+                    "reason": "身份一致，放行（连接身份=%s，包头身份=%s）"
+                              % (conn_callsign or "-", pkt_cs0 or "-"),
+                    "confidence": 1.0,
+                    "len": getattr(parsed, "len", 0) if parsed else 0,
+                    "frame_num": getattr(parsed, "frame_num", 0) if parsed else 0,
+                    "crc_ok": bool(getattr(parsed, "crc_ok", False)) if parsed else False,
+                    "smeter": getattr(parsed, "smeter", 0) if parsed else 0,
+                    "srv_uid": str(getattr(parsed, "srv_uid", "")) if parsed else "",
+                    "pkt_ts": str(getattr(parsed, "timestamp", "")) if parsed else "",
+                    "stream_begin": str(getattr(parsed, "stream_begin_utc", "")) if parsed else "",
+                    "ban": False, "source": "packet",
+                })
+                self._bump("audit_pass")
             return
         if not self.policy.allow_audit_write():
             return
@@ -847,6 +922,71 @@ class AuditService(object):
         self._stop.set()
 
     # ---------------- 查询接口（供 Web 层） ----------------
+    def _pass_log_ok(self, clientid, now=None):
+        """PASS 事件的记录节流：同一 clientid 在 audit_pass_interval_sec 内只记一条"""
+        try:
+            iv = float(self.policy.cfg.get("audit_pass_interval_sec", 60) or 60)
+        except Exception:  # noqa: BLE001
+            iv = 60.0
+        if iv <= 0:
+            return True
+        now = now if now is not None else time.time()
+        key = str(clientid or "-")
+        last = self._pass_log_track.get(key, 0)
+        if now - last < iv:
+            return False
+        self._pass_log_track[key] = now
+        if len(self._pass_log_track) > 5000:      # 防无界增长
+            cutoff = now - iv * 4
+            for k in [k for k, t in self._pass_log_track.items() if t < cutoff]:
+                self._pass_log_track.pop(k, None)
+        return True
+
+    def record_auth_ok(self, callsign, uid="", clientid="", peerhost="",
+                       app_verified="", extra=""):
+        """
+        认证通过也写一条身份审计事件。
+
+        用户要求：身份审计要看到**全部**事件（含通过的），而不是只显示未通过的。
+        认证阶段的报文身份为空是正常的（那时还没有任何报文），原因里会写明。
+        """
+        try:
+            reason = "认证通过（证书链校验通过）"
+            if str(app_verified) in ("1", "bound"):
+                reason += "，且 APP 密钥签名校验通过"
+            if extra:
+                reason += "；" + extra
+            self.db.write_audit_packet({
+                "ts": now_text(True), "topic": "", "clientid": str(clientid or ""),
+                "conn_callsign": str(callsign or ""), "conn_uid": str(uid or ""),
+                "pkt_callsign": "", "pkt_uid": "",
+                "verdict": PASS, "scene": "auth_ok", "reason": reason,
+                "confidence": 1.0, "len": 0, "frame_num": 0, "crc_ok": False,
+                "smeter": 0, "srv_uid": "", "pkt_ts": "", "stream_begin": "",
+                "ban": False, "source": "auth",
+            })
+            self._bump("audit_auth_ok")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def note_client_seen(self, callsign, uid="", clientid="", peerhost=""):
+        """
+        认证通过时登记一笔（供"最近在线"视图）。
+        手机 APP 频繁短线重连时，只看当前在线会误以为这个人没上过线。
+        """
+        try:
+            return self.db.add_client_seen(callsign, uid, clientid, peerhost)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def recent_clients(self, minutes=30, limit=200):
+        """最近 N 分钟认证通过的用户（按呼号聚合）"""
+        try:
+            return self.db.recent_clients(minutes=minutes, limit=limit)
+        except Exception:  # noqa: BLE001
+            return []
+
     def online_clients(self, live=True):
         """
         在线客户端列表。

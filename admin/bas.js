@@ -227,10 +227,31 @@
         ['收/发字节', function (r) { return fmtBytes(r.recv_oct) + ' / ' + fmtBytes(r.send_oct); }],
         ['操作', function (r) {
           var who = esc(r.callsign || r.username || '');
-          return who ? '<button class="btn ghost" onclick="BAS.ban(\'' + who + '\')">拉黑</button>' : '';
+          var cid = esc(r.clientid || '');
+          var b = '<button class="btn ghost" onclick="BAS.kick(\'' + cid + '\')">踢下线</button>';
+          if (who) b += ' <button class="btn danger" onclick="BAS.ban(\'' + who + '\')">拉黑</button>';
+          return b;
         }]
       ], rows);
       $('online-count').textContent = '用户 ' + users.length + ' 人 · 连接 ' + rows.length + ' 个';
+      // ③ 最近在线：含"刚断开/短线重连"的用户（否则像 BA4LKK 那样来回掉线就看不见了）
+      var recent = j.recent || [];
+      var onlineSet = {};
+      users.forEach(function (u) { onlineSet[u.callsign] = true; });
+      table($('t-online-recent'), [
+        ['呼号', function (r) { return '<b>' + esc(r.callsign || '(未知)') + '</b>'; }],
+        ['状态', function (r) {
+          return onlineSet[r.callsign]
+            ? '<span class="tag PASS">在线</span>'
+            : '<span class="tag WARN">已断开</span>';
+        }],
+        ['最后在线', function (r) { return esc(String(r.last_seen || '').slice(11, 19)); }],
+        ['连接次数', function (r) { return r.conns; }],
+        ['UID', function (r) { return esc(r.uid); }],
+        ['最后 IP', function (r) { return esc(r.last_ip); }],
+        ['最近 clientid', function (r) { return '<span class="mono">' + esc(r.last_clientid) + '</span>'; }]
+      ], recent);
+      if ($('recent-minutes')) $('recent-minutes').textContent = (j.recent_minutes || 30);
       if ($('online-at')) {
         $('online-at').textContent = '（' + (j.fetched_at || '').slice(11, 19)
           + ' 取自已 ' + (j.source || 'EMQX') + '）';
@@ -297,23 +318,75 @@
     });
   }
 
+  /* 事件类型友好名：一眼看出这条是什么事 */
+  var SCENE_LABEL = {
+    auth_ok: '认证通过',
+    pass: '报文身份一致',
+    forged: '盗用呼号（包内≠连接）',
+    fake_cert: '假证书/验签失败',
+    non_app_client: '非本 APP 客户端',
+    uid_mismatch: 'UID 不符',
+    dup_identity: '重复身份',
+    bad_packet: '非法包',
+    sas_unknown: '本机库查不到（仅参考）',
+    sas_unavailable: '本机库不可用',
+    attr_missing: '缺少身份属性',
+    both_missing: '连接与包内都缺身份'
+  };
+
   function loadAudit() {
     var q = [];
     if ($('au-verdict').value) q.push('verdict=' + $('au-verdict').value);
     if ($('au-callsign').value.trim()) q.push('callsign=' + encodeURIComponent($('au-callsign').value.trim()));
     q.push('limit=300');
     api('audit?' + q.join('&')).then(function (j) {
-      table($('t-audit'), [
-        ['时间', function (r) { return esc(r.ts); }],
+      var cols = [
+        ['时间', function (r) { return esc(String(r.ts || '').replace('T', ' ').slice(0, 19)); }],
         ['判决', function (r) { return '<span class="tag ' + esc(r.verdict) + '">' + esc(r.verdict) + '</span>'; }],
-        ['场景', function (r) { return esc(r.scene); }],
-        ['连接身份', function (r) { return esc(r.conn_callsign) + (r.conn_uid ? '(' + esc(r.conn_uid) + ')' : ''); }],
-        ['包头身份', function (r) { return esc(r.pkt_callsign) + (r.pkt_uid ? '(' + esc(r.pkt_uid) + ')' : ''); }],
+        ['事件', function (r) {
+          return esc(SCENE_LABEL[r.scene] || r.scene) +
+            '<br><span class="muted small">' + esc(r.scene) + '</span>';
+        }],
+        // ★ 主列：这个事件里的「人」是谁（认证事件来自证书，报文事件来自 EMQX 下发的连接身份）
+        ['身份（谁）', function (r) {
+          var who = r.conn_callsign || '';
+          if (!who) { return '<span class="muted small">（未知）</span>'; }
+          var src = r.source === 'auth' ? '证书认证' : (r.source === 'packet' ? '连接身份' : (r.source || ''));
+          return '<b>' + esc(who) + '</b>' + (r.conn_uid ? '(' + esc(r.conn_uid) + ')' : '') +
+            '<br><span class="muted small">' + esc(src) + '</span>';
+        }],
+        // 包头身份：包内自称的呼号/UID，以及它与连接身份是否一致（盗用呼号就是在这里露馅）
+        ['包头身份', function (r) {
+          if (r.pkt_callsign) {
+            var same = String(r.pkt_callsign).toUpperCase() ===
+                       String(r.conn_callsign || '').toUpperCase();
+            return esc(r.pkt_callsign) + (r.pkt_uid ? '(' + esc(r.pkt_uid) + ')' : '') +
+              '<br><span class="tag ' + (same ? 'PASS' : 'KICK') + '">' +
+              (same ? '与连接一致' : '与连接不一致') + '</span>';
+          }
+          if (r.pkt_callsign_recent) {
+            return esc(r.pkt_callsign_recent) +
+              (r.pkt_uid_recent ? '(' + esc(r.pkt_uid_recent) + ')' : '') +
+              '<br><span class="muted small">该连接最近报文 ' +
+              esc(String(r.pkt_recent_at || '').slice(11, 19)) + '</span>';
+          }
+          return '<span class="muted small">本次事件无报文<br>（认证在 CONNECT 时完成）</span>';
+        }],
         ['clientid', function (r) { return '<span class="mono">' + esc(r.clientid) + '</span>'; }],
         ['置信度', function (r) { return r.confidence === null ? '' : Number(r.confidence).toFixed(2); }],
         ['已封', function (r) { return r.ban ? '<span class="tag KICK">是</span>' : '否'; }],
         ['原因', function (r) { return esc(r.reason); }]
-      ], j.rows || []);
+      ];
+      table($('t-audit'), cols, j.rows || []);
+      if ($('au-csv')) {
+        $('au-csv').onclick = function () { csv('bas-audit.csv', cols, j.rows || []); };
+      }
+    });
+    api('audit/stats').then(function (j) {
+      if ($('au-count')) {
+        $('au-count').textContent = '共 ' + (j.total || 0) + ' 条（其中假证书 '
+          + (j.fake_cert || 0) + ' 条）';
+      }
     });
   }
 
@@ -367,6 +440,17 @@
           + (j.note ? ('　' + j.note) : '');
       }
       if ($('bl-sync')) { $('bl-sync').disabled = !stale.length; }
+    });
+    // 白名单（名单内呼号永不被自动封禁）
+    api('whitelist').then(function (j) {
+      var rows = (j.rows || []).map(function (x) { return { callsign: x }; });
+      table($('t-wl'), [
+        ['呼号', function (r) { return '<b>' + esc(r.callsign) + '</b>'; }],
+        ['操作', function (r) {
+          return '<button class="btn ghost" onclick="BAS.wlRemove(\'' + esc(r.callsign) +
+            '\')">移出白名单</button>';
+        }]
+      ], rows);
     });
     api('blacklist/history?limit=300').then(function (j) {
       table($('t-blh'), [
@@ -599,6 +683,24 @@
       api('quarantine/release', { method: 'POST', body: { id: id } })
         .then(function (j) { alert(j.ok ? '已放行并解封' : ('失败: ' + j.error)); loadQuar(); });
     },
+    kick: function (clientid) {
+      if (!confirm('把该连接踢下线？（只踢不封，它会自己重连）')) return;
+      api('kick', { method: 'POST', body: { clientid: clientid } }).then(function (j) {
+        alert(j.ok ? (j.detail || '已踢下线') : ('失败: ' + j.error));
+        loadOnline();
+      });
+    },
+    banIp: function (ip) {
+      var h = prompt('封禁 IP ' + ip + ' 多少小时？（留空=24）', '24');
+      if (h === null) return;
+      api('ban-ip', { method: 'POST', body: { ip: ip, hours: h || 24 } })
+        .then(function (j) { alert(j.ok ? (j.detail || '已封禁') : ('失败: ' + j.error)); loadBl(); });
+    },
+    wlRemove: function (cs) {
+      if (!confirm('把 ' + cs + ' 移出白名单？')) return;
+      api('whitelist/remove', { method: 'POST', body: { callsign: cs } })
+        .then(function (j) { loadBl(); });
+    },
     detail: function (name) {
       api('leaderboard/' + encodeURIComponent(name)).then(function (j) {
         var rows = j.rows || [];
@@ -625,6 +727,42 @@
         if (!confirm('确定清空 EMQX 全部封禁？')) return;
         api('banned/unban-all', { method: 'POST', body: {} }).then(function (j) {
           alert(j.ok ? (j.detail || '已清空') : ('部分失败: ' + j.error + ' / ' + (j.detail || '')));
+          loadBl();
+        });
+      });
+    }
+    // 审计：清理旧事件
+    if ($('au-prune')) {
+      $('au-prune').addEventListener('click', function () {
+        var days = parseInt($('au-days').value || '30', 10);
+        if (!confirm('清理 ' + days + ' 天前的审计事件？（不可撤销）')) return;
+        api('audit/prune', { method: 'POST', body: { days: days } }).then(function (j) {
+          alert(j.ok ? (j.detail || '已清理') : ('失败: ' + j.error));
+          loadAudit();
+        });
+      });
+    }
+    // 黑名单：按 IP 封禁
+    if ($('bn-ban-ip')) {
+      $('bn-ban-ip').addEventListener('click', function () {
+        var ip = ($('bn-ip').value || '').trim();
+        if (!ip) { alert('请填写 IP'); return; }
+        var h = parseInt($('bn-ip-hours').value || '24', 10);
+        if (!confirm('把 IP ' + ip + ' 封禁 ' + h + ' 小时？')) return;
+        api('ban-ip', { method: 'POST', body: { ip: ip, hours: h } }).then(function (j) {
+          alert(j.ok ? (j.detail || '已封禁') : ('失败: ' + j.error));
+          loadBl();
+        });
+      });
+    }
+    // 白名单：加入
+    if ($('wl-add')) {
+      $('wl-add').addEventListener('click', function () {
+        var cs = ($('wl-who').value || '').trim();
+        if (!cs) { alert('请填写呼号'); return; }
+        api('whitelist/add', { method: 'POST', body: { callsign: cs } }).then(function (j) {
+          if (!j.ok) { alert('失败: ' + j.error); return; }
+          $('wl-who').value = '';
           loadBl();
         });
       });

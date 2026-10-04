@@ -178,12 +178,22 @@ class AuditServiceE2ETests(unittest.TestCase):
 
     # ---------------- ★ 核心：合法用户不被误封 ----------------
     def test_legit_sas_user_passes_by_default(self):
-        """合法呼号 + 身份一致 → PASS，不落库、不拉黑、不进待审。"""
+        """
+        合法呼号 + 身份一致 → PASS，不拉黑、不进待审。
+
+        注意：PASS 现在也会**限流落库**（用户要求身份审计里能看到"通过"的事件），
+        所以这里断言的是"没有处置 + 记录的是 PASS"，而不是"表为空"。
+        """
         self._webhook("BG5ESN", "12345", "BG5ESN", 12345)
         self.assertEqual([], STUB.bans, "合法用户绝不能被拉黑")
-        self.assertEqual(0, self.db.stats_summary()["audit_packets"], "PASS 不落库")
         self.assertEqual(0, len(self.db.list_quarantine("pending")))
-        self.assertEqual(PASS, PASS)
+        rows = self.db.query_audit_packets()
+        self.assertTrue(rows, "PASS 事件也应留证（否则审计里看不到通过的）")
+        for r in rows:
+            self.assertEqual(PASS, r["verdict"], "合法连接不得出现非 PASS 判决")
+        self.assertEqual("pass", rows[0]["scene"])
+        self.assertEqual("BG5ESN", rows[0]["pkt_callsign"], "包头身份要记下来")
+        self.assertEqual("BG5ESN", rows[0]["conn_callsign"])
 
     def test_legit_user_with_uid_mismatch_is_not_banned_by_default(self):
         """
@@ -202,7 +212,9 @@ class AuditServiceE2ETests(unittest.TestCase):
         """EMQX 可能把 uid 下发成 number，包内是 int → 必须归一后比较（1 != "1" 陷阱）。"""
         self._webhook("BG5ESN", 12345, "BG5ESN", 12345)    # uid 传 number
         self.assertEqual([], STUB.bans)
-        self.assertEqual(0, self.db.stats_summary()["audit_packets"])
+        rows = self.db.query_audit_packets()
+        self.assertTrue(all(r["verdict"] == PASS for r in rows),
+                        "uid 数字/字符串归一后不得误判")
 
     def test_partial_attr_missing_is_not_kick(self):
         """只拿到 uid、没有 callsign（属性下发半截）→ 默认 WARN，不 KICK（上游会误判 KICK）。"""
@@ -243,7 +255,8 @@ class AuditServiceE2ETests(unittest.TestCase):
         }
         self.svc.ingest(self.db.get_ingest_token(), body)
         self.assertEqual([], STUB.bans)
-        self.assertEqual(0, len(self.db.query_audit_packets()), "身份一致 → PASS 不落库")
+        rows = self.db.query_audit_packets()
+        self.assertTrue(all(r["verdict"] == PASS for r in rows), "身份一致 → 只能有 PASS")
         self.assertGreaterEqual(self.svc.stats().get("degraded_identity", 0), 1,
                                 "应记录降级身份计数，便于发现 EMQX 没下发 client_attrs")
 
@@ -295,7 +308,8 @@ class AuditServiceE2ETests(unittest.TestCase):
         # 连接身份与包头身份一致（都是本机库里没有的呼号）
         self._webhook("BG0NOPE", "1", "BG0NOPE", 1)
         self.assertEqual([], STUB.bans, "身份一致绝不能被封")
-        self.assertEqual([], self.db.query_audit_packets(), "PASS 不落库")
+        rows = self.db.query_audit_packets()
+        self.assertTrue(all(r["verdict"] == PASS for r in rows))
 
     def test_local_db_absence_is_not_forgery_evidence(self):
         """本机库查不到该呼号（国服/信任链证书的常态）→ 不能判伪造、不能封"""
@@ -308,7 +322,8 @@ class AuditServiceE2ETests(unittest.TestCase):
         self._webhook("BH6XYZ", "1", "BH6XYZ", 1)     # 身份一致
         self.assertEqual([], STUB.bans)
         rows = self.db.query_audit_packets()
-        self.assertEqual([], rows, "身份一致就是 PASS，不该有任何记录")
+        self.assertTrue(all(r["verdict"] == PASS for r in rows),
+                        "身份一致就是 PASS，不该有任何非 PASS 记录")
 
     def test_sas_unknown_forged_is_high_confidence(self):
         """
@@ -345,7 +360,9 @@ class AuditServiceE2ETests(unittest.TestCase):
         # 身份一致 → PASS
         self._webhook("BH6REV", "1", "BH6REV", 1)
         self.assertEqual([], STUB.bans)
-        self.assertEqual([], self.db.query_audit_packets())
+        rows = self.db.query_audit_packets()
+        self.assertTrue(all(r["verdict"] == PASS for r in rows),
+                        "本机陈旧记录不得产生非 PASS 判决")
 
     def test_opt_in_local_revoked_can_kick(self):
         """显式开启 sas_local_revoked_verdict=kick 时才按本机吊销记录处置"""

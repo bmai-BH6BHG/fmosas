@@ -1941,6 +1941,20 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 print("[AUTH] 通过: callsign=%s uid=%s app_verified=%s(%s) clientid=%s" % (
                     attrs.get('callsign'), attrs.get('uid'),
                     attrs.get('app_verified'), attrs.get('app_sig'), clientid or '-'))
+                # 登记"最近在线"：手机 APP 常频繁短线重连，
+                # 只靠"当前在线"会看不到刚断开的人（真实问题：某用户来回掉线，界面像没上线）
+                try:
+                    _svc = getattr(self.__class__, 'bas_service', None)
+                    if _svc is not None and hasattr(_svc, 'note_client_seen'):
+                        _svc.note_client_seen(attrs.get('callsign') or username,
+                                              attrs.get('uid', ''), clientid, peerhost)
+                    # 认证通过也写一条身份审计（用户要求：审计里要看得到"通过"的事件）
+                    if _svc is not None and hasattr(_svc, 'record_auth_ok'):
+                        _svc.record_auth_ok(attrs.get('callsign') or username,
+                                            attrs.get('uid', ''), clientid, peerhost,
+                                            attrs.get('app_verified', ''))
+                except Exception:  # noqa: BLE001
+                    pass
             else:
                 # 诊断：拒绝时打印客户端原始 username（前 80 字符 repr），
                 # 便于定位客户端凭证格式错误（如编码/字段不符）

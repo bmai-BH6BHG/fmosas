@@ -92,6 +92,10 @@ DEFAULT_POLICY = {
     # 需要豁免别的身份时由部署方在策略里显式追加，例如
     #   audit_ignore_usernames = BAS_PREFLIGHT,ECHO
     #   audit_ignore_clientid_prefixes = FMO-ECHO
+    # 身份审计是否记录"通过"的事件（用户要求：全部事件都要看得见，不只是未通过的）
+    "audit_pass_log": True,
+    # 同一 clientid 的 PASS 事件最多多久记一条（秒）——语音帧量大，必须限流
+    "audit_pass_interval_sec": 60,
     "audit_ignore_usernames": ["BAS_PREFLIGHT"],
     "audit_ignore_clientid_prefixes": ["bas-probe"],
     # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP

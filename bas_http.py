@@ -66,7 +66,8 @@ WRITABLE_SETTINGS = {"emqx_url", "emqx_api_key", "emqx_api_secret", "topic_name"
 # 策略里允许写入的键（防止前端写坏内核字段）
 WRITABLE_POLICY = {"mode", "auto_ban", "uid_mismatch_verdict", "partial_attr_verdict",
                    "ban_hours", "ban_whitelist", "ban_rate_limit_per_hour",
-                   "ban_when_sas_unavailable", "sas_cross_check", "audit_rate_limit_per_sec"}
+                   "ban_when_sas_unavailable", "sas_cross_check", "audit_rate_limit_per_sec",
+                   "audit_pass_log", "audit_pass_interval_sec"}
 
 
 class BasAuth(object):
@@ -356,11 +357,14 @@ class BasHttp(object):
                          "now": now_text()})
             return True
 
-        # ---- 在线（实时：直查 EMQX + 按用户聚合）----
+        # ---- 在线（实时：直查 EMQX + 按用户聚合 + 最近在线）----
         if sub == "online" and method == "GET":
             clients = self.svc.online_clients()
+            mins = int((q.get("minutes") or ["30"])[0])
             h.send_json({"ok": True, "clients": clients,
                          "users": self.svc.online_users(clients),
+                         "recent": self.svc.recent_clients(minutes=mins),
+                         "recent_minutes": mins,
                          "fetched_at": now_text(), "source": "EMQX 实时列表"})
             return True
 
@@ -391,14 +395,102 @@ class BasHttp(object):
                 bucket=(q.get("bucket") or ["10s"])[0])})
             return True
 
-        # ---- 身份审计事件 ----
-        if sub == "audit" and method == "GET":
-            h.send_json({"ok": True, "rows": self.db.query_audit_packets(
+        # ---- 管理操作：踢下线 / IP 封禁 / 白名单 / 策略 / 清理 ----
+        if sub == "kick" and method == "POST":
+            body = body or {}
+            cid = str(body.get("clientid") or "").strip()
+            ok, err = self.svc.kick_client(cid)
+            h.send_json({"ok": ok, "error": err,
+                         "detail": ("已踢下线 %s" % cid) if ok else err})
+            return True
+        if sub == "ban-ip" and method == "POST":
+            body = body or {}
+            ip = str(body.get("ip") or "").strip()
+            hours = body.get("hours")
+            ok, err = self.svc.ban_ip(ip, hours,
+                                      str(body.get("reason") or "管理员手动封禁 IP"))
+            h.send_json({"ok": ok, "error": err,
+                         "detail": ("已封禁 IP %s" % ip) if ok else err})
+            return True
+        if sub == "unban-ip" and method == "POST":
+            body = body or {}
+            ip = str(body.get("ip") or "").strip()
+            ok, err, detail = self.svc.unban(ip, "admin", "peerhost")
+            h.send_json({"ok": ok, "error": err, "detail": detail})
+            return True
+        if sub == "whitelist" and method == "GET":
+            h.send_json({"ok": True, "rows": self.svc.whitelist_list()})
+            return True
+        if sub == "whitelist/add" and method == "POST":
+            body = body or {}
+            ok, msg = self.svc.whitelist_add(body.get("callsign"))
+            h.send_json({"ok": ok, "error": None if ok else msg, "detail": msg,
+                         "rows": self.svc.whitelist_list()})
+            return True
+        if sub == "whitelist/remove" and method == "POST":
+            body = body or {}
+            ok, msg = self.svc.whitelist_remove(body.get("callsign"))
+            h.send_json({"ok": ok, "error": msg if not ok else None,
+                         "rows": self.svc.whitelist_list()})
+            return True
+        if sub == "policy" and method == "GET":
+            h.send_json({"ok": True, "policy": self.svc.policy_snapshot()})
+            return True
+        if sub == "audit/prune" and method == "POST":
+            body = body or {}
+            days = body.get("days", 30)
+            scene = str(body.get("scene") or "").strip() or None
+            try:
+                n = self.db.prune_audit_packets(days=days, scene=scene)
+                h.send_json({"ok": True, "deleted": n,
+                             "detail": "已清理 %d 条（保留最近 %s 天%s）"
+                                       % (n, days, ("，场景 %s" % scene) if scene else "")})
+            except Exception as e:  # noqa: BLE001
+                h.send_json({"ok": False, "error": str(e)}, 500)
+            return True
+        if sub == "audit/stats" and method == "GET":
+            h.send_json({"ok": True,
+                         "total": self.db.count_audit_packets(),
+                         "fake_cert": self.db.count_audit_packets("fake_cert"),
+                         "now": now_text()})
+            return True
+        if sub == "seen/prune" and method == "POST":
+            body = body or {}
+            try:
+                n = self.db.prune_client_seen(days=int(body.get("days") or 7))
+                h.send_json({"ok": True, "deleted": n,
+                             "detail": "已清理 %d 条连接登记" % n})
+            except Exception as e:  # noqa: BLE001
+                h.send_json({"ok": False, "error": str(e)}, 500)
+            return True
+
+        # ---- 身份审计事件 ----        if sub == "audit" and method == "GET":
+            rows = self.db.query_audit_packets(
                 verdict=(q.get("verdict") or [None])[0],
                 callsign=(q.get("callsign") or [None])[0],
                 since=q.get("since", [None])[0], until=q.get("until", [None])[0],
                 limit=int((q.get("limit") or ["200"])[0]),
-                offset=int((q.get("offset") or ["0"])[0]))})
+                offset=int((q.get("offset") or ["0"])[0]))
+            # ★ 认证类事件（auth_ok / fake_cert 等）发生在 MQTT CONNECT 那一刻，
+            #   那时客户端还没发过任何 FMO 报文 → 天生没有包头身份。
+            #   这里把"该 clientid 最近一次报文的包头身份"补上并标注来源，
+            #   界面上就不会看着像"包头身份丢了"。
+            try:
+                need = [r.get("clientid") for r in rows
+                        if not r.get("pkt_callsign") and r.get("clientid")]
+                if need:
+                    latest = self.db.latest_pkt_identity(need)
+                    for r in rows:
+                        if r.get("pkt_callsign"):
+                            continue
+                        hit = latest.get(str(r.get("clientid")))
+                        if hit:
+                            r["pkt_callsign_recent"] = hit["pkt_callsign"]
+                            r["pkt_uid_recent"] = hit["pkt_uid"]
+                            r["pkt_recent_at"] = hit["ts"]
+            except Exception as e:  # noqa: BLE001
+                print("[BAS] 补齐包头身份失败: %s" % e)
+            h.send_json({"ok": True, "rows": rows})
             return True
 
         # ---- EMQX 实际封禁名单（关键：审计封的人在 EMQX 里，界面必须能看到并解开）----

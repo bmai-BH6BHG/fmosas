@@ -30,6 +30,9 @@
   <nav id="nav"></nav>
   <div class="top-right">
     <span id="policy-badge" class="badge" title="身份控制策略模式">—</span>
+    <!-- 返回 SAS（分系统管理后台）。BAS 是内嵌在分系统管理口的子页面，
+         这里给一个显式入口，避免只能手改地址栏。 -->
+    <a class="btn ghost" id="back-sas" href="/admin" title="返回 FMO 分系统（SAS）管理后台">← 返回 SAS 管理</a>
     <!-- 已取消后台账号登录：不再显示登录/退出按钮。
          如需恢复登录：把 bas_http.py 的 BAS_ADMIN_LOGIN_REQUIRED 改回 True，
          并把下面这段 login 遮罩与退出按钮恢复显示即可（结构都保留着）。 -->
@@ -55,6 +58,8 @@
       <label class="muted small"><input type="checkbox" id="online-auto" checked> 自动刷新(5s)</label>
     </div>
     <div class="panel table-wrap"><table id="t-online-users"></table></div>
+    <h3 class="muted small">最近在线（近 <span id="recent-minutes">30</span> 分钟登录过，含已断开的短线重连用户）</h3>
+    <div class="panel table-wrap"><table id="t-online-recent"></table></div>
     <h3 class="muted small">连接明细（同一呼号多设备会各占一行）</h3>
     <div class="panel table-wrap"><table id="t-online"></table></div>
   </section>
@@ -104,10 +109,18 @@
         <select id="au-verdict">
           <option value="">全部</option><option value="KICK">KICK 伪造</option>
           <option value="WARN">WARN 告警</option><option value="FAIL">FAIL 非法包</option>
+          <option value="PASS">PASS 通过（认证通过 / 身份一致）</option>
         </select>
       </label>
       <label class="inline">呼号<input id="au-callsign" placeholder="BG5ESN"></label>
       <button class="btn" data-reload="audit">查询</button>
+      <button class="btn ghost" id="au-csv">导出 CSV</button>
+      <label class="inline">清理
+        <input id="au-days" type="number" min="1" value="30" class="narrow" title="保留最近多少天">
+        天前
+      </label>
+      <button class="btn danger" id="au-prune">清理旧事件</button>
+      <span class="muted small" id="au-count"></span>
     </div>
     <div class="panel table-wrap"><table id="t-audit"></table></div>
   </section>
@@ -118,10 +131,21 @@
     <div class="row">
       <button class="btn ghost" id="bn-refresh">刷新</button>
       <button class="btn danger" id="bn-unban-all">一键全部解封</button>
+      <input id="bn-ip" placeholder="按 IP 封禁，如 112.251.207.117" class="mid">
+      <input id="bn-ip-hours" type="number" min="1" value="24" class="narrow" title="封禁小时数">
+      <button class="btn danger" id="bn-ban-ip">封禁该 IP</button>
       <span class="muted small">按 <b>as</b> 维度解封：username / clientid / peerhost。
         审计按 clientid 或 IP 封的，只按呼号解是解不掉的。</span>
     </div>
     <div class="panel table-wrap"><table id="t-bn"></table></div>
+
+    <h3>封禁白名单（名单内呼号永不被自动封禁）</h3>
+    <div class="row">
+      <input id="wl-who" placeholder="呼号，如 BH6BHG" class="narrow">
+      <button class="btn" id="wl-add">加入白名单</button>
+      <span class="muted small">说明：白名单只影响<b>自动封禁</b>；管理员手动封禁不受它限制。</span>
+    </div>
+    <div class="panel table-wrap"><table id="t-wl"></table></div>
 
     <div class="row">
       <h3>审计库黑名单记录</h3>

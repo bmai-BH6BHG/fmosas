@@ -202,6 +202,23 @@ CREATE TABLE IF NOT EXISTS bas_quarantine (
 );
 CREATE INDEX IF NOT EXISTS idx_quar_status ON bas_quarantine(status);
 CREATE INDEX IF NOT EXISTS idx_quar_time   ON bas_quarantine(created_at);
+
+-- 连接登记：每次认证通过记一笔。
+-- 用途：有些客户端（尤其手机 APP）会**频繁短线重连**（实测：
+-- 某用户每分钟换一个 clientid 重连一次、会话仅几十秒），
+-- 只看"当前在线"会以为这个人从没上线；有了这张表就能显示
+-- "最近 30 分钟上过线的用户 + 最后在线时间"。
+CREATE TABLE IF NOT EXISTS client_seen (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    callsign      TEXT,
+    uid           TEXT,
+    clientid      TEXT,
+    peerhost      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_seen_ts  ON client_seen(ts);
+CREATE INDEX IF NOT EXISTS idx_seen_cs  ON client_seen(callsign, ts);
+CREATE INDEX IF NOT EXISTS idx_seen_cid ON client_seen(clientid, ts);
 """
 
 DEFAULT_SETTINGS = {
@@ -615,6 +632,150 @@ class AuditDB(object):
             conn = self._conn()
             try:
                 return [dict(r) for r in conn.execute(sql, args).fetchall()]
+            finally:
+                conn.close()
+
+    def prune_audit_packets(self, days=30, scene=None):
+        """
+        清理旧的审计事件（默认保留 30 天）。
+        scene 为空则清所有场景；给定 scene 只清该场景（例如只清历史的 fake_cert）。
+        返回删除条数。
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._conn()
+            try:
+                if scene:
+                    cur = conn.execute("DELETE FROM audit_packets WHERE ts < ? AND scene=?",
+                                       (cutoff, str(scene)))
+                else:
+                    cur = conn.execute("DELETE FROM audit_packets WHERE ts < ?", (cutoff,))
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
+
+    def count_audit_packets(self, scene=None):
+        with self._lock:
+            conn = self._conn()
+            try:
+                if scene:
+                    return conn.execute("SELECT COUNT(*) FROM audit_packets WHERE scene=?",
+                                        (str(scene),)).fetchone()[0]
+                return conn.execute("SELECT COUNT(*) FROM audit_packets").fetchone()[0]
+            finally:
+                conn.close()
+
+    def latest_pkt_identity(self, clientids):
+        """
+        取这些 clientid **最近一次报文的包头身份** → {clientid: {...}}。
+
+        为什么需要：认证事件（auth_ok）发生在 MQTT CONNECT 时，那时还没有任何 FMO 报文，
+        所以它天生没有包头身份。界面上把两者关联起来，才不会看着像"数据丢了"。
+        """
+        ids = [str(x) for x in (clientids or []) if x]
+        if not ids:
+            return {}
+        out = {}
+        with self._lock:
+            conn = self._conn()
+            try:
+                qs = ",".join("?" for _ in ids)
+                sql = ("SELECT clientid, pkt_callsign, pkt_uid, ts FROM audit_packets "
+                       "WHERE pkt_callsign IS NOT NULL AND pkt_callsign != '' "
+                       "AND clientid IN (%s) ORDER BY id DESC" % qs)
+                for r in conn.execute(sql, ids):
+                    cid = str(r["clientid"])
+                    if cid not in out:            # 倒序取，第一条即最近
+                        out[cid] = {"pkt_callsign": r["pkt_callsign"],
+                                    "pkt_uid": r["pkt_uid"], "ts": r["ts"]}
+                return out
+            finally:
+                conn.close()
+
+    # ---------------- 连接登记（最近在线） ----------------
+    def add_client_seen(self, callsign, uid="", clientid="", peerhost="", ts=None):
+        """
+        记一笔"某客户端刚认证通过"。
+        节流：同一 clientid 在 20 秒内只记一次（重连风暴时不刷爆库）。
+        返回 True 表示本次写入。
+        """
+        ts = ts or now_text(True)
+        with self._lock:
+            conn = self._conn()
+            try:
+                if clientid:
+                    row = conn.execute(
+                        "SELECT ts FROM client_seen WHERE clientid=? ORDER BY id DESC LIMIT 1",
+                        (str(clientid),)).fetchone()
+                    if row and row[0]:
+                        try:
+                            from datetime import datetime
+                            prev = datetime.fromisoformat(str(row[0])).timestamp()
+                            cur = datetime.fromisoformat(str(ts)).timestamp()
+                            if cur - prev < 20:
+                                return False
+                        except Exception:  # noqa: BLE001
+                            pass
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    "INSERT INTO client_seen(ts, callsign, uid, clientid, peerhost) "
+                    "VALUES(?,?,?,?,?)",
+                    (str(ts), str(callsign or ""), str(uid or ""),
+                     str(clientid or ""), str(peerhost or "")))
+                conn.execute("COMMIT;")
+                return True
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            finally:
+                conn.close()
+
+    def recent_clients(self, minutes=30, limit=200):
+        """
+        最近 N 分钟内认证通过过的**用户**（按呼号聚合）→ "最近在线"视图。
+
+        为什么需要：手机 APP 常见频繁短线重连（实测某用户每分钟换 clientid 重连、
+        单次会话仅几十秒），只看"当前在线"会以为他从没上线。
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(minutes=int(minutes))).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        sql = """
+        SELECT callsign,
+               MAX(ts)       AS last_seen,
+               COUNT(*)      AS hits,
+               COUNT(DISTINCT clientid) AS conns,
+               MAX(clientid) AS last_clientid,
+               MAX(peerhost) AS last_ip,
+               MAX(uid)      AS uid
+        FROM client_seen
+        WHERE ts >= ?
+        GROUP BY callsign
+        ORDER BY last_seen DESC
+        LIMIT ?
+        """
+        with self._lock:
+            conn = self._conn()
+            try:
+                return [dict(r) for r in conn.execute(sql, (cutoff, int(limit))).fetchall()]
+            finally:
+                conn.close()
+
+    def prune_client_seen(self, days=7):
+        """清理过期的连接登记（默认保留 7 天）"""
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM client_seen WHERE ts < ?", (cutoff,))
+                conn.commit()
+                return cur.rowcount
             finally:
                 conn.close()
 
