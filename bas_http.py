@@ -464,7 +464,8 @@ class BasHttp(object):
                 h.send_json({"ok": False, "error": str(e)}, 500)
             return True
 
-        # ---- 身份审计事件 ----        if sub == "audit" and method == "GET":
+        # ---- 身份审计事件 ----
+        if sub == "audit" and method == "GET":
             rows = self.db.query_audit_packets(
                 verdict=(q.get("verdict") or [None])[0],
                 callsign=(q.get("callsign") or [None])[0],

@@ -92,6 +92,7 @@ class AuditService(object):
         self._app_track = {}            # clientid -> 非本 APP 连续轮数
         self._auth_fail_track = {}      # peerhost -> [失败时间戳]（假证书反滥用）
         self._pass_log_track = {}       # clientid -> 上次记录 PASS 事件的时间（限流）
+        self._ip_cache = {}             # clientid -> (ip, ts) 缓存（审计要显示来源 IP）
         self._fail_times = []           # FAIL 落库限流
         self._last_cleanup = 0.0
         self._last_collect = 0.0
@@ -354,7 +355,7 @@ class AuditService(object):
         # 1) 留证
         try:
             self.db.write_audit_packet({
-                "ts": now_text(True), "topic": "", "clientid": cid,
+                "ts": now_text(True), "topic": "", "clientid": cid, "ip": ip,
                 "conn_callsign": cs, "conn_uid": "",
                 "verdict": KICK, "scene": "fake_cert",
                 "reason": "认证被拒（假证书/验签失败）: %s | 自称呼号=%s clientid=%s ip=%s"
@@ -585,6 +586,7 @@ class AuditService(object):
                     pkt_uid0 = str(parsed.uid)
                 self.db.write_audit_packet({
                     "ts": now_text(True), "topic": topic, "clientid": clientid,
+                    "ip": self._client_ip(clientid),
                     "conn_callsign": conn_callsign, "conn_uid": conn_uid,
                     "pkt_callsign": pkt_cs0, "pkt_uid": pkt_uid0,
                     "verdict": PASS, "scene": "pass",
@@ -613,6 +615,7 @@ class AuditService(object):
 
         self.db.write_audit_packet({
             "ts": now_text(True), "topic": topic, "clientid": clientid,
+            "ip": self._client_ip(clientid),
             "conn_callsign": conn_callsign, "conn_uid": conn_uid,
             "pkt_callsign": pkt_cs, "pkt_uid": pkt_uid,
             "verdict": decision.verdict, "scene": decision.scene,
@@ -922,6 +925,32 @@ class AuditService(object):
         self._stop.set()
 
     # ---------------- 查询接口（供 Web 层） ----------------
+    def _client_ip(self, clientid):
+        """
+        按 clientid 从 EMQX 在线列表查来源 IP（带缓存）。
+        报文事件的 webhook 里通常没有 IP，用这个补上，界面上就能直接看到来源。
+        """
+        cid = str(clientid or "")
+        if not cid:
+            return ""
+        now = time.time()
+        hit = self._ip_cache.get(cid)
+        if hit and now - hit[1] < 60:
+            return hit[0]
+        ip = ""
+        try:
+            for c in self.emqx.list_clients(limit=2000):
+                if str(c.get("clientid")) == cid:
+                    ip = str(c.get("ip_address") or "")
+                    break
+        except Exception:  # noqa: BLE001
+            ip = ""
+        self._ip_cache[cid] = (ip, now)
+        if len(self._ip_cache) > 5000:
+            for k in [k for k, v in self._ip_cache.items() if now - v[1] > 300]:
+                self._ip_cache.pop(k, None)
+        return ip
+
     def _pass_log_ok(self, clientid, now=None):
         """PASS 事件的记录节流：同一 clientid 在 audit_pass_interval_sec 内只记一条"""
         try:
@@ -958,6 +987,7 @@ class AuditService(object):
                 reason += "；" + extra
             self.db.write_audit_packet({
                 "ts": now_text(True), "topic": "", "clientid": str(clientid or ""),
+                "ip": str(peerhost or ""),
                 "conn_callsign": str(callsign or ""), "conn_uid": str(uid or ""),
                 "pkt_callsign": "", "pkt_uid": "",
                 "verdict": PASS, "scene": "auth_ok", "reason": reason,

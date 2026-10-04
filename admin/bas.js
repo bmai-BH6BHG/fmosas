@@ -372,6 +372,13 @@
           }
           return '<span class="muted small">本次事件无报文<br>（认证在 CONNECT 时完成）</span>';
         }],
+        ['IP', function (r) {
+          if (r.ip) { return '<span class="mono">' + esc(r.ip) + '</span>'; }
+          // 老事件没存 IP：fake_cert 的原因串里有 ip=...
+          var m = /ip=([0-9a-fA-F:.]+)/.exec(String(r.reason || ''));
+          return m ? '<span class="mono">' + esc(m[1]) + '</span>'
+                   : '<span class="muted small">—</span>';
+        }],
         ['clientid', function (r) { return '<span class="mono">' + esc(r.clientid) + '</span>'; }],
         ['置信度', function (r) { return r.confidence === null ? '' : Number(r.confidence).toFixed(2); }],
         ['已封', function (r) { return r.ban ? '<span class="tag KICK">是</span>' : '否'; }],

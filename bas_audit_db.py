@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS audit_packets (
     ts            TEXT NOT NULL,
     topic         TEXT,
     clientid      TEXT,
+    ip            TEXT,                -- 来源 IP（认证事件取 peerhost；报文事件取 webhook/EMQX）
     conn_callsign TEXT,
     conn_uid      TEXT,
     pkt_callsign  TEXT,
@@ -268,6 +269,14 @@ class AuditDB(object):
             conn = self._conn()
             try:
                 conn.executescript(SCHEMA_SQL)
+                # 迁移：老库补列（CREATE TABLE IF NOT EXISTS 不会给已有表加列）
+                try:
+                    cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_packets)")]
+                    if "ip" not in cols:
+                        conn.execute("ALTER TABLE audit_packets ADD COLUMN ip TEXT")
+                        print("[BAS] 已为 audit_packets 增加 ip 列")
+                except Exception as e:  # noqa: BLE001
+                    print("[BAS] 迁移 audit_packets.ip 失败: %s" % e)
                 # 迁移协议：即使新建库也显式置版本
                 cur = conn.execute("PRAGMA user_version;")
                 ver = cur.fetchone()[0]
@@ -524,11 +533,12 @@ class AuditDB(object):
             try:
                 conn.execute("BEGIN IMMEDIATE;")
                 conn.execute(
-                    "INSERT INTO audit_packets(ts, topic, clientid, conn_callsign, conn_uid, "
+                    "INSERT INTO audit_packets(ts, topic, clientid, ip, conn_callsign, conn_uid, "
                     "pkt_callsign, pkt_uid, verdict, scene, reason, confidence, len, frame_num, "
                     "crc_ok, smeter, srv_uid, pkt_ts, stream_begin, ban, source) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (row.get("ts") or now_text(True), row.get("topic"), row.get("clientid"),
+                     row.get("ip"),
                      row.get("conn_callsign"), row.get("conn_uid"), row.get("pkt_callsign"),
                      row.get("pkt_uid"), row.get("verdict"), row.get("scene"), row.get("reason"),
                      row.get("confidence"), row.get("len"), row.get("frame_num"),
