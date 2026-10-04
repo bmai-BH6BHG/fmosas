@@ -490,6 +490,17 @@ for BF in install-bas.sh uninstall-bas.sh bas_migrate.py bas_emqx_auth.py bas_di
         MISSING_BAS="$MISSING_BAS $BF"
     fi
 done
+# BAS 渠道版本号：**从 install-bas.sh 的 BAS_VERSION 生成**，单一来源。
+# （原先直接拷 VERSION 文件，而它长期停在 1.0.0，与脚本里烘焙的版本号不一致）
+BAS_VER="$(awk -F'"' '/^[[:space:]]*BAS_VERSION=/{print $2; exit}' "$UPLOAD/bas/install-bas.sh" 2>/dev/null)"
+if [ -n "$BAS_VER" ]; then
+    printf '%s\n' "$BAS_VER" > "$UPLOAD/bas/VERSION"
+    printf '%s\n' "$BAS_VER" > "$REPO/bas/VERSION"   # 顺手同步源文件，避免下次又拿旧值
+    info "      [BAS] 版本号已同步: $BAS_VER"
+else
+    warn "[BAS] 未能从 install-bas.sh 解析 BAS_VERSION，bas/VERSION 可能过期"
+fi
+
 # 上传的脚本必须是 LF（否则 Linux 上 bash 会报 bad interpreter）
 for BF in install-bas.sh uninstall-bas.sh bas_emqx_auth.py; do
     if [ -f "$UPLOAD/bas/$BF" ]; then
