@@ -496,7 +496,7 @@ BAS_VER="$(awk -F'"' '/^[[:space:]]*BAS_VERSION=/{print $2; exit}' "$UPLOAD/bas/
 if [ -n "$BAS_VER" ]; then
     printf '%s\n' "$BAS_VER" > "$UPLOAD/bas/VERSION"
     printf '%s\n' "$BAS_VER" > "$REPO/bas/VERSION"   # 顺手同步源文件，避免下次又拿旧值
-    info "      [BAS] 版本号已同步: $BAS_VER"
+    echo "      [BAS] 版本号已同步: $BAS_VER"
 else
     warn "[BAS] 未能从 install-bas.sh 解析 BAS_VERSION，bas/VERSION 可能过期"
 fi
