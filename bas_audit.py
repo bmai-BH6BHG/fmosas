@@ -847,27 +847,90 @@ class AuditService(object):
         self._stop.set()
 
     # ---------------- 查询接口（供 Web 层） ----------------
-    def online_clients(self):
-        snap = self.poller.snapshot()
-        clients = snap["clients"]
-        if not clients:
-            # 轮询器还没数据时直接查一次（页面首次打开也不空）
+    def online_clients(self, live=True):
+        """
+        在线客户端列表。
+
+        ★ 默认**直查 EMQX 实时列表**，不读轮询快照 —— 页面要的是"现在谁在线"，
+          而快照会滞后到轮询间隔（真实问题：界面显示的在线数不实时）。
+          EMQX 查询失败时才退回快照。
+        另外把界面要用的字段补齐：呼号/UID（从 client_attrs 提上来）、
+        在线时长、类型（内部/APP/终端）。
+        """
+        clients = []
+        if live:
             try:
-                clients = self.emqx.list_clients()
-                self.poller._clients = clients            # noqa: SLF001
-            except EmqxError:
+                clients = self.emqx.list_clients(limit=2000)
+            except Exception:  # noqa: BLE001
                 clients = []
-        now = time.time()
+        if not clients:
+            try:
+                clients = self.poller.snapshot()["clients"] or []
+            except Exception:  # noqa: BLE001
+                clients = []
         out = []
         for c in clients:
-            connected_at = c.get("connected_at") or ""
-            uptime = 0
+            d = dict(c)
+            attrs = d.get("client_attrs") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            d["callsign"] = str(d.get("callsign") or attrs.get("callsign")
+                                or d.get("username") or "")
+            d["uid"] = str(d.get("uid") or attrs.get("uid") or "")
+            ca = d.get("connected_at")
+            sec = 0
+            if isinstance(ca, str) and ca:
+                try:
+                    from datetime import datetime
+                    sec = max(0, int(time.time() - datetime.fromisoformat(
+                        ca.replace("Z", "+00:00")).timestamp()))
+                except Exception:  # noqa: BLE001
+                    sec = 0
+            d["online_sec"] = sec
+            d["online_text"] = "%d:%02d:%02d" % (sec // 3600, (sec % 3600) // 60, sec % 60)
+            d["is_app"] = str(attrs.get("app_verified") or "") == "1"
+            cid = str(d.get("clientid") or "")
+            if d["callsign"] == "SERVER" or cid.startswith(("FMO-MONITOR", "fmo-web", "FMO-ECHO")):
+                d["kind"] = "内部"
+            elif d["is_app"]:
+                d["kind"] = "APP"
+            else:
+                d["kind"] = "终端"
+            out.append(d)
+        out.sort(key=lambda x: (x.get("callsign") or "~", x.get("clientid") or ""))
+        return out
+
+    def online_users(self, clients=None):
+        """
+        按**呼号**聚合的在线用户（页面要的是"人"，不是"连接"）。
+        同一呼号多设备/多开是正常的（实测 BH6BHG 有 APP+固件两条），要合并显示。
+        """
+        clients = self.online_clients() if clients is None else clients
+        users = {}
+        for c in clients:
+            cs = str(c.get("callsign") or c.get("username") or "").strip().upper() or "(未知)"
+            u = users.setdefault(cs, {"conns": 0, "_uids": set(), "_ips": set(),
+                                      "_kinds": set(), "max_sec": 0, "_cids": []})
+            u["conns"] += 1
+            if c.get("uid"):
+                u["_uids"].add(str(c["uid"]))
+            if c.get("ip_address"):
+                u["_ips"].add(str(c["ip_address"]))
+            u["_kinds"].add(str(c.get("kind") or ""))
+            u["max_sec"] = max(u["max_sec"], int(c.get("online_sec") or 0))
+            u["_cids"].append(str(c.get("clientid") or ""))
+        out = []
+        for cs, u in users.items():
+            sec = u["max_sec"]
             out.append({
-                **c,
-                "uptime_sec": uptime,
-                "connected_at_text": connected_at,
+                "callsign": cs, "conns": u["conns"],
+                "uids": ",".join(sorted(x for x in u["_uids"] if x)),
+                "ips": ",".join(sorted(x for x in u["_ips"] if x)),
+                "kinds": "/".join(sorted(x for x in u["_kinds"] if x)),
+                "online_text": "%d:%02d:%02d" % (sec // 3600, (sec % 3600) // 60, sec % 60),
+                "clientids": u["_cids"],
             })
-        _ = now
+        out.sort(key=lambda r: (-r["conns"], r["callsign"]))
         return out
 
     def emqx_status(self):

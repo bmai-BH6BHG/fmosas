@@ -356,9 +356,12 @@ class BasHttp(object):
                          "now": now_text()})
             return True
 
-        # ---- 在线 ----
+        # ---- 在线（实时：直查 EMQX + 按用户聚合）----
         if sub == "online" and method == "GET":
-            h.send_json({"ok": True, "clients": self.svc.online_clients()})
+            clients = self.svc.online_clients()
+            h.send_json({"ok": True, "clients": clients,
+                         "users": self.svc.online_users(clients),
+                         "fetched_at": now_text(), "source": "EMQX 实时列表"})
             return True
 
         # ---- 排行榜 ----

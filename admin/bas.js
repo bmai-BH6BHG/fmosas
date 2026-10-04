@@ -94,6 +94,19 @@
     });
     location.hash = name;
     load(name);
+    setOnlineTimer(name === 'online');   // 在线页 5 秒实时刷新，离开即停
+  }
+
+  /* 在线页实时刷新（原实现只在切页/点按钮时取一次，界面看着是"死的"） */
+  var onlineTimer = null;
+  function setOnlineTimer(on) {
+    if (onlineTimer) { clearInterval(onlineTimer); onlineTimer = null; }
+    if (!on) return;
+    onlineTimer = setInterval(function () {
+      if (current !== 'online') { setOnlineTimer(false); return; }
+      if ($('online-auto') && !$('online-auto').checked) return;
+      loadOnline();
+    }, 5000);
   }
 
   /* ---------------- 渲染工具 ---------------- */
@@ -187,21 +200,41 @@
   function loadOnline() {
     api('online').then(function (j) {
       var rows = j.clients || [];
-      $('online-count').textContent = '共 ' + rows.length + ' 个连接（60 秒刷新）';
+      var users = j.users || [];
+      // ① 用户视图：页面要的是"人"，不是"连接"（同呼号多设备要合并）
+      table($('t-online-users'), [
+        ['呼号', function (r) { return '<b>' + esc(r.callsign) + '</b>'; }],
+        ['类型', function (r) { return esc(r.kinds); }],
+        ['连接数', function (r) { return r.conns; }],
+        ['UID', function (r) { return esc(r.uids); }],
+        ['IP', function (r) { return esc(r.ips); }],
+        ['在线时长', function (r) { return esc(r.online_text); }],
+        ['操作', function (r) {
+          return '<button class="btn ghost" onclick="BAS.ban(\'' + esc(r.callsign) + '\')">拉黑</button>';
+        }]
+      ], users);
+      // ② 连接明细
       table($('t-online'), [
         ['呼号', function (r) { return esc(r.callsign || r.username || '-'); }],
+        ['类型', function (r) { return esc(r.kind || ''); }],
         ['UID', function (r) { return esc(r.uid || '-'); }],
         ['clientid', function (r) { return '<span class="mono">' + esc(r.clientid) + '</span>'; }],
         ['IP', function (r) { return esc(r.ip_address); }],
-        ['连接时间', function (r) { return esc(r.connected_at); }],
+        ['在线时长', function (r) { return esc(r.online_text || ''); }],
+        ['连接时间', function (r) { return esc(String(r.connected_at || '').replace('T', ' ').slice(0, 19)); }],
+        ['订阅', function (r) { return (r.subscriptions_cnt === undefined ? '-' : r.subscriptions_cnt); }],
         ['收/发消息', function (r) { return (r.recv_msg || 0) + ' / ' + (r.send_msg || 0); }],
         ['收/发字节', function (r) { return fmtBytes(r.recv_oct) + ' / ' + fmtBytes(r.send_oct); }],
-        ['保活', function (r) { return (r.keepalive || 0) + 's'; }],
         ['操作', function (r) {
           var who = esc(r.callsign || r.username || '');
           return who ? '<button class="btn ghost" onclick="BAS.ban(\'' + who + '\')">拉黑</button>' : '';
         }]
       ], rows);
+      $('online-count').textContent = '用户 ' + users.length + ' 人 · 连接 ' + rows.length + ' 个';
+      if ($('online-at')) {
+        $('online-at').textContent = '（' + (j.fetched_at || '').slice(11, 19)
+          + ' 取自已 ' + (j.source || 'EMQX') + '）';
+      }
     });
   }
 
@@ -612,6 +645,11 @@
                 + (j.error ? ('（读取有误: ' + j.error + '）') : ''));
           loadBl();
         });
+      });
+    }
+    if ($('online-auto')) {
+      $('online-auto').addEventListener('change', function () {
+        setOnlineTimer(current === 'online');
       });
     }
     var hash = (location.hash || '#status').slice(1);

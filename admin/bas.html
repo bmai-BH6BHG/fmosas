@@ -48,10 +48,14 @@
   <!-- 在线 -->
   <section id="tab-online" class="tab hidden">
     <div class="row">
-      <h3>在线客户端</h3>
+      <h3>在线用户</h3>
       <span class="muted" id="online-count"></span>
-      <button class="btn ghost" data-reload="online">刷新</button>
+      <span class="muted small" id="online-at"></span>
+      <button class="btn ghost" data-reload="online">立即刷新</button>
+      <label class="muted small"><input type="checkbox" id="online-auto" checked> 自动刷新(5s)</label>
     </div>
+    <div class="panel table-wrap"><table id="t-online-users"></table></div>
+    <h3 class="muted small">连接明细（同一呼号多设备会各占一行）</h3>
     <div class="panel table-wrap"><table id="t-online"></table></div>
   </section>
 
