@@ -70,28 +70,42 @@ class FakeCertTests(unittest.TestCase):
     def _types(self):
         return [(w, t) for (w, t, _r, _u) in self.emqx.bans]
 
-    # ---------------- 假证书 → 封 clientid，不碰呼号 ----------------
-    def test_fake_root_ca_bans_clientid_not_callsign(self):
+    # ---------------- 根 CA 不受信任：默认只留证（很可能是跨服合法证书）----------------
+    def test_untrusted_root_records_but_does_not_ban(self):
+        """
+        ★ 真实事故回归：本条曾把 12 个真实用户 clientid + 1 个整段公网 IP 封掉。
+        "根不受信任" ≠ 伪造 —— 可能只是本机还没信任那个跨服 CA。
+        """
         r = self.svc.record_auth_rejection(
             "BH6BHG", "evil-client-1", "203.0.113.9", "根 CA 不受信任（公钥=abc...）")
-        self.assertTrue(r["recorded"])
-        self.assertTrue(r["banned_clientid"])
-        self.assertIn(("evil-client-1", "clientid"), self._types())
-        self.assertNotIn(("BH6BHG", "username"), self._types(),
-                         "★ 绝不能按呼号封 —— 攻击者可拿别人呼号栽赃")
+        self.assertTrue(r["recorded"], "必须留证")
+        self.assertFalse(r["banned_clientid"], "默认不得封 clientid")
+        self.assertFalse(r["banned_peerhost"], "默认不得封 IP")
+        self.assertEqual([], self.emqx.bans)
+        self.assertIn("只留证", r["note"])
 
-    def test_bad_proof_bans_clientid(self):
+    def test_untrusted_root_bans_when_opted_in(self):
+        self.svc.policy.cfg["fake_cert_untrusted_root_verdict"] = "ban"
+        r = self.svc.record_auth_rejection("BH6BHG", "c-ur", "203.0.113.10",
+                                           "proof 签名验证失败")
+        self.assertTrue(r["banned_clientid"])
+        self.assertIn(("c-ur", "clientid"), self._types())
+
+    # ---------------- 真伪造（proof 验签失败）→ 封 clientid，不碰呼号 ----------------
+    def test_bad_proof_bans_clientid_not_callsign(self):
         r = self.svc.record_auth_rejection("BG5ESN", "c-2", "198.51.100.7",
                                            "proof 签名验证失败")
         self.assertTrue(r["banned_clientid"])
-        self.assertNotIn(("BG5ESN", "username"), self._types())
+        self.assertIn(("c-2", "clientid"), self._types())
+        self.assertNotIn(("BG5ESN", "username"), self._types(),
+                         "★ 绝不能按呼号封 —— 攻击者可拿别人呼号栽赃")
 
     def test_revoked_cert_bans_clientid(self):
         r = self.svc.record_auth_rejection("BG5ESN", "c-3", "198.51.100.8", "证书已被吊销")
         self.assertTrue(r["banned_clientid"])
 
     def test_audit_row_written(self):
-        self.svc.record_auth_rejection("BG5ESN", "c-4", "198.51.100.9", "根 CA 不受信任")
+        self.svc.record_auth_rejection("BG5ESN", "c-4", "198.51.100.9", "proof 签名验证失败")
         rows = self.db.query_audit_packets()
         self.assertTrue(rows)
         self.assertEqual("fake_cert", rows[0]["scene"])
@@ -125,44 +139,44 @@ class FakeCertTests(unittest.TestCase):
     def test_repeated_attempts_ban_peerhost(self):
         for i in range(3):
             r = self.svc.record_auth_rejection("BG5ESN", "c-%d" % i, "203.0.113.50",
-                                               "根 CA 不受信任")
+                                               "proof 签名验证失败")
         self.assertTrue(r["banned_peerhost"], "第 3 次应触发封 IP")
         self.assertIn(("203.0.113.50", "peerhost"), self._types())
 
     def test_peerhost_counter_resets_after_ban(self):
         for i in range(3):
             self.svc.record_auth_rejection("BG5ESN", "c-%d" % i, "203.0.113.51",
-                                           "根 CA 不受信任")
+                                           "proof 签名验证失败")
         n_before = len([1 for (w, t) in self._types() if t == "peerhost"])
-        self.svc.record_auth_rejection("BG5ESN", "c-x", "203.0.113.51", "根 CA 不受信任")
+        self.svc.record_auth_rejection("BG5ESN", "c-x", "203.0.113.51", "proof 签名验证失败")
         n_after = len([1 for (w, t) in self._types() if t == "peerhost"])
         self.assertEqual(n_before, n_after, "封完应重置计数，不要连续重复封")
 
     def test_old_attempts_outside_window_ignored(self):
         """窗口外的旧记录不应累积到阈值"""
         self.svc.policy.cfg["fake_cert_window_sec"] = 1
-        self.svc.record_auth_rejection("BG5ESN", "c-1", "203.0.113.60", "根 CA 不受信任")
-        self.svc.record_auth_rejection("BG5ESN", "c-2", "203.0.113.60", "根 CA 不受信任")
+        self.svc.record_auth_rejection("BG5ESN", "c-1", "203.0.113.60", "proof 签名验证失败")
+        self.svc.record_auth_rejection("BG5ESN", "c-2", "203.0.113.60", "proof 签名验证失败")
         time.sleep(1.2)
-        r = self.svc.record_auth_rejection("BG5ESN", "c-3", "203.0.113.60", "根 CA 不受信任")
+        r = self.svc.record_auth_rejection("BG5ESN", "c-3", "203.0.113.60", "proof 签名验证失败")
         self.assertFalse(r["banned_peerhost"], "窗口已过期，不应触发封 IP")
 
     # ---------------- 显式开启按呼号封（默认关）----------------
     def test_callsign_ban_only_when_explicitly_enabled(self):
         self.svc.policy.cfg["fake_cert_callsign_ban"] = True
-        self.svc.record_auth_rejection("BG5ESN", "c-6", "198.51.100.11", "根 CA 不受信任")
+        self.svc.record_auth_rejection("BG5ESN", "c-6", "198.51.100.11", "proof 签名验证失败")
         self.assertIn(("BG5ESN", "username"), self._types())
 
     def test_clientid_ban_can_be_disabled(self):
         self.svc.policy.cfg["fake_cert_ban_clientid"] = False
-        r = self.svc.record_auth_rejection("BG5ESN", "c-7", "198.51.100.12", "根 CA 不受信任")
+        r = self.svc.record_auth_rejection("BG5ESN", "c-7", "198.51.100.12", "proof 签名验证失败")
         self.assertTrue(r["recorded"])
         self.assertFalse(r["banned_clientid"])
         self.assertEqual([], self.emqx.bans)
 
     def test_ban_until_is_finite(self):
         """封禁必须有到期时间（不再 infinity）"""
-        self.svc.record_auth_rejection("BG5ESN", "c-8", "198.51.100.13", "根 CA 不受信任")
+        self.svc.record_auth_rejection("BG5ESN", "c-8", "198.51.100.13", "proof 签名验证失败")
         _w, _t, _r, until = self.emqx.bans[0]
         self.assertTrue(until)
         self.assertNotEqual("infinity", until)

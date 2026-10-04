@@ -397,6 +397,24 @@ class EmqxClient(object):
                 return True, None       # 不存在 = 已解封
             return False, str(e)
 
+    def unban_strict(self, who, as_type="username"):
+        """
+        像 unban 一样解封，但**明确区分"真的删掉了"与"本来就没有"**。
+        返回 (ok, existed, err)
+          ok      : 请求成功（含本来就是 404）
+          existed : True=确实删掉了一条封禁；False=该维度本来就没有
+        用途：解封时要把三个维度都试一遍，并如实告诉用户到底解掉了什么
+        （真实事故：按 clientid 封的，界面只按 username 解 → 显示成功、实际没解）
+        """
+        path = "/api/v5/banned/%s/%s" % (as_type, urllib.parse.quote(str(who), safe=""))
+        try:
+            self._json("DELETE", path, expect=(200, 204))
+            return True, True, None
+        except EmqxError as e:
+            if e.code == 404:
+                return True, False, None
+            return False, False, str(e)
+
     def kick_clients(self, clientids):
         """批量踢下线：body 是裸 JSON 字符串数组。返回 (ok, error)。"""
         if not clientids:

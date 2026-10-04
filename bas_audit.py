@@ -255,6 +255,19 @@ class AuditService(object):
             out["note"] = "非凭证类失败，仅记录不处置"
             return out
 
+        # 区分「真伪造」与「只是本机不信任该根」：
+        #   真伪造（proof 验签失败 / 证书已吊销）→ 封 clientid
+        #   根 CA 不受信任 → **默认只留证**（很可能是跨服/其它区域的合法证书，
+        #     本机只是还没信任那个根）。真实事故：本条曾把 12 个真实用户 clientid
+        #     和 1 个整段公网 IP 封掉，界面又解不掉 → 用户集体连不上。
+        untrusted_root = ("不受信任" in reason) or ("根 CA" in reason)
+        soft = untrusted_root and str(
+            self.policy.cfg.get("fake_cert_untrusted_root_verdict", "record")).lower() != "ban"
+        if soft:
+            out["note"] = ("根 CA 不受信任：只留证不封禁（可能是跨服合法证书，"
+                           "应核查并把该根加入信任链；确要封禁请设 "
+                           "fake_cert_untrusted_root_verdict=ban）")
+
         # 1) 留证
         try:
             self.db.write_audit_packet({
@@ -269,6 +282,11 @@ class AuditService(object):
             self._bump("fake_cert_attempts")
         except Exception as e:  # noqa: BLE001
             out["note"] = "留证失败: %s" % e
+
+        if soft:
+            # 只是本机不信任该根：留证即可，不做任何封禁（连 clientid/IP 都不封），
+            # 否则真实用户（可能只是证书来自其它区域 CA）会被整体挡在门外。
+            return out
 
         # 2) 封 clientid（精确打击，不涉呼号）
         if self.policy.cfg.get("fake_cert_ban_clientid", True) and cid:
@@ -849,21 +867,93 @@ class AuditService(object):
             self._bump("bans")
         return ok, err, kicked
 
-    def unban(self, who, operator="admin"):
-        ok, err = self.emqx.unban(who)
-        if ok:
-            self.db.add_blacklist_event("unban", who, "手动解封", None, operator, "username")
-        return ok, err
+    def unban(self, who, operator="admin", as_type=None):
+        """
+        解封。
+
+        ⚠️ 真实事故：反滥用按 **clientid**（甚至 peerhost）封禁，而解封只按
+        **username** 去删 → EMQX 返回 404，旧代码把 404 当成功 → 界面显示"已解封"
+        但封禁还在，用户怎么也连不回来。
+
+        因此：未指定 as_type 时，**依次尝试 username / clientid / peerhost 三个维度**，
+        并如实返回到底解掉了哪一个。
+        返回 (ok, err, detail)  —— detail: "已解封: clientid" / "本来就没有封禁"
+        """
+        who = str(who or "").strip()
+        if not who:
+            return False, "缺少解封对象", ""
+        types = [as_type] if as_type else ["username", "clientid", "peerhost"]
+        removed = []
+        errors = []
+        for t in types:
+            try:
+                ok, existed, err = self.emqx.unban_strict(who, t)
+            except Exception as e:  # noqa: BLE001
+                ok, existed, err = False, False, str(e)
+            if not ok and err:
+                errors.append("%s: %s" % (t, err))
+            if existed:
+                removed.append(t)
+                try:
+                    self.db.add_blacklist_event("unban", who, "手动解封", None, operator, t)
+                except Exception:  # noqa: BLE001
+                    pass
+        if removed:
+            return True, None, "已解封: %s" % "/".join(removed)
+        if errors:
+            return False, "; ".join(errors), ""
+        return True, None, "本来就没有封禁（%s）" % who
+
+    def unban_all(self, operator="admin"):
+        """一键清空 EMQX 封禁名单（按每条自己的维度删）。返回 (ok, err, detail)"""
+        try:
+            rows = self.emqx.list_banned(limit=10000) or []
+        except Exception as e:  # noqa: BLE001
+            return False, "读取封禁名单失败: %s" % e, ""
+        n_ok = 0
+        errors = []
+        for b in rows:
+            a = str(b.get("as") or "username")
+            who = str(b.get("who") or "")
+            if not who:
+                continue
+            try:
+                ok, existed, err = self.emqx.unban_strict(who, a)
+                if ok and existed:
+                    n_ok += 1
+                    try:
+                        self.db.add_blacklist_event("unban", who, "批量清空封禁", None, operator, a)
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif err:
+                    errors.append("%s/%s: %s" % (a, who, err))
+            except Exception as e:  # noqa: BLE001
+                errors.append("%s/%s: %s" % (a, who, e))
+        detail = "已解封 %d 条" % n_ok
+        if errors:
+            detail += "（%d 条失败）" % len(errors)
+            return False, "; ".join(errors[:5]), detail
+        return True, None, detail
 
     def release_quarantine(self, qid, by="admin"):
-        """一键放行：标记为误判并解封（若此前已被封）。"""
+        """
+        一键放行：标记为误判并解封（若此前已被封）。
+        同时尝试解封 **呼号** 与 **该记录的 clientid** ——
+        反滥用可能按 clientid 封，只解呼号会留下封禁（真实事故）。
+        """
         rows = [r for r in self.db.list_quarantine(None, 500) if r["id"] == int(qid)]
         if not rows:
             return False, "待审记录不存在"
         row = rows[0]
         cs = (row.get("conn_callsign") or "").strip()
-        if cs:
-            self.unban(cs, by)
+        cid = (row.get("clientid") or "").strip()
+        try:
+            if cs:
+                self.unban(cs, by)
+            if cid:
+                self.unban(cid, by)
+        except Exception:  # noqa: BLE001
+            pass
         self.db.resolve_quarantine(qid, "released", by)
         return True, None
 

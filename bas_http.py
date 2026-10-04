@@ -388,8 +388,13 @@ class BasHttp(object):
         if sub == "banned/unban" and method == "POST":
             body = body or {}
             who = str(body.get("who") or "").strip()
-            ok, err = self.svc.unban(who, "admin")
-            h.send_json({"ok": ok, "error": err})
+            as_type = str(body.get("as_type") or "").strip() or None
+            ok, err, detail = self.svc.unban(who, "admin", as_type)
+            h.send_json({"ok": ok, "error": err, "detail": detail})
+            return True
+        if sub == "banned/unban-all" and method == "POST":
+            ok, err, detail = self.svc.unban_all("admin")
+            h.send_json({"ok": ok, "error": err, "detail": detail})
             return True
 
         # ---- 兼容：审计库里记的黑名单 ----
@@ -415,8 +420,10 @@ class BasHttp(object):
         if sub == "blacklist/unban" and method == "POST":
             body = body or {}
             who = str(body.get("who") or "").strip().upper()
-            ok, err = self.svc.unban(who, "admin")
-            h.send_json({"ok": ok, "error": err})
+            # 注意：**不传 as_type** → 会依次尝试 username/clientid/peerhost 三个维度
+            # （真实事故：反滥用按 clientid 封，界面只按 username 解 → 解不掉）
+            ok, err, detail = self.svc.unban(who, "admin")
+            h.send_json({"ok": ok, "error": err, "detail": detail})
             return True
 
         # ---- 待审救援 ----

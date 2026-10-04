@@ -99,11 +99,18 @@ DEFAULT_POLICY = {
     #         ① 发起连接的 clientid（精确到那个客户端）
     #         ② 反复尝试的 peerhost（IP），到阈值才封，且短时
     #       呼号只用于**留证**，用于事后人工处理。
-    "fake_cert_ban_clientid": True,     # 假证书 → 封该 clientid
+    "fake_cert_ban_clientid": True,     # 验签失败的真伪造 → 封该 clientid
     "fake_cert_callsign_ban": False,    # 是否按呼号封（默认关，防栽赃；慎开）
     "fake_cert_ip_ban_after": 10,       # 同一 IP 在窗口内失败多少次后封 IP
     "fake_cert_window_sec": 300,        # 统计窗口（秒）
     "fake_cert_ip_ban_hours": 1,        # 封 IP 时长（小时，短时可自愈）
+    # 「根 CA 不受信任」的处置：record（默认，只留证）/ ban。
+    # ⚠️ 强烈建议保持 record：**根不受信任 ≠ 伪造** —— 很可能是
+    #    跨服务器/其它区域 CA 签发的合法证书，本机只是还没信任那个根。
+    #    真实事故：本条把 12 个真实用户 clientid + 1 个整段公网 IP 封掉，
+    #    界面又解不掉（解封只按 username），用户集体连不上。
+    #    正确做法：留证 → 管理员把该根加入信任链（或核查是否真伪造）。
+    "fake_cert_untrusted_root_verdict": "record",
     # 拉黑白名单（永不自动封）：管理员/骨干台呼号
     "ban_whitelist": [],
     # 同一呼号在窗口内最多自动封几次（防刷）

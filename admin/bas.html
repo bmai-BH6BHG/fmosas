@@ -107,8 +107,17 @@
 
   <!-- 黑名单 -->
   <section id="tab-blacklist" class="tab hidden">
+    <h3>EMQX 实际封禁名单（权威）</h3>
     <div class="row">
-      <h3>黑名单</h3>
+      <button class="btn ghost" id="bn-refresh">刷新</button>
+      <button class="btn danger" id="bn-unban-all">一键全部解封</button>
+      <span class="muted small">按 <b>as</b> 维度解封：username / clientid / peerhost。
+        审计按 clientid 或 IP 封的，只按呼号解是解不掉的。</span>
+    </div>
+    <div class="panel table-wrap"><table id="t-bn"></table></div>
+
+    <div class="row">
+      <h3>审计库黑名单记录</h3>
       <input id="bl-who" placeholder="呼号" class="narrow">
       <input id="bl-reason" placeholder="原因（留痕）">
       <input id="bl-hours" placeholder="时长(小时，空=永久)" class="narrow">

@@ -285,6 +285,24 @@
   }
 
   function loadBl() {
+    // ---- EMQX 实际封禁名单（权威）：按 as 维度解封 ----
+    api('banned').then(function (j) {
+      var rows = j.rows || [];
+      table($('t-bn'), [
+        ['维度', function (r) { return '<span class="tag WARN">' + esc(r.as) + '</span>'; }],
+        ['对象', function (r) { return esc(r.who); }],
+        ['到期', function (r) {
+          return esc(r.is_forever ? '永久' : r.until);
+        }],
+        ['原因', function (r) { return esc(r.reason); }],
+        ['操作', function (r) {
+          return '<button class="btn ghost" onclick="BAS.unbanEx(\'' + esc(r.as) + '\',\'' +
+            esc(r.who) + '\')">解封</button>';
+        }]
+      ], rows);
+      if (j.error) { $('bn-sum') && ($('bn-sum').textContent = '读取失败: ' + j.error); }
+    });
+
     api('blacklist').then(function (j) {
       table($('t-bl'), [
         ['呼号', function (r) { return esc(r.who); }],
@@ -511,7 +529,18 @@
         .then(function () { load(current); });
     },
     unban: function (who) {
-      api('blacklist/unban', { method: 'POST', body: { who: who } }).then(function () { loadBl(); });
+      api('blacklist/unban', { method: 'POST', body: { who: who } }).then(function (j) {
+        alert(j.ok ? ('解封结果: ' + (j.detail || '成功')) : ('失败: ' + j.error));
+        loadBl();
+      });
+    },
+    // 按 EMQX 的实际维度解封（username / clientid / peerhost）
+    unbanEx: function (asType, who) {
+      api('banned/unban', { method: 'POST', body: { who: who, as_type: asType } })
+        .then(function (j) {
+          alert(j.ok ? ('解封结果: ' + (j.detail || '成功')) : ('失败: ' + j.error));
+          loadBl();
+        });
     },
     release: function (id) {
       api('quarantine/release', { method: 'POST', body: { id: id } })
@@ -537,6 +566,26 @@
     buildNav();
     $('lb-since').value = dtLocal(-24 * 60);
     $('lb-until').value = dtLocal(0);
+    // 一键全部解封（清空 EMQX 封禁名单）
+    if ($('bn-unban-all')) {
+      $('bn-unban-all').addEventListener('click', function () {
+        if (!confirm('确定清空 EMQX 全部封禁？')) return;
+        api('banned/unban-all', { method: 'POST', body: {} }).then(function (j) {
+          alert(j.ok ? (j.detail || '已清空') : ('部分失败: ' + j.error + ' / ' + (j.detail || '')));
+          loadBl();
+        });
+      });
+    }
+    if ($('bn-refresh')) {
+      $('bn-refresh').addEventListener('click', function () {
+        api('banned').then(function (j) {
+          var rows = j.rows || [];
+          alert('EMQX 当前封禁 ' + rows.length + ' 条'
+                + (j.error ? ('（读取有误: ' + j.error + '）') : ''));
+          loadBl();
+        });
+      });
+    }
     var hash = (location.hash || '#status').slice(1);
     switchTab(TABS.some(function (t) { return t[0] === hash; }) ? hash : 'status');
   }
