@@ -132,8 +132,15 @@ class AuditService(object):
                     p[k] = int(v)
                 except ValueError:
                     pass
-            elif k == "ban_whitelist":
-                p[k] = [x.strip().upper() for x in str(v).split(",") if x.strip()]
+            elif isinstance(default, list):
+                # 列表型策略项统一按逗号分隔解析。
+                # ⚠️ 以前只对 ban_whitelist 特殊处理，其它列表项（app_exempt_prefixes、
+                # client_signature_exempt_*、audit_ignore_* 等）从界面/DB 设置后会变成
+                # **字符串**，被代码逐字符迭代 → 名单实际失效。
+                items = [x.strip() for x in str(v).split(",") if x.strip()]
+                if k == "ban_whitelist":
+                    items = [x.upper() for x in items]
+                p[k] = items
             elif k == "ban_hours":
                 p[k] = None if str(v) in ("", "none", "0") else int(float(v))
             else:
@@ -362,6 +369,22 @@ class AuditService(object):
         self._bump("ingest_ok")
         return 200, {"ok": True}
 
+    def _audit_ignored(self, clientid, username):
+        """
+        该连接是否豁免"逐包身份审计"。
+
+        典型用途：**回响节点（ECHO）**——它把别人的报文原样发回去，
+        包内呼号必然 ≠ 连接身份，不豁免就会被判"盗用呼号"并封掉回响节点自己。
+        """
+        cfg = self.policy.cfg
+        names = [str(x).strip().upper() for x in (cfg.get("audit_ignore_usernames") or [])]
+        if username and str(username).strip().upper() in names:
+            return True
+        for p in (cfg.get("audit_ignore_clientid_prefixes") or []):
+            if p and str(clientid or "").startswith(str(p)):
+                return True
+        return False
+
     def _handle_ingest(self, root):
         self._bump("ingest_total")
         topic = root.get("topic")
@@ -369,6 +392,10 @@ class AuditService(object):
         username = root.get("username")
         if username == "undefined":       # EMQX 的 Erlang undefined atom
             username = None
+        # 审计豁免（回响节点等）：直接跳过，避免把回声判成伪造
+        if self._audit_ignored(clientid, username):
+            self._bump("audit_ignored")
+            return
 
         # client_attrs：顶层对象；callsign 非空时优先于 username
         attrs = root.get("client_attrs")

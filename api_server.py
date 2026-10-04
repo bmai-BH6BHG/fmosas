@@ -1899,7 +1899,13 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         clientid = str(body.get('clientid') or '')
         peerhost = str(body.get('peerhost') or '')
         if not username or not password:
-            self.send_json({'result': 'deny', 'reason': '缺少 username 或 password'})
+            # ⚠️ 重要：EMQX 的**授权源(authz)**也配置成打这个端点，但它的请求体
+            # 只有 {"username": "..."}（没有 password）。那种请求不是认证请求：
+            # 必须回 "ignore"，让 EMQX 继续用后面的授权源（文件 ACL）判定。
+            # 若在这里回 "deny"，会把**所有已认证客户端**的 publish/subscribe 全部拒掉
+            # —— 真实事故：修好认证后全站订阅被拒（监控收不到语音、APP 互相听不到）。
+            self.send_json({'result': 'ignore',
+                            'reason': '缺少 password：按授权探测处理，交由后续授权源'})
             return
         if ca_mgr is None:
             self.send_json({'result': 'deny', 'reason': 'CA 管理器未初始化'})

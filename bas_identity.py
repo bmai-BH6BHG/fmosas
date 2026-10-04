@@ -77,8 +77,16 @@ DEFAULT_POLICY = {
     # 不满足 → 按 app_only_verdict 处置（off/warn/ban）。
     "app_only_verdict": "ban",
     "app_clientid_prefixes": ["FMO-"],
-    # 内部客户端前缀：监控/网页面板等，不受"只许本 APP"限制
-    "app_exempt_prefixes": ["FMO-MONITOR", "fmo-web-", "fmo-web"],
+    # 内部客户端前缀：监控/网页面板/回响节点等，不受"只许本 APP"限制
+    "app_exempt_prefixes": ["FMO-MONITOR", "fmo-web-", "fmo-web", "FMO-ECHO"],
+    # ---------------- 审计豁免（这些身份发布的报文不参与逐包身份审计）----------------
+    # 通用机制：内部发布者（例如把别人的报文原样转发的桥接/回响类节点）可以把身份
+    # 登记在这里。这类节点重发的报文包内呼号必然 ≠ 连接身份，不豁免会被判「盗用呼号」。
+    # 默认**空**（不豁免任何人）；需要时由部署方在策略里显式指定，例如
+    #   audit_ignore_usernames = ECHO
+    #   audit_ignore_clientid_prefixes = FMO-ECHO
+    "audit_ignore_usernames": [],
+    "audit_ignore_clientid_prefixes": [],
     # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP
     "app_require_attrs": True,
     # 是否强制要求「APP 密钥签名」验证通过（client_attrs.app_verified == "1"）。
