@@ -178,6 +178,26 @@ class AuditService(object):
             return True     # 未注入时不阻断（保持上游语义）
         return bool(self.sas_has_any())
 
+    def _ban_allowed(self):
+        """
+        ★ 全局封禁闸门：**所有**封禁路径都必须先过这里。
+
+        真实事故（三次同类）：各条规则自己调 _ban_any / ban_recorder，绕过了
+        mode 与 auto_ban，导致"我明明设了 warn/关掉自动封禁，它还在封人"。
+        现在统一收口：
+          mode 必须是 ban、auto_ban 必须开、且未触发限流，才允许封禁。
+        """
+        try:
+            if self.policy.mode() != "ban":
+                return False
+            if not self.policy.cfg.get("auto_ban", False):
+                return False
+            if not self.policy._ban_rate_ok():
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
     def _ban_recorder(self, callsign, reason, hours):
         # 注意：EMQX 的 until 必须是 RFC3339 带时区（实测 5.8.9 只认这个或 "infinity"），
         # 由 bas_emqx.rfc3339 统一格式化；这里直接传"小时数"。
@@ -248,6 +268,12 @@ class AuditService(object):
         ip = (peerhost or "").strip()
         reason = reason or "认证失败"
 
+        # 豁免身份（含本系统自己的预检探针 bas-probe-* / BAS_PREFLIGHT）：
+        # 它们本来就会故意用错凭据去验证认证是否生效，绝不能被当攻击留证或封禁
+        if self._audit_ignored(cid, cs):
+            out["note"] = "该身份在审计豁免名单中（内部探针/桥接节点），跳过处置"
+            return out
+
         # 情形分类：只有"凭证类"失败才算攻击（空请求/服务器自身错误不算）
         # 注意：实测 EMQX/SAS 的拒绝原因五花八门（如 "Int CA 验证异常: 'sn'"、
         #      "根 CA 不受信任（公钥=...）"、"proof 签名验证失败"、"证书已被吊销"），
@@ -293,6 +319,13 @@ class AuditService(object):
         if soft:
             # 只是本机不信任该根：留证即可，不做任何封禁（连 clientid/IP 都不封），
             # 否则真实用户（可能只是证书来自其它区域 CA）会被整体挡在门外。
+            return out
+
+        # ★ 统一闸门：mode 必须是 ban、auto_ban 必须开、且未触发限流，才允许封禁。
+        #   （真实事故：这里原先直接封，导致 warn 模式/关掉自动封禁后仍在封人；
+        #    我自己的预检探针都曾被这条路径封掉 clientid）
+        if not self._ban_allowed():
+            out["note"] = (out.get("note") or "") + " | 当前未开启自动封禁（mode/auto_ban/限流），仅留证不封禁"
             return out
 
         # 2) 封 clientid（精确打击，不涉呼号）
@@ -635,28 +668,34 @@ class AuditService(object):
             if n < rounds_need:
                 continue
             self._app_track[cid] = 0
-            who = (c.get("username") or (c.get("client_attrs") or {}).get("callsign")
-                   or cid)
+            who_cs = str(c.get("username")
+                         or (c.get("client_attrs") or {}).get("callsign") or "")
             reason = "非本 APP 客户端（%s）；按策略处置" % why
             self.db.write_audit_packet({
                 "ts": now_text(True), "topic": "", "clientid": cid,
-                "conn_callsign": str(who), "conn_uid": str(
+                "conn_callsign": who_cs or cid, "conn_uid": str(
                     (c.get("client_attrs") or {}).get("uid") or ""),
                 "verdict": KICK if verdict_cfg == "ban" else WARN,
                 "scene": "non_app_client", "reason": reason,
                 "confidence": 0.8, "source": "collector",
             })
-            if verdict_cfg == "ban" and not self.policy.in_whitelist(who):
+            # ★★ 处置守卫（真实事故：这里曾绕过全部守卫、并按自称呼号封人，
+            #    结果合法固件 BH6FWE 与用户自己的 APP BH6BHG 全被按呼号封掉）：
+            #   1) 只用 **clientid** 封 —— 自称呼号可以随便填，按它封就是栽赃
+            #   2) 必须过全局闸门 _ban_allowed()（mode=ban + auto_ban + 未限流）
+            #   3) 否则只写入待审（quarantine），不做任何封禁
+            may_ban = (verdict_cfg == "ban" and self._ban_allowed()
+                       and not (who_cs and self.policy.in_whitelist(who_cs)))
+            if may_ban:
                 try:
-                    kicked = self.policy.ban_recorder(
-                        who, reason, self.policy.cfg.get("ban_hours"))
-                    if kicked:
+                    if self._ban_any(cid, reason, self.policy.cfg.get("ban_hours"),
+                                     as_type="clientid"):
                         self._bump("banned")
                 except Exception as e:  # noqa: BLE001
                     self._last_collect_error = "app_only ban: %s" % e
             else:
                 self.db.add_quarantine({
-                    "created_at": now_text(True), "conn_callsign": str(who),
+                    "created_at": now_text(True), "conn_callsign": str(who_cs or cid),
                     "scene": "non_app_client", "reason": reason,
                     "confidence": 0.8,
                 })

@@ -30,7 +30,10 @@
   <nav id="nav"></nav>
   <div class="top-right">
     <span id="policy-badge" class="badge" title="身份控制策略模式">—</span>
-    <button class="btn ghost" id="btn-logout">退出</button>
+    <!-- 已取消后台账号登录：不再显示登录/退出按钮。
+         如需恢复登录：把 bas_http.py 的 BAS_ADMIN_LOGIN_REQUIRED 改回 True，
+         并把下面这段 login 遮罩与退出按钮恢复显示即可（结构都保留着）。 -->
+    <button class="btn ghost hidden" id="btn-logout">退出</button>
   </div>
 </header>
 
@@ -122,8 +125,10 @@
       <input id="bl-reason" placeholder="原因（留痕）">
       <input id="bl-hours" placeholder="时长(小时，空=永久)" class="narrow">
       <button class="btn danger" id="bl-ban">拉黑并踢下线</button>
+      <button class="btn ghost" id="bl-sync" title="把「EMQX 里已不存在」的记录标记为已解封，让记录与线上状态一致">清理失效记录</button>
       <button class="btn ghost" data-reload="blacklist">刷新</button>
     </div>
+    <p class="muted small" id="bl-sum"></p>
     <div class="panel table-wrap"><table id="t-bl"></table></div>
     <h3>操作留痕</h3>
     <div class="panel table-wrap"><table id="t-blh"></table></div>

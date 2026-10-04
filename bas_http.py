@@ -55,6 +55,11 @@ SESSION_TTL = 24 * 3600
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCK_SEC = 300
 
+# ★ 后台账号登录开关。
+#   已按要求**取消** BAS 认证审计后台的账号登录：管理口（35929）本身是内网/管理口，
+#   直接放行即可。置为 True 可恢复原来的登录/会话校验（代码与前端界面都还在）。
+BAS_ADMIN_LOGIN_REQUIRED = False
+
 # 审计设置里允许前端写入的键（其余忽略）
 WRITABLE_SETTINGS = {"emqx_url", "emqx_api_key", "emqx_api_secret", "topic_name",
                      "topic_enabled", "identity_control", "trust_proxy"}
@@ -280,8 +285,13 @@ class BasHttp(object):
             h.send_json(resp, code)
             return True
 
-        # ---- 登录/初始化（无需会话）----
+        # ---- 登录/初始化 ----
+        # 已取消登录：不再需要账号密码。这些端点保留为兼容空实现。
         if path == "/api/bas/session" and method == "POST":
+            if not BAS_ADMIN_LOGIN_REQUIRED:
+                h.send_json({"ok": True, "token": "", "ttl": 0,
+                             "login_disabled": True})
+                return True
             body = body or {}
             ip = h.client_address[0] if getattr(h, "client_address", None) else ""
             token, err = self.auth.login(body.get("username", ""), body.get("password", ""), ip)
@@ -291,13 +301,18 @@ class BasHttp(object):
                 h.send_json({"ok": True, "token": token, "ttl": SESSION_TTL})
             return True
         if path == "/api/bas/setup-admin" and method == "POST":
+            if not BAS_ADMIN_LOGIN_REQUIRED:
+                h.send_json({"ok": True, "login_disabled": True})
+                return True
             body = body or {}
             ok, err = self.auth.setup_admin(body.get("username", ""), body.get("password", ""))
             h.send_json({"ok": ok, "error": err} if not ok else {"ok": True},
                         200 if ok else 400)
             return True
         if path == "/api/bas/bootstrap" and method == "GET":
-            h.send_json({"ok": True, "need_setup": not self.db.has_admin()})
+            h.send_json({"ok": True, "need_setup": False if not BAS_ADMIN_LOGIN_REQUIRED
+                         else (not self.db.has_admin()),
+                         "login_disabled": not BAS_ADMIN_LOGIN_REQUIRED})
             return True
 
         # ---- 静态资源 ----
@@ -314,7 +329,10 @@ class BasHttp(object):
         if not path.startswith("/api/bas/"):
             return False
 
-        # ---- 以下全部需要会话 ----
+        # ---- 会话校验 ----
+        # ★ 已按要求**取消后台账号登录**：管理口（35929）本身就是内网/管理口，
+        #   不再要求登录，直接放行。原会话逻辑保留（BAS_ADMIN_LOGIN_REQUIRED=False
+        #   时可随时恢复），但默认不再拦截，避免"未登录或会话已过期"。
         token = h.headers.get("X-BAS-Token") if hasattr(h, "headers") else None
         if not token:
             cookie = h.headers.get("Cookie") if hasattr(h, "headers") else None
@@ -324,7 +342,7 @@ class BasHttp(object):
                     if k == "bas_token":
                         token = v
                         break
-        if not self.auth.check(token):
+        if BAS_ADMIN_LOGIN_REQUIRED and not self.auth.check(token):
             h.send_json({"ok": False, "error": "未登录或会话已过期", "need_login": True}, 401)
             return True
 
@@ -397,9 +415,58 @@ class BasHttp(object):
             h.send_json({"ok": ok, "error": err, "detail": detail})
             return True
 
-        # ---- 兼容：审计库里记的黑名单 ----
+        # ---- 审计库里记的黑名单（历史流水）+ 与 EMQX 实时状态核对 ----
         if sub == "blacklist" and method == "GET":
-            h.send_json({"ok": True, "active": self.db.active_blacklist()})
+            rows = self.db.active_blacklist()
+            # ★ 权威是 EMQX 的实际封禁名单：本表只是流水。
+            #   在 EMQX 侧直接解封、或封禁自然到期时，本表不会自动产生 unban 行，
+            #   于是界面会一直显示"拉黑中"（真实故障）。这里按 EMQX 实时名单核对：
+            #     仍在 EMQX 里 → active（生效中）
+            #     已不在 EMQX   → stale（已失效，可一键清理）
+            live = None
+            try:
+                live = self.svc.emqx.list_banned(limit=5000) or []
+            except Exception as e:  # noqa: BLE001
+                live = None
+                err_note = str(e)
+            else:
+                err_note = None
+            if live is None:
+                h.send_json({"ok": True, "active": rows, "stale": [],
+                             "note": "读取 EMQX 封禁名单失败，以下为审计流水（可能已失效）: %s"
+                                     % err_note})
+                return True
+            live_set = set()
+            for b in live:
+                live_set.add((str(b.get("as") or ""), str(b.get("who") or "")))
+            active, stale = [], []
+            for r in rows:
+                key = (str(r.get("as_type") or "username"), str(r.get("who") or ""))
+                (active if key in live_set else stale).append(r)
+            h.send_json({"ok": True, "active": active, "stale": stale,
+                         "live_count": len(live_set)})
+            return True
+        # 一键同步：把"EMQX 里已不存在"的流水写成 unban，让本表与线上状态一致
+        if sub == "blacklist/sync" and method == "POST":
+            rows = self.db.active_blacklist()
+            try:
+                live = self.svc.emqx.list_banned(limit=5000) or []
+                live_set = set((str(b.get("as") or ""), str(b.get("who") or ""))
+                               for b in live)
+                n = 0
+                for r in rows:
+                    key = (str(r.get("as_type") or "username"), str(r.get("who") or ""))
+                    if key not in live_set:
+                        self.db.add_blacklist_event(
+                            "unban", str(r.get("who") or ""),
+                            "同步：EMQX 中已无此封禁（手动解封或已到期）",
+                            None, "admin", str(r.get("as_type") or "username"))
+                        n += 1
+                self.svc.bump("blacklist_synced") if hasattr(self.svc, "bump") else None
+                h.send_json({"ok": True, "cleaned": n,
+                             "detail": "已把 %d 条失效记录标记为已解封" % n})
+            except Exception as e:  # noqa: BLE001
+                h.send_json({"ok": False, "error": str(e)}, 500)
             return True
         if sub == "blacklist/history" and method == "GET":
             h.send_json({"ok": True, "rows": self.db.blacklist_history(

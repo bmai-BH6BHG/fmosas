@@ -576,14 +576,21 @@ class AuditDB(object):
 
     def active_blacklist(self, now=None):
         """
-        当前生效名单：对每个 who 取最新一条流水，若最新是 ban 且未过期 → 生效。
-        （上游语义：查询时推导，过期自动视为解封）
+        当前生效名单：对每个 (who, as_type) 取最新一条流水，若最新是 ban 且未过期 → 生效。
+
+        ⚠️ 两个必须注意的点：
+          1) 必须按 **(who, as_type)** 分组。只按 who 分组时，同一个 who 在别的维度
+             解封后仍会被旧的 ban 行遮住（真实故障：界面一直显示"拉黑中"）。
+          2) 本表是**历史流水**，不是权威状态。权威是 EMQX 的实际封禁名单；
+             在 EMQX 侧直接解封（或封禁到期）时这里不会自动出现 unban 行。
+             调用方应拿 EMQX 的实时名单做核对/清理，见 bas_http 的 sync。
         """
         now = now or now_text()
         sql = """
         SELECT who, as_type, reason, until, operator, created_at FROM (
             SELECT who, as_type, reason, until, operator, created_at,
-                   ROW_NUMBER() OVER (PARTITION BY who ORDER BY created_at DESC, id DESC) AS rn,
+                   ROW_NUMBER() OVER (PARTITION BY who, as_type
+                                      ORDER BY created_at DESC, id DESC) AS rn,
                    action
             FROM blacklist_audit
         ) WHERE rn=1 AND action='ban' AND (until IS NULL OR until='infinity' OR until > ?)

@@ -66,7 +66,8 @@ class ClassifyTests(unittest.TestCase):
             self.assertTrue(exempt, cid)
 
     def test_app_only_verdict_values(self):
-        self.assertEqual("ban", self.p.app_only_verdict())
+        """默认必须是 warn（只留证）：证据太弱，默认封禁会误伤固件与自家 APP"""
+        self.assertEqual("warn", self.p.app_only_verdict())
         self.p.cfg["app_only_verdict"] = "off"
         self.assertEqual("off", self.p.app_only_verdict())
         self.p.cfg["app_only_verdict"] = "garbage"
@@ -80,11 +81,15 @@ class EnforceTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="bas-apponly-")
         self.db = AuditDB(self.tmp + "/a.db")
         self.svc = AuditService(self.db, config={"admin_port": 35929})
-        self.bans = []
-        self.svc.policy.ban_recorder = lambda cs, r, h: (self.bans.append((cs, h)), True)[1]
+        self.bans = []          # [(who, as_type, hours)]
+        # 新的实现走 _ban_any（只用 clientid），桩住它来观察"到底按什么维度封"
+        self.svc._ban_any = lambda who, reason, hours, as_type="username": (
+            self.bans.append((who, as_type, hours)), True)[1]
         self.svc.policy.cfg["app_only_verdict"] = "ban"
         self.svc.policy.cfg["app_confirm_rounds"] = 2
         self.svc.policy.cfg["ban_hours"] = 24
+        self.svc.policy.cfg["mode"] = "ban"
+        self.svc.policy.cfg["auto_ban"] = True
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -100,21 +105,53 @@ class EnforceTests(unittest.TestCase):
         self._run(clients, rounds=5)
         self.assertEqual([], self.bans, "APP 多设备被误封: %s" % self.bans)
 
-    def test_non_app_client_banned_after_confirm_rounds(self):
-        """非本 APP 的连接：连续 2 轮确认后封禁"""
+    def test_default_verdict_is_record_only(self):
+        """★ 默认（warn）：只留证 + 待审，不封任何人"""
+        self.svc.policy.cfg["app_only_verdict"] = "warn"
+        self._run([anon_client("hacker-1234", "BADUSER")], rounds=3)
+        self.assertEqual([], self.bans, "默认档位绝不能封禁")
+
+    def test_non_app_client_banned_by_clientid_not_callsign(self):
+        """★ 回归：封禁只能按 **clientid**，绝不能按"自称的呼号"
+
+        真实事故：这条规则曾按 username 封 → 合法固件 BH6FWE 与用户自己的 APP
+        BH6BHG 全被按呼号封掉（客户端的呼号是自己填的，按它封 = 栽赃）。
+        """
         clients = [anon_client("hacker-1234", "BADUSER")]
         self._run(clients, rounds=1)
         self.assertEqual([], self.bans, "第 1 轮不应立即封（防抖）")
         self._run(clients, rounds=1)
         self.assertEqual(1, len(self.bans), "第 2 轮应封: %s" % self.bans)
-        self.assertEqual("BADUSER", self.bans[0][0])
-        self.assertEqual(24, self.bans[0][1], "封禁必须有期限（不再是 infinity）")
+        who, as_type, hours = self.bans[0]
+        self.assertEqual("hacker-1234", who, "必须按 clientid 封")
+        self.assertEqual("clientid", as_type, "封禁维度必须是 clientid")
+        self.assertEqual(24, hours, "封禁必须有期限（不是 infinity）")
+        self.assertNotIn("BADUSER", [b[0] for b in self.bans],
+                         "★ 绝不能按自称呼号封")
 
-    def test_spoofed_fmo_clientid_is_banned(self):
-        """伪造成 FMO- 形态但没有证书身份 → 封"""
+    def test_spoofed_fmo_clientid_is_banned_by_clientid(self):
+        """伪造成 FMO- 形态但没有证书身份 → 封 clientid（不碰呼号）"""
         clients = [anon_client("FMO-BH6BHG-1075-EVIL", "BH6BHG")]
         self._run(clients, rounds=2)
-        self.assertEqual(["BH6BHG"], [b[0] for b in self.bans])
+        self.assertEqual(["FMO-BH6BHG-1075-EVIL"], [b[0] for b in self.bans])
+        self.assertNotIn("BH6BHG", [b[0] for b in self.bans])
+
+    def test_ban_requires_auto_ban_on(self):
+        """★ 回归：auto_ban 关着时必须只留证 —— 本次事故正是这条守卫被绕过"""
+        self.svc.policy.cfg["auto_ban"] = False
+        self._run([anon_client("hacker-1234", "BADUSER")], rounds=3)
+        self.assertEqual([], self.bans, "auto_ban 关闭时不得封禁")
+
+    def test_ban_requires_ban_mode(self):
+        """★ 回归：mode=warn 时必须只留证"""
+        self.svc.policy.cfg["mode"] = "warn"
+        self._run([anon_client("hacker-1234", "BADUSER")], rounds=3)
+        self.assertEqual([], self.bans, "warn 模式不得封禁")
+
+    def test_whitelisted_callsign_not_banned(self):
+        self.svc.policy.cfg["ban_whitelist"] = ["BADUSER"]
+        self._run([anon_client("hacker-1234", "BADUSER")], rounds=3)
+        self.assertEqual([], self.bans, "白名单呼号不得被封")
 
     def test_exempt_internal_clients_not_banned(self):
         clients = [anon_client("fmo-web-ptt-pwza"), anon_client("FMO-MONITOR-sub-1")]

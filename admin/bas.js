@@ -304,16 +304,36 @@
     });
 
     api('blacklist').then(function (j) {
+      // ★ active = 与 EMQX 实时名单核对后**确实还在生效**的；
+      //   stale  = 审计流水里还记着、但 EMQX 里已经没有了（手动解封或已到期）
+      var stale = j.stale || [];
+      var rows = (j.active || []).concat(stale.map(function (r) {
+        var c = {}; for (var k in r) c[k] = r[k];
+        c._stale = true; return c;
+      }));
       table($('t-bl'), [
         ['呼号', function (r) { return esc(r.who); }],
+        ['维度', function (r) { return esc(r.as_type || 'username'); }],
+        ['状态', function (r) {
+          return r._stale
+            ? '<span class="tag PASS">已失效</span>'
+            : '<span class="tag KICK">生效中</span>';
+        }],
         ['原因', function (r) { return esc(r.reason); }],
         ['到期', function (r) { return esc(r.until === 'infinity' ? '永久' : r.until); }],
         ['操作者', function (r) { return esc(r.operator); }],
         ['时间', function (r) { return esc(r.created_at); }],
         ['操作', function (r) {
+          if (r._stale) return '<span class="muted small">EMQX 中已无此封禁</span>';
           return '<button class="btn ghost" onclick="BAS.unban(\'' + esc(r.who) + '\')">解封</button>';
         }]
-      ], j.active || []);
+      ], rows);
+      if ($('bl-sum')) {
+        $('bl-sum').textContent = '生效中 ' + (j.active || []).length + ' 条'
+          + (stale.length ? ('，已失效 ' + stale.length + ' 条（可一键清理）') : '')
+          + (j.note ? ('　' + j.note) : '');
+      }
+      if ($('bl-sync')) { $('bl-sync').disabled = !stale.length; }
     });
     api('blacklist/history?limit=300').then(function (j) {
       table($('t-blh'), [
@@ -576,6 +596,14 @@
         });
       });
     }
+    if ($('bl-sync')) {
+      $('bl-sync').addEventListener('click', function () {
+        api('blacklist/sync', { method: 'POST', body: {} }).then(function (j) {
+          alert(j.ok ? (j.detail || '已清理') : ('失败: ' + j.error));
+          loadBl();
+        });
+      });
+    }
     if ($('bn-refresh')) {
       $('bn-refresh').addEventListener('click', function () {
         api('banned').then(function (j) {
@@ -594,13 +622,9 @@
     if (h && h !== current) switchTab(h);
   });
 
-  if (token) {
-    api('bootstrap').then(function () {
-      fetch('/api/bas/status', { headers: { 'X-BAS-Token': token } }).then(function (r) {
-        if (r.status === 401) { showLogin(); } else { boot(); }
-      });
-    }).catch(showLogin);
-  } else {
-    showLogin();
-  }
+  /* ---------------- 启动（已取消后台账号登录） ----------------
+     管理口默认直连：不再要求登录，也不再弹出登录遮罩。
+     如需恢复登录：把 bas_http.py 里的 BAS_ADMIN_LOGIN_REQUIRED 改回 True 即可，
+     这里的登录界面与逻辑都保留未删。 */
+  boot();
 })();

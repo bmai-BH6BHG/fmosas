@@ -75,18 +75,25 @@ DEFAULT_POLICY = {
     #      clientid 可以伪造，证书不能）
     # 满足条件 → 即使同 uid 多连接（多设备/多开）也**一律放行**；
     # 不满足 → 按 app_only_verdict 处置（off/warn/ban）。
-    "app_only_verdict": "ban",
+    # ⚠️ 默认 warn（只留证 + 待审），不要默认 ban：
+    #   实测事故：EMQX 没下发 client_attrs 时（认证链刚切换、客户端在窗口期连上），
+    #   合法固件 BH6FWE 与用户自己的 APP 全被判"非本 APP"，而且当时是**按自称呼号封**，
+    #   直接把呼号封掉。判定"非本 APP"的证据太弱（clientid 前缀可伪造、attrs 也会缺），
+    #   因此默认只记录；确要封禁请显式设 app_only_verdict=ban（此时也只封 clientid）。
+    "app_only_verdict": "warn",
     "app_clientid_prefixes": ["FMO-"],
     # 内部客户端前缀：监控/网页面板/回响节点等，不受"只许本 APP"限制
     "app_exempt_prefixes": ["FMO-MONITOR", "fmo-web-", "fmo-web", "FMO-ECHO"],
     # ---------------- 审计豁免（这些身份发布的报文不参与逐包身份审计）----------------
     # 通用机制：内部发布者（例如把别人的报文原样转发的桥接/回响类节点）可以把身份
     # 登记在这里。这类节点重发的报文包内呼号必然 ≠ 连接身份，不豁免会被判「盗用呼号」。
-    # 默认**空**（不豁免任何人）；需要时由部署方在策略里显式指定，例如
-    #   audit_ignore_usernames = ECHO
+    # 默认只豁免**本系统自己的预检探针**（它会故意用错凭据去验证认证是否真的生效，
+    # 不豁免就会被记成 fake_cert、甚至在开启自动封禁时把自己的探针封掉）。
+    # 需要豁免别的身份时由部署方在策略里显式追加，例如
+    #   audit_ignore_usernames = BAS_PREFLIGHT,ECHO
     #   audit_ignore_clientid_prefixes = FMO-ECHO
-    "audit_ignore_usernames": [],
-    "audit_ignore_clientid_prefixes": [],
+    "audit_ignore_usernames": ["BAS_PREFLIGHT"],
+    "audit_ignore_clientid_prefixes": ["bas-probe"],
     # 是否要求必须有 client_attrs（即通过 SAS 证书认证）才算本 APP
     "app_require_attrs": True,
     # 是否强制要求「APP 密钥签名」验证通过（client_attrs.app_verified == "1"）。

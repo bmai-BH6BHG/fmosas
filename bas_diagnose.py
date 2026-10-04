@@ -344,6 +344,234 @@ def check_mqtt_listeners(host="127.0.0.1", ports=(1883, 8083)):
     return results
 
 
+# ---------------------------------------------------------------- 聚合入口
+def diagnose(emqx_url=None, key=None, secret=None, sas_url=None, base_dir=None,
+             audit_db=None, do_probe=True):
+    """
+    身份链路诊断的**聚合入口**（管理后台「运行诊断」按钮走的就是它）。
+
+    回答一个核心问题：**为什么 client_attrs 没下发 / 身份信息缺失**，
+    以及"认证链会不会把所有人的收发权限都拒掉"。
+
+    返回 {"ok": bool, "findings": [...], "facts": {...}}
+      findings[]: {level: fatal|warn|info, code, title, detail, fix}
+      facts{}   : 与前端约定一致
+        emqx_url / emqx_version / emqx_reachable / http_authn_count
+        authn_detail[{id,method,body_keys}] / other_authn[{backend}]
+        audit_scenes_24h / sas_url / live_clients / mqtt_listeners
+    """
+    base_dir = base_dir or "/opt/fmo-subsystem"
+    cfg = read_cfg(base_dir)
+    emqx_url = str(emqx_url or cfg.get("emqx_url") or "").strip()
+    key = key or cfg.get("key") or ""
+    secret = secret or cfg.get("secret") or ""
+    sas_url = sas_url or ("http://127.0.0.1:%d/auth" % cfg.get("port", 35928))
+    findings = []
+    facts = {
+        "base_dir": base_dir, "sas_url": sas_url,
+        "emqx_url": emqx_url or "-", "emqx_version": "", "emqx_reachable": False,
+        "http_authn_count": 0, "authn_detail": [], "other_authn": [],
+        "audit_scenes_24h": {}, "live_clients": {}, "mqtt_listeners": [],
+    }
+
+    def add(level, code, title, detail="", fix=""):
+        findings.append({"level": level, "code": code, "title": title,
+                         "detail": detail, "fix": fix})
+
+    # ---------- 1) 分系统 /auth 可达性 ----------
+    sas = check_sas_auth(cfg.get("port", 35928), sas_url)
+    facts["sas"] = {"status": sas.get("status"), "body": (sas.get("body") or "")[:200]}
+    if sas.get("status") in (200, 400, 401):
+        add("info", "SAS_OK", "分系统 /auth 可达", "HTTP %s" % sas.get("status"))
+    elif sas.get("status") == 403:
+        add("fatal", "SAS_403", "/auth 被公网白名单拒绝", (sas.get("body") or "")[:160],
+            "EMQX 必须访问公网口（默认 35928）的 /auth，不是管理口 35929")
+    else:
+        add("fatal", "SAS_UNREACHABLE", "分系统 /auth 连不上",
+            "%s → HTTP %s %s" % (sas_url, sas.get("status"), (sas.get("body") or "")[:120]),
+            "确认 fmo-subsystem 在跑、端口正确；否则所有客户端都认证不了")
+
+    # ---------- 2) ★ /auth 对"授权探测"必须回 ignore ----------
+    # EMQX 的授权源(authz)也打这个端点，只带 username 不带 password。
+    # 若这里回 deny → EMQX 会拒绝**所有**客户端的 publish/subscribe
+    # （现象：能连上，但谁的话都传不出去、也收不到）。
+    st_p, tx_p = _req("POST", sas_url, data={"username": "DIAG_AUTHZ_PROBE"})
+    probe_result = ""
+    try:
+        probe_result = str((_jget(st_p, tx_p) or {}).get("result") or "")
+    except Exception:  # noqa: BLE001
+        probe_result = ""
+    facts["authz_probe"] = {"status": st_p, "result": probe_result,
+                            "body": (tx_p or "")[:200]}
+    if st_p in (200, 400, 401):
+        if probe_result == "ignore":
+            add("info", "AUTHZ_PROBE_IGNORE",
+                "/auth 对授权探测返回 ignore（正确）",
+                "EMQX 的授权源会继续用后面的 ACL 判定，收发权限正常")
+        elif probe_result == "deny":
+            add("fatal", "AUTHZ_PROBE_DENY",
+                "/auth 对「只有 username、没有 password」的请求回了 deny",
+                "EMQX 的授权源打的就是这个端点 → 会把**所有已认证客户端**的 "
+                "publish/subscribe 全部拒掉",
+                "让 /auth 在缺少 password 时返回 {\"result\":\"ignore\"}"
+                "（那是授权探测，不是认证请求）")
+        else:
+            add("warn", "AUTHZ_PROBE_UNKNOWN",
+                "/auth 对授权探测返回了非预期结果", "result=%r body=%s"
+                % (probe_result, (tx_p or "")[:120]),
+                "期望 ignore（放行给后续 ACL）；若 EMQX 配了授权源指向 /auth，请核对")
+
+    # ---------- 3) EMQX 可达 / 版本 ----------
+    emqx = Emqx(emqx_url, key, secret)
+    if not (emqx_url and key and secret):
+        add("fatal", "EMQX_CFG_MISSING", "没有 EMQX API 凭据",
+            "审计库里 emqx_url / emqx_api_key / emqx_api_secret 为空",
+            "在管理后台填写 EMQX 地址与 API 密钥后重跑诊断")
+    else:
+        try:
+            ver, st_v, tx_v = emqx.version()
+            facts["emqx_version"] = ver or ""
+            facts["emqx_reachable"] = (st_v == 200)
+            if st_v == 200:
+                add("info", "EMQX_OK", "EMQX API 可达", "版本 %s" % (ver or "未知"))
+                vt = ver_tuple(ver)
+                if vt and vt < (5, 7):
+                    add("fatal", "EMQX_VER_TOO_OLD",
+                        "EMQX 版本过低，不支持 client_attrs",
+                        "当前 %s；client_attrs 需要 ≥5.7，acl 需要 ≥5.8" % ver,
+                        "升级 EMQX 到 5.8.x（本系统按 5.8.9 验证）")
+            else:
+                add("fatal", "EMQX_UNREACHABLE", "EMQX API 连不上",
+                    "%s/api/v5/nodes → HTTP %s %s" % (emqx_url, st_v, (tx_v or "")[:120]),
+                    "核对地址（含端口，默认 18083）、API 密钥是否被重建后失效")
+        except Exception as e:  # noqa: BLE001
+            add("fatal", "EMQX_UNREACHABLE", "EMQX API 请求异常", str(e),
+                "核对地址与 API 密钥")
+
+    # ---------- 4) 认证器链（有没有 HTTP 认证、body 全不全、有没有抢跑） ----------
+    if facts["emqx_reachable"]:
+        try:
+            authn = check_emqx_authn(emqx) or {}
+            items = authn.get("items") or []
+            http_items, other_items = [], []
+            for a in items:
+                backend = str(a.get("backend") or "")
+                url = str(a.get("url") or "")
+                if backend == "http" or url:
+                    http_items.append(a)
+                    facts["authn_detail"].append({
+                        "id": a.get("id"), "method": a.get("method"),
+                        "url": url, "body_keys": list(a.get("body_keys") or []),
+                        "have_detail": bool(a.get("have_detail")),
+                    })
+                else:
+                    other_items.append(a)
+                    facts["other_authn"].append({"id": a.get("id"), "backend": backend})
+            facts["http_authn_count"] = len(http_items)
+            if not http_items:
+                add("fatal", "HTTP_AUTHN_MISSING",
+                    "没有指向本系统 /auth 的 HTTP 认证器",
+                    "在线客户端的 client_attrs 会全部为空（没经过 SAS）",
+                    "EMQX Dashboard → 访问控制 → 认证，新建 HTTP 认证："
+                    "URL=%s、Method=POST、Body=%s、mechanism=password_based、"
+                    "ssl={\"enable\": false}（不要填 type/listener_id）"
+                    % (sas_url, '{"username":"${username}","password":"${password}",'
+                                '"clientid":"${clientid}","peerhost":"${peerhost}"}'))
+            else:
+                for a in facts["authn_detail"]:
+                    bk = a.get("body_keys") or []
+                    if not a.get("have_detail"):
+                        add("warn", "AUTHN_DETAIL_MISSING",
+                            "认证器 %s 拉不到详情，无法核对请求体" % a.get("id"),
+                            "列表接口不含 method/body，请到 Dashboard 里核对")
+                        continue
+                    if "username" not in bk or "password" not in bk:
+                        add("warn", "AUTHN_BODY_INCOMPLETE",
+                            "认证器 %s 的请求体缺少 username/password" % a.get("id"),
+                            "body键=%s" % bk,
+                            "Body 至少要包含 username 与 password，否则认证必失败")
+                    elif "clientid" not in bk or "peerhost" not in bk:
+                        add("warn", "AUTHN_BODY_NO_CLIENTID",
+                            "认证器 %s 的请求体没有 clientid/peerhost" % a.get("id"),
+                            "body键=%s" % bk,
+                            "建议补上：{\"username\":\"${username}\","
+                            "\"password\":\"${password}\",\"clientid\":\"${clientid}\","
+                            "\"peerhost\":\"${peerhost}\"}（APP 签名校验与来源 IP 诊断需要）")
+            if other_items:
+                add("warn", "AUTHN_OTHER_PRESENT",
+                    "同一认证链里还有其它认证器",
+                    "其它: %s" % ", ".join(str(x.get("backend")) for x in other_items),
+                    "顺序在前的认证器若先通过，客户端就不会经过 SAS → client_attrs 为空；"
+                    "建议只保留 HTTP 认证器，或把内置库排到后面")
+        except Exception as e:  # noqa: BLE001
+            add("warn", "AUTHN_READ_FAIL", "读取认证器配置失败", str(e))
+
+    # ---------- 5) 真实在线客户端的 client_attrs（最直接的证据） ----------
+    if facts["emqx_reachable"]:
+        try:
+            live = check_live_clients(emqx)
+            facts["live_clients"] = {
+                "total": live.get("total"), "with_callsign": live.get("with_callsign"),
+                "without": live.get("without"),
+            }
+            total = int(live.get("total") or 0)
+            without = int(live.get("without") or 0)
+            if total and without == total:
+                add("fatal", "CLIENTS_NO_ATTRS",
+                    "全部 %d 个在线连接都没有身份属性" % total,
+                    "样本: %s" % json.dumps(live.get("samples", [])[:5], ensure_ascii=False),
+                    "先修上一条 HTTP 认证器问题，然后让客户端**重连**"
+                    "（旧连接的属性不会补发）")
+            elif without:
+                add("warn", "CLIENTS_PARTIAL_ATTRS",
+                    "%d/%d 个在线连接没有身份属性" % (without, total),
+                    "这些连接多半是在认证链修好之前连上的",
+                    "让它们重连即可拿到 client_attrs；"
+                    "在此之前它们会被「只许本 APP」规则记入待审（默认不封）")
+            elif total:
+                add("info", "CLIENTS_ATTRS_OK",
+                    "%d 个在线连接都带身份属性" % total, "链路正常")
+        except Exception as e:  # noqa: BLE001
+            add("warn", "CLIENTS_READ_FAIL", "读取在线客户端失败", str(e))
+
+    # ---------- 6) MQTT 监听器是否真的启用了认证（错误凭据能连上=没启用） ----------
+    if do_probe:
+        try:
+            probes = check_mqtt_listeners("127.0.0.1", (1883, 8083))
+            facts["mqtt_listeners"] = [
+                {"port": p.get("port"), "verdict": p.get("verdict"),
+                 "connack_rc": p.get("connack_rc")} for p in probes]
+            for p in probes:
+                if p.get("verdict") == "anonymous":
+                    add("fatal", "MQTT_AUTH_DISABLED",
+                        "监听器 %s 没有启用客户端认证" % p.get("port"),
+                        "用错误凭据也能连上（CONNACK rc=0）→ 客户端根本没过 SAS，"
+                        "client_attrs 必为空",
+                        "给该监听器挂上 HTTP 认证器（见上面的修法），然后重启监听器")
+        except Exception as e:  # noqa: BLE001
+            add("warn", "MQTT_PROBE_FAIL", "MQTT 监听器探测失败", str(e))
+
+    # ---------- 7) 审计库近况（谁在被判"非本 APP"） ----------
+    try:
+        ad = check_audit_db(base_dir) or {}
+        facts["audit_scenes_24h"] = ad.get("scenes") or {}
+        na = int((ad.get("scenes") or {}).get("non_app_client") or 0)
+        if na:
+            add("warn", "AUDIT_NON_APP",
+                "近 24h 有 %d 条「非本 APP 客户端」记录" % na,
+                "该规则默认只留证不封禁；若你的策略把它设成了 ban，请注意它只按 clientid 封",
+                "确认这些连接确实不是自家 APP 后再收紧策略")
+    except Exception as e:  # noqa: BLE001
+        add("warn", "AUDIT_READ_FAIL", "读取审计库失败", str(e))
+
+    ok = not any(f["level"] == "fatal" for f in findings)
+    if ok:
+        add("info", "ALL_OK", "身份链路未发现致命问题",
+            "共 %d 项检查，%d 条提示" % (len(findings), sum(
+                1 for f in findings if f["level"] != "info")))
+    return {"ok": ok, "findings": findings, "facts": facts}
+
+
 # ---------------------------------------------------------------- 主流程
 def main():
     args = sys.argv[1:]

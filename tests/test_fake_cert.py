@@ -62,6 +62,10 @@ class FakeCertTests(unittest.TestCase):
             "fake_cert_window_sec": 300,
             "fake_cert_ip_ban_hours": 1,
             "ban_hours": 24,
+            # 这些用例测的是"封禁路径本身"，必须先打开全局闸门；
+            # 闸门关闭时的行为由 BanGateTests 覆盖（warn/auto_ban=0 一律不封）
+            "mode": "ban",
+            "auto_ban": True,
         })
 
     def tearDown(self):
@@ -216,6 +220,64 @@ class FakeCertTests(unittest.TestCase):
         self.assertEqual(200, code)
         self.assertIn(("BH6BHG", "username"), self._types(),
                       "盗用呼号（包内声明别人）必须被封")
+
+
+class BanGateTests(unittest.TestCase):
+    """★ 统一封禁闸门：mode=warn 或 auto_ban 关闭时，**任何**路径都不得封人。
+
+    真实事故（三次同类）：各规则自己调封禁，绕过 mode/auto_ban ——
+    用户明明设了 warn / 关掉自动封禁，系统还在封人（连自家预检探针都被封）。
+    """
+
+    def _svc(self):
+        import tempfile, shutil
+        from bas_audit_db import AuditDB
+        from bas_audit import AuditService
+        tmp = tempfile.mkdtemp(prefix="bas-gate-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        svc = AuditService(AuditDB(tmp + "/a.db"), config={"admin_port": 35929})
+        self.bans = []
+        svc._ban_any = lambda who, reason, hours, as_type="username": (
+            self.bans.append((who, as_type)), True)[1]
+        svc._ban_recorder = lambda cs, r, h: (self.bans.append((cs, "username")), True)[1]
+        return svc
+
+    def test_warn_mode_never_bans_on_fake_cert(self):
+        svc = self._svc()
+        svc.set_policy("mode", "warn")
+        svc.set_policy("auto_ban", "true")      # 即便开了 auto_ban
+        svc.record_auth_rejection("BH6BHG", "cid-x", "203.0.113.5", "proof 签名验证失败")
+        self.assertEqual([], self.bans, "warn 模式不得封禁")
+
+    def test_auto_ban_off_never_bans_on_fake_cert(self):
+        svc = self._svc()
+        svc.set_policy("mode", "ban")
+        svc.set_policy("auto_ban", "false")     # 即便模式是 ban
+        svc.record_auth_rejection("BH6BHG", "cid-x", "203.0.113.6", "proof 签名验证失败")
+        self.assertEqual([], self.bans, "auto_ban 关闭时不得封禁")
+
+    def test_ban_mode_and_auto_ban_does_ban_clientid(self):
+        svc = self._svc()
+        svc.set_policy("mode", "ban")
+        svc.set_policy("auto_ban", "true")
+        svc.record_auth_rejection("BH6BHG", "cid-x", "203.0.113.7", "proof 签名验证失败")
+        self.assertIn(("cid-x", "clientid"), self.bans, "两个开关都开且证据充分时应封 clientid")
+
+    def test_own_preflight_probe_is_never_banned(self):
+        svc = self._svc()
+        svc.set_policy("mode", "ban")
+        svc.set_policy("auto_ban", "true")
+        # 预检探针：客户端名 bas-probe-*，用户名 BAS_PREFLIGHT
+        svc.record_auth_rejection("BAS_PREFLIGHT", "bas-probe-123", "127.0.0.1", "password 解析失败")
+        self.assertEqual([], self.bans, "自家预检探针绝不能被封（真实事故）")
+
+    def test_ip_ban_also_gated(self):
+        svc = self._svc()
+        svc.set_policy("mode", "warn")
+        svc.set_policy("fake_cert_ip_ban_after", "1")
+        for i in range(3):
+            svc.record_auth_rejection("BH6BHG", "cid-%d" % i, "203.0.113.9", "proof 签名验证失败")
+        self.assertEqual([], self.bans, "warn 模式下连 IP 也不能封")
 
 
 class SasCrossCheckSemanticsTests(unittest.TestCase):

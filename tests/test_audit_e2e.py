@@ -445,14 +445,34 @@ class AuditServiceE2ETests(unittest.TestCase):
         self.assertEqual("dup_identity", rows[0]["scene"])
         self.assertEqual(PASS, rows[0]["verdict"], "本 APP 多设备必须判 PASS（放行）")
 
-    def test_non_app_client_is_banned(self):
-        """不是本 APP 上来的（无证书身份 / clientid 非 APP 形态）→ 封死。"""
+    def test_non_app_client_default_is_record_only(self):
+        """
+        ★ 默认（warn）档位：非本 APP 连接只留证/待审，不封人。
+
+        真实事故：默认封禁 + 按自称呼号封 → 合法固件 BH6FWE 与用户自己的 APP
+        BH6BHG 全被按呼号封掉（EMQX 没下发 client_attrs 时就会命中这条规则）。
+        """
         STUB.clients = [{"clientid": "hacker-9527", "username": "BADGUY",
                          "client_attrs": {}}]
         for _ in range(3):
             self.svc.collect_once()
-        self.assertTrue(STUB.bans, "非本 APP 连接必须被处置")
-        self.assertEqual("BADGUY", STUB.bans[0]["who"])
+        self.assertEqual([], STUB.bans, "默认档位绝不能封禁")
+
+    def test_non_app_client_banned_by_clientid_only(self):
+        """显式开启封禁后，只按 clientid 封，绝不按客户自称呼号"""
+        STUB.clients = [{"clientid": "hacker-9527", "username": "BADGUY",
+                         "client_attrs": {}}]
+        self.svc.set_policy("app_only_verdict", "ban")
+        self.svc.set_policy("mode", "ban")
+        self.svc.set_policy("auto_ban", "true")
+        self.svc.set_policy("ban_hours", "24")
+        for _ in range(3):
+            self.svc.collect_once()
+        self.assertTrue(STUB.bans, "开启封禁后应处置")
+        b = STUB.bans[0]
+        self.assertEqual("clientid", b.get("as"), "封禁维度必须是 clientid")
+        self.assertEqual("hacker-9527", b.get("who"))
+        self.assertNotEqual("BADGUY", b.get("who"), "★ 绝不能按自称呼号封")
 
     def test_cleanup_runs_in_collect_path(self):
         self.db.upsert_minute_stat({"clientid": "old", "ts": "2020-01-01 00:00:00"})
