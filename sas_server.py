@@ -91,6 +91,46 @@ OFFICIAL_ROOT_PUBKEYS = {
 
 
 # ============================================================
+#  配置里追加信任的根公钥（trust.extraRootPubkeys）
+#
+#  用途：**本机 CA 被重新生成后，旧 CA 根签发的证书也要继续能用**。
+#  真实事故：CA 文件在某次重启/重建时被重新生成（换了根），
+#  所有此前签发的证书（含国服 8601 绑定流程签发的）立刻被判
+#  "根 CA 不受信任" → 全体用户登录不了。
+#  把旧根公钥列在 config.json 的 trust.extraRootPubkeys 里即可继续信任它，
+#  新根照常给新绑定签发，两代证书并存。
+# ============================================================
+_CONFIG_EXTRA_ROOTS_CACHE = None
+
+
+def get_config_extra_root_pubkeys() -> set:
+    """
+    读取 config.json → trust.extraRootPubkeys（字符串或数组）。
+    注意：**直接读文件**，不走 load_config —— 后者只保留已知键，会把 trust 丢掉。
+    结果缓存（改配置后需重启生效，与 roots 目录一致）。
+    """
+    global _CONFIG_EXTRA_ROOTS_CACHE
+    if _CONFIG_EXTRA_ROOTS_CACHE is not None:
+        return _CONFIG_EXTRA_ROOTS_CACHE
+    out = set()
+    try:
+        p = os.path.join(_HERE, "config.json")
+        with open(p, "r", encoding="utf-8-sig") as f:
+            raw_cfg = json.load(f)
+        raw = ((raw_cfg or {}).get("trust") or {}).get("extraRootPubkeys")
+        if isinstance(raw, str):
+            raw = [raw]
+        for x in (raw or []):
+            x = str(x).strip()
+            if x:
+                out.add(x)
+    except Exception:  # noqa: BLE001
+        pass
+    _CONFIG_EXTRA_ROOTS_CACHE = out
+    return out
+
+
+# ============================================================
 #  数据库命名前缀工具（基于域名/IP，避免多系统部署冲突）
 # ============================================================
 
@@ -585,11 +625,46 @@ class CaManager:
         """
         初始化本地 CA。如果已存在且 force=False 则加载现有 CA。
         返回 True 表示新生成，False 表示加载已有。
+
+        ★ 安全阀（真实事故）：原先只要三个 CA 文件里有**任何一个**读不到，
+          `_try_load()` 失败就**静默重新生成**整套 CA —— 换根之后，此前签发的
+          所有证书（含国服 8601 绑定流程签发的）立刻被判「根 CA 不受信任」，
+          全体用户登录不了。
+          现在：只要 ca/ 下**已存在任何 CA 文件**而加载失败，就**拒绝生成**
+          （抛错），必须显式 force=True 才重建；且重建前自动备份整个 ca/ 目录。
         """
         if not force and self._try_load():
             return False
+        existing = [p for p in (self.ca_private_path, self.root_path, self.int_path)
+                    if os.path.exists(p)]
+        if existing and not force:
+            raise RuntimeError(
+                "检测到已有 CA 文件但加载失败（%s）；**拒绝重新生成**，"
+                "以免作废全部已签发证书。请检查文件权限/完整性后重启；"
+                "确要重建请显式 force=True（会先自动备份 ca/）"
+                % "、".join(os.path.basename(p) for p in existing))
+        if existing:
+            self._backup_ca_dir()
         self._generate()
         return True
+
+    def _backup_ca_dir(self) -> str:
+        """重建 CA 前把整个 ca/ 目录备份走（返回备份路径）"""
+        import shutil
+        import time as _t
+        stamp = _t.strftime("%Y%m%d-%H%M%S")
+        ca_dir = os.path.dirname(self.root_path) or "."
+        dst = os.path.join(ca_dir, "backup-%s" % stamp)
+        try:
+            os.makedirs(dst, exist_ok=True)
+            for fn in os.listdir(ca_dir):
+                src = os.path.join(ca_dir, fn)
+                if os.path.isfile(src) and fn.endswith(".json"):
+                    shutil.copy2(src, os.path.join(dst, fn))
+            print("[CA] 重建前已备份旧 CA → %s" % dst)
+        except Exception as e:  # noqa: BLE001
+            print("[CA] 备份旧 CA 失败: %s" % e)
+        return dst
 
     def _try_load(self) -> bool:
         """尝试从文件或数据库加载已有 CA。"""
@@ -1119,6 +1194,9 @@ def authenticate(username: str, password: str,
         local_root_pub = (ca_mgr.root_cert.get("subject") or {}).get("publicKey")
         trusted = (root_pub_b64 == local_root_pub)
     if not trusted and root_pub_b64 in OFFICIAL_ROOT_PUBKEYS:
+        trusted = True
+    # ★ 配置里追加信任的根（本机 CA 被重新生成时，旧根仍可用）
+    if not trusted and root_pub_b64 in get_config_extra_root_pubkeys():
         trusted = True
     if not trusted and root_pub_b64 in get_extra_roots():
         trusted = True

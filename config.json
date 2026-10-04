@@ -1,58 +1,61 @@
 {
-    "subsystem_id": "sub-db77bd6f",
-    "name": "FMO注册系统-默认",
-    "domain": "bh6bhg.synology.me",
-    "api_url": "http://bh6bhg.synology.me:35928",
-    "port": 35928,
-    "master_url": "http://bh6bhg.synology.me:35930",
-    "report_interval": 30,
-    "app_domain": "",
-    "app_port": 35928,
-    "app_use_port": true,
-    "sas_port": 8080,
-    "ca_dir": "ca",
-    "monitor": {
-        "enabled": true,
-        "mqtt_host": "127.0.0.1",
-        "mqtt_port": 1883,
-        "report_voice": true,
-        "retention_days": 3
+  "subsystem_id": "sub-db77bd6f",
+  "name": "FMO注册系统-默认",
+  "domain": "bh6bhg.synology.me",
+  "api_url": "http://bh6bhg.synology.me:35928",
+  "port": 35928,
+  "master_url": "http://bh6bhg.synology.me:35930",
+  "report_interval": 30,
+  "app_domain": "",
+  "app_port": 35928,
+  "app_use_port": true,
+  "sas_port": 8080,
+  "ca_dir": "ca",
+  "monitor": {
+    "enabled": true,
+    "mqtt_host": "127.0.0.1",
+    "mqtt_port": 1883,
+    "report_voice": true,
+    "retention_days": 3
+  },
+  "dmrid": {
+    "enabled": true,
+    "base_url": "https://dmriapi.radiowo.com",
+    "timeout": 10,
+    "app_pubkey": "4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0",
+    "app_timestamp_window": 300,
+    "verify_password": false,
+    "kdf_algorithm": "pbkdf2",
+    "kdf_pbkdf2_iterations": 600000,
+    "kdf_scrypt_n": 32768,
+    "kdf_scrypt_r": 8,
+    "kdf_scrypt_p": 1,
+    "dev_mode": false
+  },
+  "sas_db_path": "",
+  "sas_ca_name": "MYCA",
+  "sas_validity_years": 10,
+  "trust": {
+    "rootsDir": "roots",
+    "extraRootPubkeys": [
+      "j7JIRYV8tRQU7RQvCBPFSJK-eyynbHWMJSWtn8WGNNo"
+    ]
+  },
+  "peers": [],
+  "sync_interval": 30,
+  "full_report_interval": 300,
+  "pull_interval": 60,
+  "peer_sync_interval": 60,
+  "sas_runtime": {
+    "allowed_callsigns": [],
+    "require_client_signature": false,
+    "auto_trust_local_ca": true,
+    "uid_range": {
+      "start": 1,
+      "end": 200000
     },
-    "dmrid": {
-        "enabled": true,
-        "base_url": "https://dmriapi.radiowo.com",
-        "timeout": 10,
-        "app_pubkey": "4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0",
-        "app_timestamp_window": 300,
-        "verify_password": false,
-        "kdf_algorithm": "pbkdf2",
-        "kdf_pbkdf2_iterations": 600000,
-        "kdf_scrypt_n": 32768,
-        "kdf_scrypt_r": 8,
-        "kdf_scrypt_p": 1,
-        "dev_mode": false
-    },
-    "sas_db_path": "",
-    "sas_ca_name": "MYCA",
-    "sas_validity_years": 10,
-    "trust": {
-        "rootsDir": "roots"
-    },
-    "peers": [],
-    "sync_interval": 30,
-    "full_report_interval": 300,
-    "pull_interval": 60,
-    "peer_sync_interval": 60,
-    "sas_runtime": {
-        "allowed_callsigns": [],
-        "require_client_signature": false,
-        "auto_trust_local_ca": true,
-        "uid_range": {
-            "start": 1,
-            "end": 200000
-        },
-        "issuing_countries": [
-            "CN"
-        ]
-    }
+    "issuing_countries": [
+      "CN"
+    ]
+  }
 }
