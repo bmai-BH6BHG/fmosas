@@ -938,6 +938,10 @@ PUBLIC_GET_PATHS = frozenset({
     '/', '/index.html',
     '/api/health', '/api/users', '/api/stats', '/api/config',
     '/api/cert/mine', '/api/sync/status',
+    # 根证书公开下载：别的 FMO 服务器要信任本机签发的证书（含国服绑定签发的），
+    # 就得从这里取根证书放进它的 roots/。根证书是自签公开信息——它的公钥本来就
+    # 出现在每张已签发证书的链里，私钥 ca_private.json 不在这里、也不外发。
+    '/api/ca/root.json',
 })
 PUBLIC_GET_PREFIXES = ('/uploads/',)
 PUBLIC_POST_PATHS = frozenset({
@@ -949,6 +953,32 @@ PUBLIC_POST_PATHS = frozenset({
     # 公网口必须放行，否则 EMQX 在别的机器上投递会被白名单 403）
     '/api/ingest',
 })
+
+def build_ca_root_payload(ca_mgr, config=None):
+    """
+    组装「根证书下载」响应体（纯函数，便于测试）。
+
+    ⚠️ 只读 ca_mgr.root_cert（自签公开证书）。**绝不读 ca_private.json**——
+    根证书是公开信息（公钥本来就在每张已签发证书的链里），私钥不外发。
+    指纹取 ca_mgr.root_fingerprint（加载 CA 时算好的字符串）；
+    注意 cert_fingerprint() 收的是 TBS 列表而不是证书，直接传证书会返回 bytes，
+    会让 send_json 抛 "Object of type bytes is not JSON serializable"。
+    """
+    root = getattr(ca_mgr, 'root_cert', None) if ca_mgr else None
+    if not root:
+        return None
+    cfg = config or {}
+    return {
+        'ok': True,
+        'ca_name': (root.get('subject') or {}).get('name', ''),
+        'fingerprint': str(getattr(ca_mgr, 'root_fingerprint', '') or ''),
+        'subsystem_id': cfg.get('subsystem_id', ''),
+        'domain': cfg.get('domain', ''),
+        'cert': root,
+        'usage': ('把 cert 字段存成 <名字>.json 放进对方安装目录的 roots/，'
+                  '重启后本机签发的证书（含国服绑定签发的）即被对方信任'),
+    }
+
 
 # ==================== 请求处理器 ====================
 class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
@@ -1842,6 +1872,9 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'GET' and path == '/api/ca/info':
                 self._handle_sas_ca_info()
                 return True
+            if method == 'GET' and path == '/api/ca/root.json':
+                self._handle_sas_ca_root_json()
+                return True
             if method == 'POST' and path == '/api/ca/init':
                 self._handle_sas_ca_init()
                 return True
@@ -2496,6 +2529,32 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             info['trusted_ca_count'] = 0
             info['trusted_ca_error'] = str(e)
         self.send_json({'ok': True, 'ca': info})
+
+    # ---------- GET /api/ca/root.json ----------
+    def _handle_sas_ca_root_json(self):
+        """
+        下载本机 Root CA 完整证书（自签，含 signature）。
+
+        用途：别的 FMO 服务器要信任本机签发的证书（含国服绑定流程签发的证书），
+        就要把本机根证书放进它的 roots/ 目录。**根证书是公开信息**——公钥本来就
+        存在于每张已签发证书的链里，私钥 ca_private.json 绝不外发。
+
+        对方拿到后：
+            curl -fsS http://<本机IP>:35928/api/ca/root.json \
+              | python3 -c "import json,sys;json.dump(json.load(sys.stdin)['cert'],open('MY.root.json','w'),indent=2)"
+            cp MY.root.json <对方>/roots/ && 重启
+        """
+        sas_db, ca_mgr = self._require_sas()
+        if sas_db is None:
+            return
+        payload = build_ca_root_payload(ca_mgr, CONFIG)
+        if payload is None:
+            self.send_json({'ok': False,
+                            'error': '本机 CA 未初始化，无法下载根证书'}, 503)
+            return
+        self.send_json(payload)
+        print("[CA] 根证书已被下载：%s fp=%s（根证书是公开信息，私钥不外发）"
+              % (payload['ca_name'], payload['fingerprint'][:24]))
 
     # ---------- POST /api/ca/init ----------
     def _handle_sas_ca_init(self):

@@ -131,6 +131,79 @@ class RoutingAndPackagingTests(unittest.TestCase):
         block = src.split("PUBLIC_GET_PATHS", 1)[1].split(")", 1)[0]
         self.assertNotIn("/admin", block)
 
+    def test_root_ca_downloadable_from_public_port(self):
+        """根证书是公开信息，必须能在公网口拉走，别人才能接种信任。
+        但 /api/ca/init、/api/ca/info 仍只在管理口（会泄露私钥状态/内部信息）。"""
+        src = _read_root("api_server.py")
+        block = src.split("PUBLIC_GET_PATHS", 1)[1].split(")", 1)[0]
+        self.assertIn("'/api/ca/root.json'", block)
+        for forbidden in ("'/api/ca/init'", "'/api/ca/renew'", "'/api/ca/info'"):
+            self.assertNotIn(forbidden, block)
+
+    def test_root_json_route_exists_and_never_leaks_private_key(self):
+        src = _read_root("api_server.py")
+        self.assertIn("_handle_sas_ca_root_json", src)
+        self.assertIn("'/api/ca/root.json'", src)
+        self.assertNotIn("ca_private", src.split("_handle_sas_ca_root_json")[1]
+                         .split("def ", 1)[0],
+                         "根证书下载端点绝不能碰私钥文件")
+
+
+class RootCertPayloadTests(unittest.TestCase):
+    """根证书下载响应必须是可 JSON 序列化的，且带完整自签证书。"""
+
+    class _FakeCaMgr(object):
+        def __init__(self):
+            self.root_cert = {
+                "sn": 1, "type": "rootCA",
+                "issuer": {"name": "MYCA", "email": ""},
+                "subject": {"name": "MYCA", "publicKey": "vht_DzLunLa2Sdj5uJ3IeJ7I6w"},
+                "extensions": {"isCA": True, "pathLen": 1, "crl": "", "license": "",
+                               "keyId": "1"},
+                "iat": 1791090441, "exp": 2106450441,
+                "signatureAlgorithm": "Ed25519",
+                "signature": "hb0YePvSnM6rqXouko_MtrMiJ64Rv_bKgBJ6YoWPHwU",
+            }
+            self.root_fingerprint = "leWfFe5uVoojCkeKSafliV7X16cdn2Xf1ej0JBeIddw"
+
+    def _payload(self):
+        import api_server
+        return api_server.build_ca_root_payload(
+            self._FakeCaMgr(), {"subsystem_id": "sub-x", "domain": "d.example"})
+
+    def test_payload_is_json_serializable(self):
+        """回归：曾经传 bytes 指纹进去，导致 HTTP 500 bytes is not JSON serializable。"""
+        import json
+        p = self._payload()
+        json.dumps(p)  # 不抛异常即通过
+        self.assertTrue(p["ok"])
+
+    def test_payload_carries_full_self_signed_cert(self):
+        p = self._payload()
+        self.assertEqual("rootCA", p["cert"]["type"])
+        self.assertTrue(p["cert"]["signature"], "必须带 signature，否则对方无法验签接种")
+        self.assertEqual("vht_DzLunLa2Sdj5uJ3IeJ7I6w",
+                         p["cert"]["subject"]["publicKey"])
+
+    def test_payload_contains_no_private_material(self):
+        import json
+        raw = json.dumps(self._payload())
+        for bad in ("privateKey", "ca_private", "seed", "PRIVATE KEY"):
+            self.assertNotIn(bad, raw, "响应里绝不能出现私钥相关字段")
+
+    def test_uninitialized_ca_returns_none(self):
+        import api_server
+
+        class _Empty(object):
+            root_cert = None
+            root_fingerprint = ""
+
+        self.assertIsNone(api_server.build_ca_root_payload(_Empty(), {}))
+
+    def test_fingerprint_is_str_not_bytes(self):
+        p = self._payload()
+        self.assertIsInstance(p["fingerprint"], str)
+
     def test_install_scripts_know_portal(self):
         for name in ("install.sh", "build_release.sh"):
             src = _read_root(name)
