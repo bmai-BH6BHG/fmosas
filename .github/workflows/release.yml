@@ -125,6 +125,11 @@ jobs:
           cp out/bas/bas_emqx_auth.py  up/bas-emqx-auth.py
           cp out/bas/bas_diagnose.py   up/bas-diagnose.py
           cp out/bas/VERSION           up/bas-version.txt
+          # FUS 别名（系统已更名 FUS；bas-* 保留兼容，两个名字都能下载）
+          cp out/bas/install-bas.sh    up/fus-install.sh
+          cp out/bas/uninstall-bas.sh  up/fus-uninstall.sh
+          cp out/bas/bas_diagnose.py   up/fus-diagnose.py
+          cp out/bas/VERSION           up/fus-version.txt
           ls -l up/
           for f in up/*; do
             echo "上传 $f"

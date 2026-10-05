@@ -1058,7 +1058,7 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 return True
             return False
         if not (path.startswith('/api/bas/') or path == '/api/ingest'
-                or path.startswith('/admin/bas')):
+                or path.startswith('/admin/bas') or path.startswith('/admin/fus')):
             return False
 
         body = None

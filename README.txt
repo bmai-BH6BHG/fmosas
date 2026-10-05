@@ -2,9 +2,9 @@
   FMO 注册系统 - 分系统部署包（前后端分离版）
 ============================================================
 
-零、BAS 一键安装（认证 SAS + 审计 FAS 一体，推荐）
+零、FUS 一键安装（认证 SAS + 审计 FAS 一体，推荐）
 ------------------------------------------------------------
-一条命令完成：扫描旧 SAS/FAS → 备份 → 卸载旧系统 → 安装新 BAS → 接管 EMQX 认证 → 联合自检
+一条命令完成：扫描旧 SAS/FAS → 备份 → 卸载旧系统 → 安装新 FUS → 接管 EMQX 认证 → 联合自检
 
   curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-install.sh | sudo bash
 

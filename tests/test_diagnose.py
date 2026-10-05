@@ -281,7 +281,8 @@ class DiagnoseTests(unittest.TestCase):
         p = subprocess.run(cmd, capture_output=True, timeout=60,
                            env=dict(os.environ, PYTHONIOENCODING="utf-8"))
         out = (p.stdout or b"").decode("utf-8", "replace")
-        self.assertIn("BAS 链路自检", out)
+        # 系统已更名为 FUS（FMO Unified Security Server）；兼容旧名 BAS
+        self.assertTrue("FUS 链路自检" in out or "BAS 链路自检" in out, out[:200])
 
 
 if __name__ == "__main__":

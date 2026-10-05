@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BAS 审计 · FMO</title>
+<title>FUS · FMO 统一安全服务端</title>
 <link rel="stylesheet" href="/admin/bas.css">
 </head>
 <body>
 <div id="login" class="login-mask hidden">
   <div class="login-card">
-    <h2>BAS 审计控制台</h2>
+    <h2>FUS 控制台</h2>
     <p class="muted" id="login-hint">请输入管理员账号</p>
     <div id="setup-fields" class="hidden">
       <label>设置管理员账号<input id="su-user" autocomplete="username"></label>
@@ -26,11 +26,11 @@
 </div>
 
 <header class="top">
-  <div class="brand">BAS <span class="muted">认证 + 审计</span></div>
+  <div class="brand">FUS <span class="muted">FMO 统一安全服务端</span></div>
   <nav id="nav"></nav>
   <div class="top-right">
     <span id="policy-badge" class="badge" title="身份控制策略模式">—</span>
-    <!-- 返回 SAS（分系统管理后台）。BAS 是内嵌在分系统管理口的子页面，
+    <!-- 返回 SAS（分系统管理后台）。FUS 是内嵌在分系统管理口的子页面，
          这里给一个显式入口，避免只能手改地址栏。 -->
     <a class="btn ghost" id="back-sas" href="/admin" title="返回 FMO 分系统（SAS）管理后台">← 返回 SAS 管理</a>
     <!-- 已取消后台账号登录：不再显示登录/退出按钮。
@@ -257,6 +257,14 @@
     </div>
   </section>
 </main>
+
+<footer class="foot">
+  <div class="foot-name">FUS — FMO Unified Security Server</div>
+  <div class="foot-cn">FMO 统一安全服务端</div>
+  <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
+  <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
+</footer>
+
 <script src="/admin/bas.js"></script>
 </body>
 </html>

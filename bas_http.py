@@ -317,7 +317,9 @@ class BasHttp(object):
             return True
 
         # ---- 静态资源 ----
-        if path in ("/admin/bas", "/admin/bas/", "/admin/bas/index.html"):
+        # /admin/bas 与 /admin/fus 等价（系统更名为 FUS；旧地址保留兼容）
+        if path in ("/admin/bas", "/admin/bas/", "/admin/bas/index.html",
+                    "/admin/fus", "/admin/fus/", "/admin/fus/index.html"):
             self._serve_asset(h, "bas.html", "text/html; charset=utf-8")
             return True
         if path == "/admin/bas.js":

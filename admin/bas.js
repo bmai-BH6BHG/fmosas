@@ -1,4 +1,4 @@
-/* BAS 审计控制台前端（零依赖） */
+/* FUS 审计控制台前端（零依赖） */
 (function () {
   'use strict';
 
@@ -210,7 +210,7 @@
         ['IP', function (r) { return esc(r.ips); }],
         ['在线时长', function (r) { return esc(r.online_text); }],
         ['操作', function (r) {
-          return '<button class="btn ghost" onclick="BAS.ban(\'' + esc(r.callsign) + '\')">拉黑</button>';
+          return '<button class="btn ghost" onclick="FUS.ban(\'' + esc(r.callsign) + '\')">拉黑</button>';
         }]
       ], users);
       // ② 连接明细
@@ -228,8 +228,8 @@
         ['操作', function (r) {
           var who = esc(r.callsign || r.username || '');
           var cid = esc(r.clientid || '');
-          var b = '<button class="btn ghost" onclick="BAS.kick(\'' + cid + '\')">踢下线</button>';
-          if (who) b += ' <button class="btn danger" onclick="BAS.ban(\'' + who + '\')">拉黑</button>';
+          var b = '<button class="btn ghost" onclick="FUS.kick(\'' + cid + '\')">踢下线</button>';
+          if (who) b += ' <button class="btn danger" onclick="FUS.ban(\'' + who + '\')">拉黑</button>';
           return b;
         }]
       ], rows);
@@ -278,13 +278,13 @@
         ['设备数', function (r) { return r.clients || 0; }],
         ['最近出现', function (r) { return esc(r.last_seen); }],
         ['操作', function (r) {
-          return '<button class="btn ghost" onclick="BAS.detail(\'' + esc(r.name) + '\')">明细</button> ' +
-            '<button class="btn ghost" onclick="BAS.ban(\'' + esc(r.name) + '\')">拉黑</button>';
+          return '<button class="btn ghost" onclick="FUS.detail(\'' + esc(r.name) + '\')">明细</button> ' +
+            '<button class="btn ghost" onclick="FUS.ban(\'' + esc(r.name) + '\')">拉黑</button>';
         }]
       ];
       table($('t-lb'), cols, rows);
       $('lb-csv').onclick = function () {
-        csv('bas-leaderboard.csv', cols.slice(0, 7), rows);
+        csv('fus-leaderboard.csv', cols.slice(0, 7), rows);
       };
     });
   }
@@ -314,7 +314,7 @@
         ['字节', function (r) { return fmtBytes(r.bytes); }]
       ];
       table($('t-topics'), cols, rows);
-      $('tp-csv').onclick = function () { csv('bas-topics.csv', cols, rows); };
+      $('tp-csv').onclick = function () { csv('fus-topics.csv', cols, rows); };
     });
   }
 
@@ -386,7 +386,7 @@
       ];
       table($('t-audit'), cols, j.rows || []);
       if ($('au-csv')) {
-        $('au-csv').onclick = function () { csv('bas-audit.csv', cols, j.rows || []); };
+        $('au-csv').onclick = function () { csv('fus-audit.csv', cols, j.rows || []); };
       }
     });
     api('audit/stats').then(function (j) {
@@ -409,7 +409,7 @@
         }],
         ['原因', function (r) { return esc(r.reason); }],
         ['操作', function (r) {
-          return '<button class="btn ghost" onclick="BAS.unbanEx(\'' + esc(r.as) + '\',\'' +
+          return '<button class="btn ghost" onclick="FUS.unbanEx(\'' + esc(r.as) + '\',\'' +
             esc(r.who) + '\')">解封</button>';
         }]
       ], rows);
@@ -438,7 +438,7 @@
         ['时间', function (r) { return esc(r.created_at); }],
         ['操作', function (r) {
           if (r._stale) return '<span class="muted small">EMQX 中已无此封禁</span>';
-          return '<button class="btn ghost" onclick="BAS.unban(\'' + esc(r.who) + '\')">解封</button>';
+          return '<button class="btn ghost" onclick="FUS.unban(\'' + esc(r.who) + '\')">解封</button>';
         }]
       ], rows);
       if ($('bl-sum')) {
@@ -454,7 +454,7 @@
       table($('t-wl'), [
         ['呼号', function (r) { return '<b>' + esc(r.callsign) + '</b>'; }],
         ['操作', function (r) {
-          return '<button class="btn ghost" onclick="BAS.wlRemove(\'' + esc(r.callsign) +
+          return '<button class="btn ghost" onclick="FUS.wlRemove(\'' + esc(r.callsign) +
             '\')">移出白名单</button>';
         }]
       ], rows);
@@ -484,7 +484,7 @@
         ['状态', function (r) { return esc(r.status); }],
         ['操作', function (r) {
           return r.status === 'pending'
-            ? '<button class="btn primary" onclick="BAS.release(' + r.id + ')">放行</button>'
+            ? '<button class="btn primary" onclick="FUS.release(' + r.id + ')">放行</button>'
             : '';
         }]
       ], j.rows || []);

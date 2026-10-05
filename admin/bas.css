@@ -1,4 +1,4 @@
-/* BAS 审计控制台样式（风格对齐分系统管理后台：深色 + 青蓝强调色） */
+/* FUS 审计控制台样式（风格对齐分系统管理后台：深色 + 青蓝强调色） */
 :root{
   --bg:#0f1720; --panel:#16202b; --panel2:#1c2836; --line:#26374a;
   --text:#e6eef7; --muted:#8aa0b6; --accent:#22d3ee; --accent2:#0ea5b7;
@@ -87,3 +87,9 @@ input[type=checkbox]{min-width:auto;width:auto}
 .login-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;width:340px}
 .login-card input{width:100%;min-width:auto}
 .login-card .btn{width:100%;margin-top:10px}
+
+/* 页脚：系统名 + 中英署名 */
+.foot{margin:26px 0 18px;padding:14px 12px;text-align:center;border-top:1px solid var(--line);line-height:1.7}
+.foot-name{font-size:14px;font-weight:600;letter-spacing:.3px}
+.foot-cn{font-size:12.5px;opacity:.85;margin-top:2px}
+.foot-credit{font-size:12px;opacity:.6;margin-top:8px}

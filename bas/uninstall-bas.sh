@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  BAS 卸载（认证 + 审计一体）
+#  FUS 卸载（认证 + 审计一体）
 #
 #  用法:
 #    curl -fsSL <BASE>/bas/uninstall-bas.sh | sudo bash                # 保留数据
@@ -41,7 +41,7 @@ info() { printf "${CYAN}%s${NC}\n" "$*"; }
 [ "$(id -u)" -eq 0 ] || { err "需要 root：curl -fsSL <BASE>/bas/uninstall-bas.sh | sudo bash"; exit 1; }
 
 echo "======================================"
-echo "  BAS 卸载   模式: $( [ "$PURGE" = "1" ] && echo 彻底删除 || echo 保留数据 )"
+echo "  FUS 卸载   模式: $( [ "$PURGE" = "1" ] && echo 彻底删除 || echo 保留数据 )"
 echo "======================================"
 
 # 1) 停止并移除服务单元
@@ -110,9 +110,9 @@ fi
 echo ""
 echo "======================================"
 if [ "$PURGE" = "1" ]; then
-    ok "BAS 已彻底卸载"
+    ok "FUS 已彻底卸载"
 else
-    ok "BAS 服务已移除，数据保留"
+    ok "FUS 服务已移除，数据保留"
     echo "  彻底删除数据: 同上命令加 --purge"
     echo "  数据位置    : $INSTALL_DIR"
 fi

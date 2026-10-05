@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  BAS 一键安装（FMO 认证 + 审计一体，纯 Python，无 .NET）
+#  FUS 一键安装（FMO 认证 + 审计一体，纯 Python，无 .NET）
 #
 #  用法（推荐一行）:
 #    curl -fsSL <BASE>/install-bas.sh | sudo bash
@@ -9,8 +9,8 @@
 #    1) 扫描本机**原有的 SAS（分系统认证）与 FAS（.NET 审计）**
 #    2) 备份旧数据（数据库 / CA 私钥 / 配置 → tar.gz）
 #    3) 安全停用并卸载旧系统（含清理 EMQX 上旧 FAS 的规则与桥接）
-#    4) 安装新的 BAS：单进程、单端口、单登录、单库，审计能力内嵌
-#    5) 把旧 FAS 的 EMQX 配置迁移到 BAS
+#    4) 安装新的 FUS：单进程、单端口、单登录、单库，审计能力内嵌
+#    5) 把旧 FAS 的 EMQX 配置迁移到 FUS
 #    6) 联合自检
 #
 #  常用参数:
@@ -19,7 +19,7 @@
 #    --no-backup       跳过备份（不推荐）
 #    --purge           卸载旧系统时同时删除旧 FAS 低权用户 fmo-audit
 #    --yes             不询问，直接按默认执行
-#    --mode sas|fas|both   安装范围（默认 both；新 BAS 两者一体，通常不用改）
+#    --mode sas|fas|both   安装范围（默认 both；新 FUS 两者一体，通常不用改）
 #
 #  可用环境变量:
 #    FMO_BASE_URL 覆盖下载根地址      FMO_DIR 分系统安装目录
@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.7.5"
+BAS_VERSION="1.7.6"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -90,7 +90,7 @@ cleanup() { [ -n "$TMP" ] && rm -rf "$TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "======================================"
-echo "  BAS 一键安装 v${BAS_VERSION}"
+echo "  FUS 一键安装 v${BAS_VERSION}  (FMO Unified Security Server / FMO 统一安全服务端)"
 echo "  认证(SAS) + 审计(FAS) 一体 · 纯 Python"
 echo "  分发地址: $BASE_URL"
 echo "======================================"
@@ -102,7 +102,7 @@ fi
 for c in curl tar mktemp; do
     command -v "$c" >/dev/null 2>&1 || die "缺少命令: $c"
 done
-find_python || die "未找到 python3（BAS 需要 Python 3.6+）"
+find_python || die "未找到 python3（FUS 需要 Python 3.6+）"
 TMP="$(mktemp -d)"
 
 # ══════════════════════════════════════════════════════════════
@@ -134,7 +134,7 @@ fi
 # 2) 迁移旧系统（备份 → 卸载）
 # ══════════════════════════════════════════════════════════════
 if [ "$KEEP_OLD" = "1" ]; then
-    warn "[2/7] --keep-old：跳过卸载旧系统（新 BAS 可能与管理端口/规则冲突）"
+    warn "[2/7] --keep-old：跳过卸载旧系统（新 FUS 可能与管理端口/规则冲突）"
 elif [ "$SAS_FOUND" = "0" ] && [ "$FAS_FOUND" = "0" ]; then
     info ""
     info "[2/7] 未发现旧系统，无需迁移"
@@ -152,16 +152,16 @@ else
     [ "$NO_BACKUP" = "1" ] && MIG_ARGS+=(--no-backup)
     [ "$PURGE" = "1" ] && MIG_ARGS+=(--purge)
     if ! "$PY" "${MIG_ARGS[@]}" | sed 's/^/    /'; then
-        warn "      迁移过程有错误（见上），继续安装新 BAS；旧数据备份若已生成可手工恢复"
+        warn "      迁移过程有错误（见上），继续安装新 FUS；旧数据备份若已生成可手工恢复"
     fi
     ok "      旧系统已处理完毕"
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 3) 安装新的 BAS（下载分系统包并安装；审计模块随包一起落地）
+# 3) 安装新的 FUS（下载分系统包并安装；审计模块随包一起落地）
 # ══════════════════════════════════════════════════════════════
 info ""
-info "[3/7] 安装 BAS 主程序（分系统 + 内嵌审计）..."
+info "[3/7] 安装 FUS 主程序（分系统 + 内嵌审计）..."
 SUBSYS_INSTALL_URL="$BASE_URL/install.sh"
 curl -fsSL "$SUBSYS_INSTALL_URL" -o "$TMP/install.sh" \
     || die "下载安装脚本失败（$SUBSYS_INSTALL_URL）"
@@ -181,14 +181,14 @@ done
 [ -n "$INSTALL_DIR" ] || die "找不到安装目录（api_server.py 不存在）"
 info "      安装目录: $INSTALL_DIR"
 
-# 审计模块必须随包存在（新 BAS 的审计能力靠它们，不再需要 .NET）
+# 审计模块必须随包存在（新 FUS 的审计能力靠它们，不再需要 .NET）
 for m in bas_audit.py bas_audit_db.py bas_emqx.py bas_http.py bas_identity.py bas_fmo_parser.py; do
     [ -f "$INSTALL_DIR/$m" ] || die "缺少审计模块 $m —— 发布包不完整，请重新打包"
 done
 ok "      审计模块齐全（${INSTALL_DIR}/bas_*.py）"
 
 # ══════════════════════════════════════════════════════════════
-# 4) 迁移旧 FAS 的 EMQX 配置到 BAS
+# 4) 迁移旧 FAS 的 EMQX 配置到 FUS
 # ══════════════════════════════════════════════════════════════
 info ""
 info "[4/7] 迁移 EMQX 配置并建立收数链路..."
@@ -346,7 +346,7 @@ fi
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo ""
 echo "======================================"
-echo "  BAS 安装完成"
+echo "  FUS 安装完成"
 echo "  认证(SAS): http://<公网IP>:$SUBSYS_PORT        （APP 注册/登录、EMQX 认证 /auth）"
 echo "  审计界面 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/bas"
 echo "  策略模式 : warn（只告警留证，不会自动封人；确认无误封后再去界面切 ban）"
