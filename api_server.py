@@ -2535,14 +2535,16 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         """
         下载本机 Root CA 完整证书（自签，含 signature）。
 
-        用途：别的 FMO 服务器要信任本机签发的证书（含国服绑定流程签发的证书），
-        就要把本机根证书放进它的 roots/ 目录。**根证书是公开信息**——公钥本来就
-        存在于每张已签发证书的链里，私钥 ca_private.json 绝不外发。
+        用途：别的 FMO 服务器（多为**官方 SAS**）要信任本机签发的证书（含国服绑定
+        流程签发的），就要把本机根证书放进它的信任目录。**根证书是公开信息**——
+        公钥本来就存在于每张已签发证书的链里，私钥 ca_private.json 绝不外发。
 
-        对方拿到后：
-            curl -fsS http://<本机IP>:35928/api/ca/root.json \
-              | python3 -c "import json,sys;json.dump(json.load(sys.stdin)['cert'],open('MY.root.json','w'),indent=2)"
-            cp MY.root.json <对方>/roots/ && 重启
+        两种取法：
+          · ?raw=1  直接返回**裸证书 JSON**（官方 SAS 的 RootsDir 要的就是它），
+                    对方一条命令落盘即可：
+              curl -fsS -o BH6BHG-CA.json "http://<本机>:35928/api/ca/root.json?raw=1"
+              sudo cp BH6BHG-CA.json /root/.sas/roots/ && sudo systemctl restart fmo-sas
+          · 不带参数  返回带元信息的包装（ca_name/fingerprint/usage），证书在 cert 字段
         """
         sas_db, ca_mgr = self._require_sas()
         if sas_db is None:
@@ -2552,7 +2554,12 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': False,
                             'error': '本机 CA 未初始化，无法下载根证书'}, 503)
             return
-        self.send_json(payload)
+        # ?raw=1 → 裸证书 JSON（官方 SAS RootsDir 期望的文件格式）
+        qs = parse_qs(urlparse(self.path).query)
+        if str((qs.get('raw') or [''])[0]).lower() in ('1', 'true', 'yes'):
+            self.send_json(payload['cert'])
+        else:
+            self.send_json(payload)
         print("[CA] 根证书已被下载：%s fp=%s（根证书是公开信息，私钥不外发）"
               % (payload['ca_name'], payload['fingerprint'][:24]))
 

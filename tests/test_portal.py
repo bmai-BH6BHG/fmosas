@@ -204,6 +204,13 @@ class RootCertPayloadTests(unittest.TestCase):
         p = self._payload()
         self.assertIsInstance(p["fingerprint"], str)
 
+    def test_raw_mode_supported_for_official_sas_rootsdir(self):
+        """官方 SAS 的 Trust.RootsDir 要的是裸证书 JSON，用 ?raw=1 直接落盘。"""
+        src = _read_root("api_server.py")
+        handler = src.split("def _handle_sas_ca_root_json", 1)[1].split("    def ", 1)[0]
+        self.assertIn("raw", handler, "缺少 ?raw=1 裸证书模式")
+        self.assertIn("payload['cert']", handler)
+
     def test_install_scripts_know_portal(self):
         for name in ("install.sh", "build_release.sh"):
             src = _read_root(name)
