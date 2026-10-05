@@ -295,6 +295,7 @@ class MqttMiniClient:
         self._sock = None
         self._buf = b""
         self._last_io = 0.0
+        self._last_send = 0.0        # 上次**发包**时间（keepalive 必须按它算，见 poll_once）
         self._pkt_id = 0
 
     # ---- 底层 ----
@@ -339,6 +340,7 @@ class MqttMiniClient:
     def _send(self, data):
         self._sock.sendall(data)
         self._last_io = time.time()
+        self._last_send = time.time()
 
     # ---- 协议 ----
     def connect(self, timeout=10):
@@ -387,12 +389,22 @@ class MqttMiniClient:
 
     def poll_once(self):
         """读取并分发一个包（无包时约 5s 超时返回 False）。异常抛出让上层重连。"""
+        # ★ keepalive 必须按「上次**发包**时间」判断，不能按 _last_io（收发都刷新）。
+        #   真实事故：本机订阅 FMO/RAW 流量不断 → _read_packet() 永远有包返回 →
+        #   下面那个「空闲才 ping」的分支永远走不到 → 服务端视角是"客户端一直没发东西"，
+        #   EMQX 按 1.5×keepalive（60s→90s）判定超时，每 ~2 分钟把监控踢掉一次。
+        #   客户端收得多 ≠ 客户端活着。
+        try:
+            if time.time() - self._last_send > max(self.keepalive * 0.6, 10):
+                self.ping()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             pkt = self._read_packet()
         except socket.timeout:
             pkt = None
         if pkt is None:
-            if time.time() - self._last_io > max(self.keepalive * 0.6, 10):
+            if time.time() - self._last_send > max(self.keepalive * 0.6, 10):
                 self.ping()
             return False
         ptype = pkt[0] >> 4

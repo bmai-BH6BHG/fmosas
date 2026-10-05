@@ -40,9 +40,17 @@ APRS_LOGIN = b"user FMO-MON pass -1 vers FMO-FUS 1.0\r\n"
 APRS_STATIONS_FILE = "aprs_stations.json"
 
 READ_TIMEOUT = 30.0                  # socket 读超时（APRS 平时也在心跳）
-RECONNECT_MIN = 5.0
-RECONNECT_MAX = 120.0
+RECONNECT_MIN = 30.0                 # 断线后最少等这么久再连（防重连风暴）
+RECONNECT_MAX = 300.0
 SAVE_INTERVAL = 30.0                 # 落盘节流
+
+# ---- 探测节流（真实事故：一开始每次 APRS 重连都全量重探，104 个台站 ×
+#      频繁重连 = 每秒 8 个 MQTT 连接，把自己 broker 也探了，把监控连接挤掉）----
+PROBE_MIN_INTERVAL = 0.5             # 两次探测之间至少间隔（秒）→ 最多 2 个/秒
+SWEEP_MIN_AGE = 900.0                # 只重探「超过 15 分钟没探过」的台站
+SWEEP_MAX_PER_ROUND = 20             # 每轮最多探这么多个，避免一次打出去一堆
+SWEEP_MIN_INTERVAL = 300.0           # 两轮全量重探之间至少 5 分钟
+PROBE_WORKERS = 3                    # 并发数（越小越温和）
 
 _HOST_RE = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
@@ -399,6 +407,31 @@ def probe_all(store, base_dir, timeout=MQTT_PROBE_TIMEOUT, workers=8,
     return (good if only_enterable else allst), summary
 
 
+def base_callsign(cs):
+    """
+    呼号去掉 SSID 后缀：BH6BHG-15 → BH6BHG。
+
+    APRS 上自己的台站是**带 -SSID** 的（如 BH6BHG-15），而我们从站点名片拿到的
+    本机呼号是不带后缀的（BH6BHG）。不归一化就会漏判成"别人"，把自己的 broker
+    当成外部台站反复探测 —— 真实事故：就是这条把自己监控连接挤掉、看起来像断联。
+    """
+    return str(cs or "").strip().upper().split("-")[0]
+
+
+def is_self_host(host, self_hosts):
+    """host 是否属于本机域名/IP（含子域后缀匹配）。"""
+    h = str(host or "").strip().lower().split(":")[0]
+    if not h:
+        return False
+    for mine in (self_hosts or ()):
+        m = str(mine or "").strip().lower().split(":")[0]
+        if not m:
+            continue
+        if h == m or h.endswith("." + m) or m.endswith("." + h):
+            return True
+    return False
+
+
 class AprsStationStore(object):
     """APRS 台站台账：按呼号累积 + 落盘（重启不丢，长期才能攒到几百个）。"""
 
@@ -549,12 +582,41 @@ class AprsCollector(threading.Thread):
         self._pool = None
         self._probe_cert = None
         self._last_sweep = 0.0
+        self._last_probe_at = 0.0
+        self._self_hosts = set()      # 自己的域名/IP：绝不探测自己
+        self._self_callsigns = set()  # 自己的台站呼号
+
+    def set_self(self, hosts=None, callsigns=None):
+        """登记「自己」：探测时跳过，避免拿自己的证书反复连自家 broker
+        （真实事故：探自己把本机监控的 MQTT 连接挤掉，表现为服务断联）。"""
+        with self._lock:
+            for h in (hosts or []):
+                h = str(h or "").strip().lower().split(":")[0]
+                if h:
+                    self._self_hosts.add(h)
+            for c in (callsigns or []):
+                b = base_callsign(c)
+                if b:
+                    self._self_callsigns.add(b)
+            if self._self_callsigns:
+                self.log("[APRS] 自我保护已启用: hosts=%s callsigns=%s"
+                         % (sorted(self._self_hosts), sorted(self._self_callsigns)))
+
+    def is_self(self, st):
+        host = str(st.get("host") or "").strip().lower().split(":")[0]
+        cs = base_callsign(st.get("callsign"))
+        with self._lock:
+            if host and is_self_host(host, self._self_hosts):
+                return True
+            if cs and cs in self._self_callsigns:
+                return True
+        return False
 
     def _ensure_pool(self):
         if self._pool is None:
             try:
                 from concurrent.futures import ThreadPoolExecutor
-                self._pool = ThreadPoolExecutor(max_workers=8,
+                self._pool = ThreadPoolExecutor(max_workers=PROBE_WORKERS,
                                                 thread_name_prefix="aprs-probe")
             except Exception:  # noqa: BLE001
                 self._pool = None
@@ -597,7 +659,15 @@ class AprsCollector(threading.Thread):
 
     # ---------- 探测（发现即探） ----------
     def _probe_one(self, st):
-        """探测单个台站（真实登录），结果写回台账。"""
+        """探测单个台站（真实登录），结果写回台账。带全局节流。"""
+        if self.is_self(st):
+            return                       # 绝不探自己
+        # 全局节流：两次探测之间至少 PROBE_MIN_INTERVAL，避免打爆对端与本机
+        with self._lock:
+            wait = PROBE_MIN_INTERVAL - (time.time() - self._last_probe_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_probe_at = time.time()
         if self._probe_cert is None:
             self._probe_cert = load_probe_cert(self.base_dir)
         if not self._probe_cert:
@@ -618,6 +688,8 @@ class AprsCollector(threading.Thread):
             self.log("[APRS] 探测失败 %s: %s" % (st.get("callsign"), e))
 
     def _submit_probe(self, st):
+        if self.is_self(st):
+            return
         pool = self._ensure_pool()
         if pool is None:
             self._probe_one(st)
@@ -627,19 +699,38 @@ class AprsCollector(threading.Thread):
             except Exception:  # noqa: BLE001
                 self._probe_one(st)
 
-    def sweep(self, force=False, min_interval=60.0):
+    def sweep(self, force=False, min_interval=None):
         """
-        全量重探一遍台账里的台站（限流：默认最多每 60 秒一轮）。
-        常驻运行时会自动周期性调用；也是页面「扫描全部台站」的即时动作。
+        挑**该重探**的台站探一轮（限流，绝不一次全打出去）。
+
+        规则：
+          · 只挑「从没探过」或「上次探测早于 SWEEP_MIN_AGE」的台站
+          · 每轮最多 SWEEP_MAX_PER_ROUND 个
+          · 两轮之间至少 SWEEP_MIN_INTERVAL
+          · 跳过自己
+        returns 本轮提交数量
         """
         now = time.time()
-        if not force and (now - self._last_sweep) < min_interval:
+        gap = SWEEP_MIN_INTERVAL if min_interval is None else float(min_interval)
+        if not force and (now - self._last_sweep) < gap:
             return 0
         self._last_sweep = now
-        stations = self.store.all()
-        for st in stations:
+        cands = []
+        for st in self.store.all():
+            if self.is_self(st):
+                continue
+            probed_at = st.get("probed_at")
+            if not probed_at or (now - float(probed_at)) > SWEEP_MIN_AGE:
+                cands.append(st)
+        # 从没探过的优先，其次最久没探的
+        cands.sort(key=lambda s: float(s.get("probed_at") or 0))
+        picked = cands[:SWEEP_MAX_PER_ROUND]
+        for st in picked:
             self._submit_probe(st)
-        return len(stations)
+        if picked:
+            self.log("[APRS] 重探一轮: 候选 %d，本轮探 %d（最多 %d/轮，间隔 %.0fs）"
+                     % (len(cands), len(picked), SWEEP_MAX_PER_ROUND, gap))
+        return len(picked)
 
     # ---------- 主循环 ----------
     def run(self):
@@ -664,13 +755,14 @@ class AprsCollector(threading.Thread):
             self._set_state("connected")
             self.log("[APRS] 已连接 %s:%d，**不限时持续扫描** FMO 台站"
                      "（当前台账 %d 个）" % (self.host, self.port, self.store.count()))
-            # 连上先对已有台账做一轮全量重探
-            self.sweep(force=True)
+            # 只补探「从没探过/很久没探」的，**不再每次重连都全量重探**
+            # （真实事故：APRS 断线频繁 + 每次重连全量重探 104 个 → 每秒 8 个连接）
+            self.sweep()
             buf = b""
             last_sweep = time.time()
             while not self._stop.is_set():
-                # 周期性重探（久没验过的台站可能已经关了/开了）
-                if time.time() - last_sweep > 120.0:
+                # 周期性补探（自带限流与每轮上限）
+                if time.time() - last_sweep > 180.0:
                     last_sweep = time.time()
                     self.sweep()
                 try:
@@ -773,10 +865,18 @@ def build_aprs_station_payload(store, collector=None, config=None, now=None,
     only_enterable=True → 只回「能进入」的台站（进不去的不显示）。
     未探测过的台站（reachable 为 None）在 only_enterable 模式下会被排除，
     避免把没验过的站当成能进的显示出去。
+
+    自己的台站（如 BH6BHG-15）一律不列出 —— 那是本机，不是「可以进入的外站」。
     """
     now = now or time.time()
     out = []
     for st in store.all():
+        if collector is not None:
+            try:
+                if collector.is_self(st):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
         entry = dict(st)
         entry["entry_url"] = station_entry_url(st)
         entry["mqtt_addr"] = station_mqtt_addr(st)

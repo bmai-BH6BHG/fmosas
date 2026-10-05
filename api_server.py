@@ -2678,9 +2678,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if coll is not None:
             restarted = coll.ensure_running()
             try:
-                swept = coll.sweep(force=True)
+                # 不清空台账、不强制全量重探：只挑「没探过/很久没探」的补探一批
+                swept = coll.sweep(force=True, min_interval=0)
             except Exception as e:  # noqa: BLE001
-                print("[APRS] 全量重探提交失败: %s" % e)
+                print("[APRS] 补探提交失败: %s" % e)
         payload = fmo_aprs.build_aprs_station_payload(
             store, coll, CONFIG, only_enterable=True)
         payload['scan'] = {'continuous': True, 'restarted': restarted,
@@ -2994,6 +2995,32 @@ def main():
             aprs_store = fmo_aprs.AprsStationStore(BASE_DIR)
             aprs_collector = fmo_aprs.AprsCollector(aprs_store, logger=print,
                                                     base_dir=BASE_DIR)
+            # 登记「自己」：探测时跳过，避免拿自己的证书反复连自家 broker
+            # （真实事故：探自己把本机监控的 MQTT 连接挤掉 → 看起来像服务断联）
+            _self_hosts = [str(CONFIG.get('app_domain') or ''),
+                           str(CONFIG.get('domain') or ''),
+                           'localhost', '127.0.0.1']
+            try:
+                _self_hosts.append(socket.gethostbyname(socket.gethostname()))
+            except Exception:  # noqa: BLE001
+                pass
+            # master_url / api_url 里的域名也算自己（本机对外可能有好几个名字）
+            for _key in ('master_url', 'api_url'):
+                _u = str(CONFIG.get(_key) or '')
+                if '://' in _u:
+                    _u = _u.split('://', 1)[1]
+                _self_hosts.append(_u.split('/')[0].split(':')[0])
+            _self_cs = []
+            try:
+                if monitor is not None and getattr(monitor, 'stations', None):
+                    for _st in monitor.stations():
+                        if _st.get('callsign'):
+                            _self_cs.append(_st['callsign'])
+            except Exception:  # noqa: BLE001
+                pass
+            # 本机自己的站点名片呼号（BH6BHG）；APRS 上是带 SSID 的 BH6BHG-15，
+            # fmo_aprs.base_callsign() 会归一化后再比对
+            aprs_collector.set_self(hosts=_self_hosts, callsigns=_self_cs)
             aprs_collector.start()
             print("[INIT] APRS 台站采集: 已启动（%s:%d），台账现有 %d 个台站"
                   % (fmo_aprs.APRS_HOST, fmo_aprs.APRS_PORT, aprs_store.count()))

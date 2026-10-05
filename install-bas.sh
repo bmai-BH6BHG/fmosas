@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # ============================================================
 #  FUS 一键安装（FMO 认证 + 审计一体，纯 Python，无 .NET）
 #
@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.2"
+BAS_VERSION="1.8.3"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
