@@ -45,6 +45,7 @@ CLEAN_INTERVAL_SEC = 3600  # 过期数据清理间隔
 MONITOR_CERT_FILE = "monitor_cert.json"
 MONITOR_CALLSIGN = "SERVER"
 SERVER_INFO_FILE = "server_info.json"   # MQTT SERVER_INFO 抄收的服务器名持久化
+STATIONS_FILE = "stations.json"         # FMO 站点目录（可进入的中继/服务器）
 RECENT_DONE_SEC = 30.0       # 收尾段在内存中保留时长（供流式播放取尾部）
 
 _CONST5 = b"\x3d\x14\x00\xe0\x3d"
@@ -208,6 +209,50 @@ def parse_tele(p):
         "freq1": round(struct.unpack_from("<f", p, 25)[0], 4),
         "freq2": round(struct.unpack_from("<f", p, 29)[0], 4),
     }
+
+
+# -------------------- FMO/SERVER_INFO（站点名片，二进制） --------------------
+# 报文结构（对照真实报文逐个字节核对过，两个真实站点 + 本机站点）：
+#   [0]     版本（0x00 / 0x01）
+#   [1:5]   站点编号（uint32 LE；实测 2 / 4 / 7）
+#   [5:9]   站内计数（uint32 LE；实测 16 / 9 / 23）
+#   [9:21]  呼号，12 字节，NUL 补齐（与 FMO/RAW 头的 callsign[12] 一致）
+#   [21:]   站名、简介：NUL 分隔的 UTF-8 串，依次为「站名」「欢迎语/简介」
+#
+# 真实样本：
+#   BH6BHG → 站号2  安铜集群(铜陵FMO站) / 欢迎来到八百里皖江本中继与安庆中继互联
+#   BI7IOB → 站号4  FMRS
+#   BH8GYP → 站号7  重庆互联中继
+#
+# ⚠️ 老代码把它当 JSON/文本解析（_parse_server_name 直接 decode 整包），
+#    于是站名变成「\x00\x02\x00\x00…BH6BHG…安铜集群…」一整坨乱码，
+#    因为 NUL 能正常 decode、逃过了 \ufffd 检查。这里改为按二进制字段解析。
+
+def parse_server_info(p):
+    """解析 FMO/SERVER_INFO 站点名片。失败返回 None。"""
+    if not p or len(p) < 21:
+        return None
+    try:
+        callsign = p[9:21].split(b"\x00")[0].decode("utf-8", "replace").strip()
+        runs = []
+        for part in p[21:].split(b"\x00"):
+            if not part:
+                continue
+            text = part.decode("utf-8", "replace").strip()
+            if text and "\ufffd" not in text:
+                runs.append(text)
+        if not callsign and not runs:
+            return None
+        return {
+            "ver": p[0],
+            "station_no": struct.unpack_from("<I", p, 1)[0],
+            "counter": struct.unpack_from("<I", p, 5)[0],
+            "callsign": callsign,
+            "name": runs[0] if runs else "",
+            "desc": runs[1] if len(runs) > 1 else "",
+        }
+    except Exception:
+        return None
 
 
 # -------------------- 最小 MQTT 3.1.1 客户端（QoS0，stdlib） --------------------
@@ -563,6 +608,7 @@ class VoiceMonitor(threading.Thread):
         self._last_clean = 0.0
         self._last_retry = 0.0
         self.server_name, self.server_desc = self._load_server_info()
+        self._stations = self._load_stations()   # 站点目录：呼号 -> 站点名片
         self._server_info_raw = ""   # 最近一次 SERVER_INFO 原始报文（诊断用）
         self._client = None          # 当前 MQTT 连接（界面热更新地址时断开它触发重连）
 
@@ -668,8 +714,14 @@ class VoiceMonitor(threading.Thread):
 
     def _on_server_info(self, payload):
         self._server_info_raw = repr(payload[:200])
-        name = self._parse_server_name(payload)
-        desc = self._parse_server_desc(payload)
+        # 优先按二进制站点名片解析（正确姿势）；失败再退回老的宽容文本解析
+        info = parse_server_info(payload)
+        if info:
+            name, desc = info.get("name", ""), info.get("desc", "")
+            self._note_station(info)
+        else:
+            name = self._parse_server_name(payload)
+            desc = self._parse_server_desc(payload)
         if not name and not desc:
             # 低频主题，打原始报文方便诊断 APP 实际发布格式
             log("MONITOR", "SERVER_INFO 无法解析，原始报文(%dB): %r"
@@ -692,6 +744,60 @@ class VoiceMonitor(threading.Thread):
                            "ts": time.time()}, f, ensure_ascii=False)
         except Exception as e:
             log("MONITOR", "服务器信息持久化失败: %s" % e)
+
+    # ---------- 站点目录（可进入的 FMO 中继/服务器） ----------
+    def _stations_path(self):
+        return os.path.join(self.base_dir, STATIONS_FILE)
+
+    def _load_stations(self):
+        try:
+            with open(self._stations_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_stations(self):
+        try:
+            with open(self._stations_path(), "w", encoding="utf-8") as f:
+                json.dump(self._stations, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log("MONITOR", "站点目录持久化失败: %s" % e)
+
+    def _note_station(self, info):
+        """把一张站点名片累积进目录。
+
+        为什么要累积：SERVER_INFO 是**全网广播的站点名片**，老代码只留最后一条，
+        于是「可进入的站点」永远只有 1 个。按呼号累积才能形成站点列表。
+        """
+        cs = str(info.get("callsign") or "").strip().upper()
+        if not cs:
+            return
+        with self._lock:
+            old = self._stations.get(cs) or {}
+            self._stations[cs] = {
+                "callsign": cs,
+                "name": info.get("name") or old.get("name") or "",
+                "desc": info.get("desc") or old.get("desc") or "",
+                "station_no": info.get("station_no", old.get("station_no")),
+                "counter": info.get("counter", old.get("counter")),
+                "ver": info.get("ver", old.get("ver")),
+                "first_seen": old.get("first_seen") or time.time(),
+                "last_seen": time.time(),
+                "hits": int(old.get("hits") or 0) + 1,
+            }
+            should_save = (old.get("name") != info.get("name")
+                           or old.get("desc") != info.get("desc"))
+        if should_save:
+            log("MONITOR", "登记 FMO 站点: %s 「%s」站号=%s"
+                % (cs, info.get("name", ""), info.get("station_no")))
+            self._save_stations()
+
+    def stations(self):
+        """站点目录（最近出现的在前）"""
+        with self._lock:
+            return sorted((dict(v) for v in self._stations.values()),
+                          key=lambda x: x.get("last_seen") or 0, reverse=True)
 
     # ---------- 状态 ----------
     def status(self):

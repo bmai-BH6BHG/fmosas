@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FMO 站点 · 可以进入的中继</title>
+<link rel="stylesheet" href="/admin/bas.css">
+<style>
+  /* 站点卡片：一屏能看清「叫什么、是谁、多少人、进不进得去」 */
+  .st-grid {
+    display: grid; gap: 14px; margin: 12px 0;
+    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  }
+  .st-card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 9px;
+    position: relative; overflow: hidden;
+    transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  }
+  .st-card::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+    background: linear-gradient(90deg, transparent, var(--tint, #22d3ee), transparent);
+  }
+  .st-card:hover {
+    border-color: var(--tint, #22d3ee);
+    box-shadow: 0 10px 30px #0006, 0 0 22px -8px var(--tint, #22d3ee);
+    transform: translateY(-2px);
+  }
+  .st-card.self   { --tint: #22c55e; }
+  .st-card.online { --tint: #22d3ee; }
+  .st-card.offline{ --tint: #64748b; }
+
+  .st-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .st-name { font-size: 17px; font-weight: 700; color: var(--text); }
+  .st-card.self .st-name { color: #22c55e; }
+  .st-cs {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+    color: var(--accent); padding: 1px 7px; border-radius: 4px;
+    border: 1px solid var(--line); background: var(--panel2);
+  }
+  .st-no {
+    font-size: 11.5px; color: var(--muted); padding: 1px 7px;
+    border-radius: 999px; border: 1px solid var(--line);
+  }
+  .st-desc {
+    font-size: 12.5px; color: var(--muted); line-height: 1.6;
+    min-height: 20px; word-break: break-word;
+  }
+  .st-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .st-meta b { color: var(--text); font-weight: 600; }
+  .st-foot {
+    margin-top: auto; padding-top: 10px; border-top: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .st-url {
+    font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+    color: var(--muted); word-break: break-all; flex: 1; min-width: 140px;
+  }
+  .st-enter {
+    background: var(--accent); color: #04222a; border: 0; border-radius: 6px;
+    padding: 7px 14px; font-weight: 700; font-size: 13px; cursor: pointer;
+    text-decoration: none; white-space: nowrap;
+  }
+  .st-enter:hover { filter: brightness(1.08); }
+  .st-enter.disabled {
+    background: var(--panel2); color: var(--muted);
+    border: 1px solid var(--line); cursor: not-allowed; filter: none;
+  }
+  .pill {
+    font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .pill.on  { color: var(--ok); border-color: var(--ok); }
+  .pill.off { color: var(--muted); }
+  .pill.self{ color: #22c55e; border-color: #22c55e; }
+  .empty {
+    padding: 26px; text-align: center; color: var(--muted);
+    border: 1px dashed var(--line); border-radius: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">FMO 站点 <span class="muted">可以进入的中继 / 服务器</span></div>
+  <div class="top-right">
+    <span class="badge" id="st-count">—</span>
+    <label class="muted small" style="display:flex;align-items:center;gap:6px;margin:0;">
+      <input type="checkbox" id="st-auto" checked> 自动刷新(15s)
+    </label>
+    <button class="btn ghost" id="st-reload">刷新</button>
+    <a class="btn ghost" href="/admin">← 返回门户</a>
+  </div>
+</header>
+
+<main>
+  <p class="muted small" style="margin:6px 0 0;">
+    每个 FMO 站就是 MQTT 上的一个「房间」：拿证书连上该站的 broker 即等于进入。
+    站点名片来自各站广播的 <code>FMO/SERVER_INFO</code>；用户数/在线数来自总系统登记。
+  </p>
+  <div id="st-src" class="muted small" style="margin:8px 0;"></div>
+
+  <div id="st-grid" class="st-grid"></div>
+  <div id="st-empty" class="empty hidden">还没有抄收到任何站点名片。</div>
+</main>
+
+<footer class="foot">
+  <div class="foot-name">FMO 站点目录 · FUS 分系统</div>
+  <div class="foot-cn">FMO 统一安全服务端 · SAS 认证 + FAS 审计</div>
+  <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
+  <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
+</footer>
+
+<script src="/admin/stations.js"></script>
+</body>
+</html>

@@ -99,6 +99,15 @@ except Exception as _e_bas:
     _BAS_AVAILABLE = False
     print("[INIT] bas_http 模块加载失败（审计子系统不可用）: %s" % _e_bas)
 
+# ==================== FMO 站点目录（可以进入的中继/服务器）====================
+try:
+    import fmo_stations
+    _STATIONS_AVAILABLE = True
+except Exception as _e_st:
+    fmo_stations = None
+    _STATIONS_AVAILABLE = False
+    print("[INIT] fmo_stations 模块加载失败（站点目录不可用）: %s" % _e_st)
+
 # ==================== 全局配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = None  # 稍后在 CONFIG 加载后基于域名/IP 动态设置
@@ -1128,6 +1137,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if self.handle_sync_routes('GET', self.path):
             return
 
+        # 管理后台静态资源（admin/*.js / *.css）。BAS 的 bas.js/bas.css 由
+        # bas_http 在前面处理；这里兜住其余页面（如 stations.js）。
+        if path.startswith('/admin/') and path.endswith(('.js', '.css')):
+            self._serve_admin_asset(path[len('/admin/'):])
+            return
         # 管理后台页面（由后端提供，内网访问）
         #   /admin             → FUS 门户（SAS / FAS 两个子系统入口）
         #   /admin/sas         → SAS 统一认证服务后台（原 /admin 的内容）
@@ -1138,6 +1152,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
         if path in ('/admin/sas', '/admin/sas/', '/admin/sas/index.html'):
             self._serve_admin_page()
+            return
+        if path in ('/admin/stations', '/admin/stations/',
+                    '/admin/stations/index.html'):
+            self._serve_admin_file('stations.html')
             return
         if path == '/admin/index.html':
             self.send_response(302)
@@ -1324,8 +1342,38 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_portal_page(self):
-        """FUS 门户页：SAS 系统 / FAS 系统 两个入口"""
+        """FUS 门户页：SAS 系统 / FAS 系统 / FMO 站点 三个入口"""
         self._serve_admin_file('portal.html')
+
+    def _serve_admin_asset(self, name):
+        """
+        提供 admin/ 目录下的 js/css 静态资源。
+
+        安全：只接受**纯文件名**且扩展名为 .js/.css —— 含路径分隔符、`..`、
+        隐藏文件一律拒绝，杜绝目录穿越（例如 /admin/../config.json）。
+        """
+        if (not name or '/' in name or '\\' in name or name.startswith('.')
+                or '..' in name or not name.endswith(('.js', '.css'))):
+            self.send_error(404, 'not found')
+            return
+        fp = os.path.join(BASE_DIR, 'admin', name)
+        if not os.path.isfile(fp):
+            self.send_error(404, 'not found')
+            return
+        ctype = ('application/javascript; charset=utf-8'
+                 if name.endswith('.js') else 'text/css; charset=utf-8')
+        try:
+            with open(fp, 'rb') as f:
+                body = f.read()
+        except Exception as e:  # noqa: BLE001
+            self.send_error(500, '读取失败: %s' % e)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_admin_page(self):
         """SAS 统一认证服务后台（原「管理后台」主页面）"""
@@ -1847,6 +1895,9 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         try:
             if method == 'POST' and path == '/auth':
                 self._handle_sas_auth()
+                return True
+            if method == 'GET' and path == '/api/fus/stations':
+                self._handle_fmo_stations()
                 return True
             if method == 'POST' and path == '/api/cert/bind':
                 self._handle_cert_bind()
@@ -2562,6 +2613,48 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.send_json(payload)
         print("[CA] 根证书已被下载：%s fp=%s（根证书是公开信息，私钥不外发）"
               % (payload['ca_name'], payload['fingerprint'][:24]))
+
+    # ---------- GET /api/fus/stations ----------
+    def _handle_fmo_stations(self):
+        """
+        FMO 站点目录：可以进入的中继/服务器。
+
+        三路数据合并（任一路挂掉页面仍可用）：
+          1. 本机 MQTT 抄收的站点名片（monitor 累积，实时）
+          2. 总系统 subsystems 表登记的站点（只读直连，同机部署）
+          3. 本机自身
+        """
+        if not _STATIONS_AVAILABLE:
+            self.send_json({'ok': False,
+                            'error': 'fmo_stations 模块不可用'}, 503)
+            return
+        try:
+            mon = getattr(self.__class__, 'monitor', None)
+            mqtt_stations = mon.stations() if mon is not None else []
+        except Exception:  # noqa: BLE001
+            mqtt_stations = []
+
+        # 本机站点 = 最近抄收到的那张站点名片（本机 broker 上的站就是本机）
+        self_info = {
+            'callsign': '',
+            'name': '',
+            'desc': '',
+            'domain': CONFIG.get('app_domain') or CONFIG.get('domain') or '',
+            'api_url': '',
+            'subsystem_id': CONFIG.get('subsystem_id') or '',
+        }
+        if mqtt_stations:
+            newest = mqtt_stations[0]
+            self_info['callsign'] = str(newest.get('callsign') or '').upper()
+            self_info['name'] = newest.get('name') or ''
+            self_info['desc'] = newest.get('desc') or ''
+        if CONFIG.get('app_domain'):
+            self_info['api_url'] = 'http://%s:%s' % (
+                CONFIG.get('app_domain'), CONFIG.get('app_port') or PORT)
+
+        payload = fmo_stations.build_station_payload(
+            CONFIG, mqtt_stations=mqtt_stations, self_info=self_info)
+        self.send_json(payload)
 
     # ---------- POST /api/ca/init ----------
     def _handle_sas_ca_init(self):

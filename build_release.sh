@@ -164,6 +164,7 @@ fi
 echo "[2/8] 预检查（必需文件 + shell 语法）..."
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
+         fmo_stations.py \
          config.default.json config.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh uploads/.gitkeep \
          CONTRACT.md dist/VERSION; do
@@ -171,6 +172,7 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
 done
 [ -e "$REPO/admin/index.html" ] || die "缺少必需文件: admin/index.html"
 [ -e "$REPO/admin/portal.html" ] || die "缺少必需文件: admin/portal.html（FUS 门户）"
+[ -e "$REPO/admin/stations.html" ] || die "缺少必需文件: admin/stations.html（FMO 站点页）"
 for S in install.sh uninstall.sh build_release.sh; do
     if ! bash -n "$REPO/$S"; then
         die "$S 语法检查未通过（bash -n）"
@@ -216,7 +218,8 @@ copy_path() {
 
 # 代码（契约必须包含）
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
-         gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py; do
+         gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
+         fmo_stations.py; do
     copy_path "$F" 1
 done
 # BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）

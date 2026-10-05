@@ -19,6 +19,7 @@
         --muted: #8aa0b6;
         --sas: #22d3ee;
         --fas: #a78bfa;
+        --st: #34d399;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -83,9 +84,9 @@
     /* ---------- 两个子系统入口 ---------- */
     .entries {
         width: 100%;
-        max-width: 900px;
+        max-width: 1240px;
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(3, 1fr);
         gap: 22px;
     }
     .entry {
@@ -112,6 +113,7 @@
     }
     .entry.sas { --tint: var(--sas); }
     .entry.fas { --tint: var(--fas); }
+    .entry.st  { --tint: var(--st); }
     .entry:hover {
         transform: translateY(-4px);
         border-color: var(--tint);
@@ -190,13 +192,16 @@
         text-align: center;
         border-top: 1px solid var(--line);
         width: 100%;
-        max-width: 900px;
+        max-width: 1240px;
         line-height: 1.8;
     }
     .foot-name { font-size: 14px; font-weight: 600; letter-spacing: .4px; color: #cfe9f5; }
     .foot-cn { font-size: 12.5px; opacity: .85; margin-top: 2px; color: var(--muted); }
     .foot-credit { font-size: 12px; opacity: .6; margin-top: 8px; color: var(--muted); }
 
+    @media (max-width: 980px) {
+        .entries { grid-template-columns: 1fr 1fr; }
+    }
     @media (max-width: 720px) {
         .hero { padding: 44px 0 28px; }
         .hero .mark { font-size: 38px; letter-spacing: 4px; }
@@ -251,11 +256,26 @@
         </div>
         <div class="go"><span>进入 FAS 系统</span><span class="arrow">→</span></div>
     </a>
+
+    <a class="entry st" href="/admin/stations">
+        <div class="ico">📡</div>
+        <div class="name">FMO 站点</div>
+        <div class="cn-name">可以进入的中继 / 服务器</div>
+        <div class="en-name">FMO Station Directory</div>
+        <div class="desc">全网 FMO 站目录：站名、呼号、站号与简介，标出在线状态与用户数，一键进入对应站点的 APP 登录地址。</div>
+        <div class="chips">
+            <span class="chip">站点名片</span>
+            <span class="chip">在线状态</span>
+            <span class="chip">用户数</span>
+            <span class="chip">一键进入</span>
+        </div>
+        <div class="go"><span>进入 FMO 站点</span><span class="arrow">→</span></div>
+    </a>
 </div>
 
 <footer class="foot">
     <div class="foot-name">FUS — FMO Unified Security Server</div>
-    <div class="foot-cn">FMO 统一安全服务端 · SAS 认证 + FAS 审计</div>
+    <div class="foot-cn">FMO 统一安全服务端 · SAS 认证 + FAS 审计 + 站点目录</div>
     <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
     <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
 </footer>
