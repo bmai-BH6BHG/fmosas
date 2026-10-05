@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FMO 用户监控后台（分系统）</title>
+<title>SAS · FMO 统一认证服务</title>
 <style>
     /* ============ 主题变量（统一深色科技风格） ============ */
     :root {
@@ -316,6 +316,16 @@
         border-bottom-color: #00e5ff;
         text-shadow: 0 0 8px rgba(0, 229, 255, 0.4);
     }
+    /* 返回 FUS 门户：靠右，视觉上弱于三个内容标签 */
+    .nav-tab.nav-back {
+        margin-left: auto;
+        font-size: 13px;
+        font-weight: normal;
+        letter-spacing: 0;
+        color: #8aa0b6;
+        border-bottom-color: transparent;
+    }
+    .nav-tab.nav-back:hover { color: #00e5ff; }
 
     /* ============ SAS 卡片 ============ */
     .sas-card {
@@ -662,6 +672,19 @@
         .mon-side { width: 100%; max-height: 220px; }
     }
 
+    /* ============ 页脚：系统名 + 中英署名 ============ */
+    .foot {
+        margin: 26px 0 18px;
+        padding: 14px 12px;
+        text-align: center;
+        border-top: 1px solid rgba(0, 180, 255, 0.15);
+        line-height: 1.7;
+        color: #8aa0b6;
+    }
+    .foot-name { font-size: 14px; font-weight: 600; letter-spacing: .3px; color: #cfe9f5; }
+    .foot-cn { font-size: 12.5px; opacity: .85; margin-top: 2px; }
+    .foot-credit { font-size: 12px; opacity: .6; margin-top: 8px; }
+
     /* ============ 响应式 ============ */
     @media (max-width: 768px) {
         .header { flex-direction: column; gap: 14px; padding: 16px 16px; }
@@ -679,8 +702,8 @@
 <body>
 <div class="header">
     <div>
-        <h1>⚡ FMO 用户监控后台</h1>
-        <div class="subtitle">业余无线电用户管理系统 · 分系统</div>
+        <h1>🔐 SAS 统一认证服务</h1>
+        <div class="subtitle">FMO Unified Authentication Server · FUS 分系统</div>
     </div>
     <div class="stats-bar">
         <div class="stat-card">
@@ -703,7 +726,7 @@
     <div class="nav-tab active" data-page="register">注册系统</div>
     <div class="nav-tab" data-page="sas">SAS 配置</div>
     <div class="nav-tab" data-page="monitor">语音监控</div>
-    <a class="nav-tab" href="/admin/bas" style="text-decoration:none;color:inherit;">审计（BAS）↗</a>
+    <a class="nav-tab nav-back" href="/admin" title="返回 FUS 门户（SAS / FAS 入口）" style="text-decoration:none;color:inherit;">← 返回门户</a>
 </div>
 
 <!-- ============ 页面：注册系统（现有内容） ============ -->
@@ -1324,8 +1347,10 @@ function switchPage(page) {
     }
 }
 document.querySelectorAll('.nav-tab').forEach(function(tab) {
+    var page = tab.getAttribute('data-page');
+    if (!page) return;          // 「返回门户」等外链不参与页内切换
     tab.addEventListener('click', function() {
-        switchPage(tab.getAttribute('data-page'));
+        switchPage(page);
     });
 });
 
@@ -2489,5 +2514,12 @@ function monitorStop() {
     MON.queue = [];
 }
 </script>
+
+<footer class="foot">
+    <div class="foot-name">SAS — FMO Unified Authentication Server</div>
+    <div class="foot-cn">FMO 统一认证服务 · FUS 分系统</div>
+    <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
+    <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
+</footer>
 </body>
 </html>

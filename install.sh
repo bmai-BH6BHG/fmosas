@@ -358,8 +358,9 @@ fi
 
 [ -f "$SRC/api_server.py" ]        || die "安装包内缺少 api_server.py，包内容不完整"
 [ -f "$SRC/admin/index.html" ]     || die "安装包内缺少 admin/index.html，包内容不完整"
+[ -f "$SRC/admin/portal.html" ]    || die "安装包内缺少 admin/portal.html，包内容不完整"
 [ -f "$SRC/config.default.json" ]  || die "安装包内缺少 config.default.json，包内容不完整"
-say "包内容校验通过：api_server.py / admin/index.html / config.default.json"
+say "包内容校验通过：api_server.py / admin/index.html / admin/portal.html / config.default.json"
 
 # ==========================================================================
 # 5/8 Python 依赖 cryptography
@@ -717,6 +718,7 @@ else
     # 再确认一次关键文件（防止包内结构异常导致漏拷）
     [ -f "$DIR/api_server.py" ] || die "同步后安装目录缺少 api_server.py"
     [ -f "$DIR/admin/index.html" ] || die "同步后安装目录缺少 admin/index.html"
+    [ -f "$DIR/admin/portal.html" ] || die "同步后安装目录缺少 admin/portal.html（FUS 门户）"
     chmod +x "$DIR/start.sh" 2>/dev/null || true
     chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" 2>/dev/null || true
     say "源码已同步到：$DIR（config.json / *_users.db / *_sas.db / ca/ / uploads/ / roots/ 均未被覆盖）"
@@ -863,12 +865,15 @@ fi
 
 if [ "$HEALTH_OK" = 1 ]; then
     say "自检通过：$HEALTH_URL → $(printf '%s' "$BODY" | head -c 200)"
-    ADMIN_BODY="$(http_get "$ADMIN_URL" | head -c 4000 || true)"
-    if printf '%s' "$ADMIN_BODY" | grep -qi '<html\|<!doctype'; then
-        say "管理后台可访问：$ADMIN_URL （返回 HTML）"
-    else
-        warn "管理口 $ADMIN_PORT 的 /admin 未返回 HTML，请检查是否被占用或端口未监听。"
-    fi
+    # FUS 三个入口都要能出 HTML：/admin（门户）→ /admin/sas（SAS）→ /admin/fus（FAS）
+    for _u in "/admin" "/admin/sas" "/admin/fus"; do
+        _BODY="$(http_get "http://127.0.0.1:${ADMIN_PORT}${_u}" | head -c 4000 || true)"
+        if printf '%s' "$_BODY" | grep -qi '<html\|<!doctype'; then
+            say "  页面可访问：http://127.0.0.1:${ADMIN_PORT}${_u}"
+        else
+            warn "  管理口 ${ADMIN_PORT} 的 ${_u} 未返回 HTML，请检查是否被占用或端口未监听。"
+        fi
+    done
 else
     if [ "$SERVICE_STARTED" = 1 ]; then
         err "服务自检失败：约 20 秒内 $HEALTH_URL 未返回 {\"ok\":true}。"
@@ -892,7 +897,9 @@ fi
 echo "--------------------------------------"
 echo "  安装目录 : $DIR"
 echo "  公网 API : $PORT          （路由器只需映射此端口）"
-echo "  管理后台 : http://<本机IP>:$ADMIN_PORT/admin   （内网访问，勿映射公网）"
+echo "  FUS 门户 : http://<本机IP>:$ADMIN_PORT/admin        （内网访问，勿映射公网）"
+echo "  SAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/sas"
+echo "  FAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/fus"
 echo "  健康检查 : $HEALTH_URL"
 echo "  配置文件 : $DIR/config.json"
 if [ "$SERVICE_STARTED" = 1 ]; then

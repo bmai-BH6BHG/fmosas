@@ -170,6 +170,7 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
     [ -e "$REPO/$F" ] || die "缺少必需文件: $F（契约第 5 节必须包含）"
 done
 [ -e "$REPO/admin/index.html" ] || die "缺少必需文件: admin/index.html"
+[ -e "$REPO/admin/portal.html" ] || die "缺少必需文件: admin/portal.html（FUS 门户）"
 for S in install.sh uninstall.sh build_release.sh; do
     if ! bash -n "$REPO/$S"; then
         die "$S 语法检查未通过（bash -n）"
@@ -388,7 +389,7 @@ if [ -n "$BAD" ] || [ -n "$UPLOADS_BAD" ] || [ -n "$PREFIXED" ]; then
     exit 1
 fi
 
-for NEED in api_server.py admin/index.html config.default.json install.sh uninstall.sh uploads/.gitkeep; do
+for NEED in api_server.py admin/index.html admin/portal.html config.default.json install.sh uninstall.sh uploads/.gitkeep; do
     if ! grep -qxF "$NEED" "$WORK/listing.txt"; then
         rm -f -- "$OUT"
         die "自检失败：包内缺少必需文件 $NEED（已删除 tarball）"
@@ -402,7 +403,7 @@ if ! fmo_tar_extract "$OUT" "$EXTRACT"; then
     rm -f -- "$OUT"
     die "解包复核失败（tar 与 python 回退均不可用），已删除 tarball"
 fi
-for NEED in api_server.py admin/index.html config.default.json install.sh uninstall.sh; do
+for NEED in api_server.py admin/index.html admin/portal.html config.default.json install.sh uninstall.sh; do
     if [ ! -f "$EXTRACT/$NEED" ]; then
         rm -f -- "$OUT"
         die "解包后根目录缺少 $NEED，不是平铺结构（已删除 tarball）"

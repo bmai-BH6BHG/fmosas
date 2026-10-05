@@ -32,7 +32,7 @@ APP ──HTTP──> 分系统 公网API口 (35928，白名单) ──> 用户�
 
 - 公网口仅放行：GET `/`、`/index.html`、`/api/health`、`/api/users`、`/api/stats`、`/api/config`、`/api/cert/mine`、`/api/sync/status`、`/uploads/*`；POST `/api/register`、`/api/login`、`/api/heartbeat`、`/auth`、`/api/cert/bind`、`/api/sync/peer`、`/api/sync/report`。
 - 其余路径（含全部 DELETE、管理 API、`/admin`）在公网口一律 `403 {"ok": false, "error": "该接口仅内网管理端口提供"}`。
-- APP 只需对接公网口；管理后台访问 `http://内网IP:35929/admin`。
+- APP 只需对接公网口；管理口访问 `http://内网IP:35929/admin`（FUS 门户），SAS 在 `/admin/sas`、FAS 在 `/admin/fus`（旧 `/admin/bas` 仍兼容）。
 
 ---
 

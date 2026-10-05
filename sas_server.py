@@ -1203,8 +1203,13 @@ def authenticate(username: str, password: str,
     if not trusted and root_pub_b64 in db.trusted_root_pubkeys():
         trusted = True
     if not trusted:
+        # 公钥**完整**返回，不要截断：
+        #   截断后管理员在日志/审计库里只能看到 20 个字符，既没法核对来源，
+        #   也没法把它加进 trust.extraRootPubkeys —— 会出现「看得见问题、修不了」。
+        #   审计层 bas_audit.record_auth_rejection 会把完整值单独入台账便于核查。
         return {"result": "deny",
-                "reason": f"根 CA 不受信任（公钥={root_pub_b64[:20]}...）"}
+                "reason": f"根 CA 不受信任（公钥={root_pub_b64}）",
+                "untrusted_root_pubkey": root_pub_b64}
 
     # ---- 9. 认证通过 ----
     is_superuser = False

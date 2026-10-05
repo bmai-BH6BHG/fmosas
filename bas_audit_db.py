@@ -220,6 +220,27 @@ CREATE TABLE IF NOT EXISTS client_seen (
 CREATE INDEX IF NOT EXISTS idx_seen_ts  ON client_seen(ts);
 CREATE INDEX IF NOT EXISTS idx_seen_cs  ON client_seen(callsign, ts);
 CREATE INDEX IF NOT EXISTS idx_seen_cid ON client_seen(clientid, ts);
+
+-- 未信任根台账：客户端拿「我们不认识的根 CA」签发的证书来登录时被记一笔。
+-- 为什么要这张表：根公钥曾经只写进 reason 的前 20 个字符，管理员既核对不了来源、
+-- 也复制不出完整值去加白（出现"看得见问题、修不了"）。这里存**完整**公钥，
+-- 配合「谁在用这个根、最近一次、自称呼号、IP、次数」，一眼能判断：
+--   · 是自己某台老服务器 / 兄弟分系统 → 拿完整公钥去 roots/ 或 extraRootPubkeys 加白
+--   · 是陌生人反复试            → 就是伪造证书的撞库，维持拒绝即可
+-- ⚠️ 这张表只是**线索**，不是信任；加不加白永远由管理员决定。
+CREATE TABLE IF NOT EXISTS untrusted_roots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_pubkey   TEXT NOT NULL,        -- 完整根公钥（base64url，可直接复制加白）
+    ts            TEXT NOT NULL,        -- 最近一次出现时间
+    first_ts      TEXT,                 -- 首次出现时间
+    hits          INTEGER DEFAULT 1,    -- 累计出现次数
+    last_callsign TEXT,                 -- 最近一次自称呼号（仅留证，不可信）
+    last_clientid TEXT,
+    last_ip       TEXT,
+    distinct_cs   INTEGER DEFAULT 1     -- 自称呼号去重个数（撞库典型特征）
+);
+CREATE INDEX IF NOT EXISTS idx_uroot_ts  ON untrusted_roots(ts);
+CREATE INDEX IF NOT EXISTS idx_uroot_key ON untrusted_roots(root_pubkey);
 """
 
 DEFAULT_SETTINGS = {
@@ -784,6 +805,85 @@ class AuditDB(object):
             conn = self._conn()
             try:
                 cur = conn.execute("DELETE FROM client_seen WHERE ts < ?", (cutoff,))
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
+
+    # ---------------- 未信任根台账 ----------------
+    def note_untrusted_root(self, root_pubkey, callsign="", clientid="", peerhost="",
+                            ts=None):
+        """
+        记一笔「未信任的根 CA」。同一根重复出现只累加计数与更新时间，
+        并统计自称呼号去重个数（撞库的典型特征：换着呼号试）。
+        返回该根当前的累计条数记录。
+        """
+        key = str(root_pubkey or "").strip()
+        if not key:
+            return None
+        ts = ts or now_text(True)
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                row = conn.execute(
+                    "SELECT id, first_ts, hits, distinct_cs FROM untrusted_roots "
+                    "WHERE root_pubkey = ?", (key,)).fetchone()
+                cs = str(callsign or "").strip().upper()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO untrusted_roots(root_pubkey, ts, first_ts, hits, "
+                        "last_callsign, last_clientid, last_ip, distinct_cs) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (key, ts, ts, 1, cs or None, clientid or None,
+                         peerhost or None, 1 if cs else 0))
+                    rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                else:
+                    rid = row["id"]
+                    n_cs = int(row["distinct_cs"] or 0)
+                    if cs:
+                        prev = conn.execute(
+                            "SELECT last_callsign FROM untrusted_roots WHERE id=?",
+                            (rid,)).fetchone()
+                        prev_cs = (prev["last_callsign"] or "") if prev else ""
+                        # 只有自称呼号变了才算新增（只记最后一个呼号，够用且省事）
+                        if prev_cs != cs:
+                            n_cs += 1
+                    conn.execute(
+                        "UPDATE untrusted_roots SET ts=?, hits=hits+1, "
+                        "last_callsign=?, last_clientid=?, last_ip=?, distinct_cs=? "
+                        "WHERE id=?",
+                        (ts, cs or None, clientid or None, peerhost or None, n_cs, rid))
+                conn.execute("COMMIT;")
+                cur = conn.execute("SELECT * FROM untrusted_roots WHERE id=?", (rid,)).fetchone()
+                return dict(cur) if cur else None
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            finally:
+                conn.close()
+
+    def list_untrusted_roots(self, limit=50):
+        """未信任根列表（最近出现的在前）"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                sql = ("SELECT * FROM untrusted_roots ORDER BY ts DESC LIMIT ?")
+                return [dict(r) for r in conn.execute(sql, (int(limit),)).fetchall()]
+            finally:
+                conn.close()
+
+    def prune_untrusted_roots(self, days=90):
+        """清理长期没再出现的根（默认 90 天）"""
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM untrusted_roots WHERE ts < ?", (cutoff,))
                 conn.commit()
                 return cur.rowcount
             finally:

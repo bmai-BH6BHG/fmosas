@@ -35,8 +35,9 @@ curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/bas-in
 | 用途 | 地址 |
 |---|---|
 | APP 调用 / EMQX 认证钩子 | `http://<公网IP>:35928`（认证 URL：`http://<IP>:35928/auth`） |
-| 审计界面（内网） | `http://<内网IP>:35929/admin/bas` |
-| 注册系统 / SAS 配置 | `http://<内网IP>:35929/admin` |
+| FUS 门户（内网，SAS / FAS 两个入口） | `http://<内网IP>:35929/admin` |
+| SAS 系统（统一认证服务） | `http://<内网IP>:35929/admin/sas` |
+| FAS 系统（统一审计服务） | `http://<内网IP>:35929/admin/fus`（旧地址 `/admin/bas` 仍可用） |
 
 卸载：
 
@@ -237,7 +238,7 @@ curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/instal
 | 用途 | 地址 | 说明 |
 |------|------|------|
 | APP 调用（公网） | `http://<域名或IP>:35928` | 只放行 APP 必需接口 + 分系统间同步，管理接口一律 403 |
-| 管理后台（内网） | `http://<内网IP>:35929/admin` | **不要映射到公网** |
+| FUS 门户（内网） | `http://<内网IP>:35929/admin` | **不要映射到公网**；SAS 在 `/admin/sas`、FAS 在 `/admin/fus` |
 | 健康检查 | `/api/health` | 两个端口都放行，便于探活 |
 
 上线还需要两步人工确认（脚本无法代做）：

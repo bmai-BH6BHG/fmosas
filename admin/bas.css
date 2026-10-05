@@ -1,4 +1,4 @@
-/* FUS 审计控制台样式（风格对齐分系统管理后台：深色 + 青蓝强调色） */
+/* FAS 审计控制台样式（风格对齐 SAS 管理后台：深色 + 青蓝强调色） */
 :root{
   --bg:#0f1720; --panel:#16202b; --panel2:#1c2836; --line:#26374a;
   --text:#e6eef7; --muted:#8aa0b6; --accent:#22d3ee; --accent2:#0ea5b7;

@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FUS · FMO 统一安全服务端</title>
+<title>FAS · FMO 统一审计服务</title>
 <link rel="stylesheet" href="/admin/bas.css">
 </head>
 <body>
 <div id="login" class="login-mask hidden">
   <div class="login-card">
-    <h2>FUS 控制台</h2>
+    <h2>FAS 控制台</h2>
     <p class="muted" id="login-hint">请输入管理员账号</p>
     <div id="setup-fields" class="hidden">
       <label>设置管理员账号<input id="su-user" autocomplete="username"></label>
@@ -26,13 +26,13 @@
 </div>
 
 <header class="top">
-  <div class="brand">FUS <span class="muted">FMO 统一安全服务端</span></div>
+  <div class="brand">FAS <span class="muted">FMO 统一审计服务</span></div>
   <nav id="nav"></nav>
   <div class="top-right">
     <span id="policy-badge" class="badge" title="身份控制策略模式">—</span>
-    <!-- 返回 SAS（分系统管理后台）。FUS 是内嵌在分系统管理口的子页面，
-         这里给一个显式入口，避免只能手改地址栏。 -->
-    <a class="btn ghost" id="back-sas" href="/admin" title="返回 FMO 分系统（SAS）管理后台">← 返回 SAS 管理</a>
+    <!-- 返回 FUS 门户。FAS 是 FUS 下的审计子系统，这里给一个显式入口，
+         避免只能手改地址栏。（旧地址 /admin 现在也是门户，因此跳转不变） -->
+    <a class="btn ghost" id="back-sas" href="/admin" title="返回 FUS 门户（SAS / FAS 入口）">← 返回门户</a>
     <!-- 已取消后台账号登录：不再显示登录/退出按钮。
          如需恢复登录：把 bas_http.py 的 BAS_ADMIN_LOGIN_REQUIRED 改回 True，
          并把下面这段 login 遮罩与退出按钮恢复显示即可（结构都保留着）。 -->
@@ -180,6 +180,20 @@
     <div class="row"><h3>服务器与 EMQX 健康</h3><button class="btn ghost" data-reload="health">刷新</button></div>
     <div class="grid" id="health-cards"></div>
     <div class="panel table-wrap"><table id="t-health"></table></div>
+
+    <!-- 未信任根台账 -->
+    <div class="row" style="margin-top:18px;">
+      <h3 style="margin:0;">未信任的根 CA</h3>
+      <span class="muted small" id="uroot-count"></span>
+    </div>
+    <p class="muted small" style="margin:6px 0;">
+      客户端拿着「本机不认识的根 CA」签发的证书来登录时会被拒绝，并在这里留一条线索。
+      公钥是<b>完整</b>的，可直接复制去加白。判断标准：
+      <b>是自己某台服务器／兄弟分系统</b> → 把该根证书放进 <code>/opt/fmo-subsystem/roots/</code>；
+      <b>陌生人反复换呼号试</b> → 伪造证书的撞库，维持拒绝即可（<code>自称呼号数</code> 会明显偏大）。
+      这里只是线索，<b>加不加白永远由管理员决定</b>。
+    </p>
+    <div class="panel table-wrap"><table id="t-uroot"></table></div>
   </section>
 
   <!-- 设置 -->
@@ -237,7 +251,7 @@
       <label>UID 不一致时
         <select id="po-uid">
           <option value="warn">warn 降级告警（避免误封，推荐）</option>
-          <option value="kick">kick 判为伪造（上游 FAS 行为，易误封）</option>
+          <option value="kick">kick 判为伪造（上游 FAS 旧版行为，易误封）</option>
         </select>
       </label>
       <label>连接身份只剩一半时
@@ -259,10 +273,10 @@
 </main>
 
 <footer class="foot">
-  <div class="foot-name">FUS — FMO Unified Security Server</div>
-  <div class="foot-cn">FMO 统一安全服务端</div>
-  <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
-  <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
+  <div class="foot-name">FAS — FMO Unified Audit Server</div>
+  <div class="foot-cn">FMO 统一审计服务 · FUS 分系统</div>
+  <div class="foot-credit">Original design by BG5ESN · FAS edition by BH6BHG</div>
+  <div class="foot-credit">原始设计：BG5ESN　FAS 统一审计版：BH6BHG</div>
 </footer>
 
 <script src="/admin/bas.js"></script>

@@ -298,22 +298,26 @@ class AuditService(object):
             self._bump("bans")
         return bool(ok)
 
-    def record_auth_rejection(self, callsign="", clientid="", peerhost="", reason=""):
+    def record_auth_rejection(self, callsign="", clientid="", peerhost="", reason="",
+                             root_pubkey=""):
         """
         /auth 拒绝一次连接时调用（假证书、验签失败、吊销、根不受信任等）。
 
-        做两件事：
+        做三件事：
           1) **留证**：写审计行，scene=fake_cert，记下自称的呼号 / clientid / IP
-          2) **反滥用**：
+          2) **未信任根台账**：若原因是「根 CA 不受信任」，把**完整**根公钥
+             单独入 untrusted_roots 表（截断过的 20 字符既没法核对也没法加白）
+          3) **反滥用**：
                - 封该 clientid（精确到那个客户端，不伤别人）
                - 同一 IP 在窗口内失败达阈值 → 短暂封 IP
              ⚠️ **绝不按呼号封**：攻击者可用别人的呼号配假证书来栽赃，
                 按呼号封等于替他把无辜用户封掉。呼号只用于留证与人工核查。
 
-        返回 {"recorded":bool,"banned_clientid":bool,"banned_peerhost":bool,"note":str}
+        返回 {"recorded":bool,"banned_clientid":bool,"banned_peerhost":bool,"note":str,
+              "untrusted_root":str}
         """
         out = {"recorded": False, "banned_clientid": False,
-               "banned_peerhost": False, "note": ""}
+               "banned_peerhost": False, "note": "", "untrusted_root": ""}
         cs = (callsign or "").strip().upper()
         cid = (clientid or "").strip()
         ip = (peerhost or "").strip()
@@ -352,7 +356,22 @@ class AuditService(object):
                            "应核查并把该根加入信任链；确要封禁请设 "
                            "fake_cert_untrusted_root_verdict=ban）")
 
-        # 1) 留证
+        # 2) **未信任根台账**：完整公钥入账，便于"复制 → 加白 / 判定撞库"。
+        #    放在 soft 的提前返回**之前**：不信任的根正是最需要留线索的场合。
+        if untrusted_root and root_pubkey:
+            out["untrusted_root"] = str(root_pubkey).strip()
+            try:
+                rec = self.db.note_untrusted_root(out["untrusted_root"], cs, cid, ip)
+                if rec:
+                    out["note"] = ((out.get("note") or "") +
+                                   " | 未信任根已入台账：首次=%s 次数=%s 自称呼号数=%s"
+                                   % (rec.get("first_ts"), rec.get("hits"),
+                                      rec.get("distinct_cs")))
+            except Exception as e:  # noqa: BLE001
+                out["note"] = ((out.get("note") or "") +
+                               " | 未信任根入账失败: %s" % e)
+
+        # 3) 留证
         try:
             self.db.write_audit_packet({
                 "ts": now_text(True), "topic": "", "clientid": cid, "ip": ip,
@@ -379,7 +398,7 @@ class AuditService(object):
             out["note"] = (out.get("note") or "") + " | 当前未开启自动封禁（mode/auto_ban/限流），仅留证不封禁"
             return out
 
-        # 2) 封 clientid（精确打击，不涉呼号）
+        # 4) 封 clientid（精确打击，不涉呼号）
         if self.policy.cfg.get("fake_cert_ban_clientid", True) and cid:
             try:
                 if self._ban_any(cid, "假证书/认证失败: %s" % reason,
@@ -389,7 +408,7 @@ class AuditService(object):
             except Exception as e:  # noqa: BLE001
                 out["note"] += " | 封 clientid 失败: %s" % e
 
-        # 3) 同 IP 反复尝试 → 短时封 IP
+        # 5) 同 IP 反复尝试 → 短时封 IP
         if ip:
             now = time.time()
             win = float(self.policy.cfg.get("fake_cert_window_sec", 300) or 300)
@@ -409,7 +428,7 @@ class AuditService(object):
                 except Exception as e:  # noqa: BLE001
                     out["note"] += " | 封 IP 失败: %s" % e
 
-        # 4) 可选：按呼号封（默认关；开启前务必理解栽赃风险）
+        # 6) 可选：按呼号封（默认关；开启前务必理解栽赃风险）
         if self.policy.cfg.get("fake_cert_callsign_ban") and cs:
             try:
                 self._ban_recorder(cs, "假证书（按呼号封，已开启 fake_cert_callsign_ban）",

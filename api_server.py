@@ -1099,8 +1099,21 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
 
         # 管理后台页面（由后端提供，内网访问）
-        if path == '/admin' or path == '/admin/' or path == '/admin/index.html':
+        #   /admin             → FUS 门户（SAS / FAS 两个子系统入口）
+        #   /admin/sas         → SAS 统一认证服务后台（原 /admin 的内容）
+        #   /admin/fus         → FAS 统一审计服务后台（由 bas_http 处理，见上方路由分发）
+        #   /admin/index.html  → 旧书签兜底，302 到 /admin/sas
+        if path == '/admin' or path == '/admin/' or path == '/admin/portal.html':
+            self._serve_portal_page()
+            return
+        if path in ('/admin/sas', '/admin/sas/', '/admin/sas/index.html'):
             self._serve_admin_page()
+            return
+        if path == '/admin/index.html':
+            self.send_response(302)
+            self.send_header('Location', '/admin/sas')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
             return
 
         # 根路径：返回 JSON 提示（不暴露管理后台）
@@ -1264,20 +1277,29 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         self.send_json({'ok': False, 'error': '路径不存在'}, 404)
 
     # ---------- 管理后台页面 ----------
-    def _serve_admin_page(self):
-        """提供管理后台 HTML 页面（内网访问）"""
-        admin_html_path = os.path.join(BASE_DIR, 'admin', 'index.html')
+    def _serve_admin_file(self, filename):
+        """提供 admin/ 目录下的 HTML 页面（内网访问）"""
+        admin_html_path = os.path.join(BASE_DIR, 'admin', filename)
         try:
             with open(admin_html_path, 'r', encoding='utf-8') as f:
                 html = f.read()
-            body = html.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
         except FileNotFoundError:
-            self.send_error(404, 'admin/index.html not found')
+            self.send_error(404, 'admin/%s not found' % filename)
+            return
+        body = html.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_portal_page(self):
+        """FUS 门户页：SAS 系统 / FAS 系统 两个入口"""
+        self._serve_admin_file('portal.html')
+
+    def _serve_admin_page(self):
+        """SAS 统一认证服务后台（原「管理后台」主页面）"""
+        self._serve_admin_file('index.html')
 
     # ---------- API：GET /api/config ----------
     def handle_get_config(self):
@@ -1967,7 +1989,8 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                     svc = getattr(self.__class__, 'bas_service', None)
                     if svc is not None and hasattr(svc, 'record_auth_rejection'):
                         r = svc.record_auth_rejection(
-                            username, clientid, peerhost, result.get('reason', ''))
+                            username, clientid, peerhost, result.get('reason', ''),
+                            root_pubkey=result.get('untrusted_root_pubkey', ''))
                         if r.get('banned_clientid') or r.get('banned_peerhost'):
                             print("[AUTH] 反滥用处置: clientid封=%s IP封=%s 假证书来源=%s"
                                   % (r.get('banned_clientid'), r.get('banned_peerhost'),
@@ -2809,10 +2832,11 @@ def main():
     print("  APP 登录地址: %s" % app_login_url)
     print("  公网 API 端口: %d（仅 APP/同步白名单，管理接口已隔离）" % port)
     print("  管理端口: %d（内网，勿映射公网）" % admin_port)
-    print("  管理后台: http://内网IP:%d/admin" % admin_port)
+    print("  FUS 门户: http://内网IP:%d/admin" % admin_port)
+    print("    ├─ SAS 系统（统一认证服务）: http://内网IP:%d/admin/sas" % admin_port)
     if bas_service is not None:
-        print("  BAS 审计: 已内嵌（http://内网IP:%d/admin/bas）  策略模式=%s" % (
-            admin_port, bas_service.policy.mode()))
+        print("    └─ FAS 系统（统一审计服务）: http://内网IP:%d/admin/fus"
+              "  策略模式=%s" % (admin_port, bas_service.policy.mode()))
         print("            EMQX 收数口: POST /api/ingest（X-Ingest-Token 自校验）")
         print("            身份控制: %s" % ("启用" if bas_service.identity_control_enabled() else "关闭"))
     else:

@@ -1,4 +1,4 @@
-/* FUS 审计控制台前端（零依赖） */
+/* FAS 审计控制台前端（零依赖） */
 (function () {
   'use strict';
 
@@ -509,7 +509,42 @@
         ['告警', function (r) { return esc(r.emqx_alarms); }],
         ['速率 in/out', function (r) { return (r.msg_rate_in || 0) + ' / ' + (r.msg_rate_out || 0); }]
       ], series.slice(-60).reverse());
+
+      renderUntrustedRoots(j.untrusted_roots || []);
     });
+  }
+
+  /* 未信任根台账：把完整公钥摆出来，方便复制与判断 */
+  function renderUntrustedRoots(rows) {
+    var el = $('t-uroot');
+    if (!el) return;
+    var cnt = $('uroot-count');
+    if (cnt) cnt.textContent = rows.length ? ('共 ' + rows.length + ' 个') : '暂无记录';
+    if (!rows.length) {
+      el.innerHTML = '<thead><tr><th>状态</th></tr></thead><tbody>' +
+        '<tr><td class="muted">没有记录：当前没有客户端用陌生根 CA 的证书来登录。</td></tr></tbody>';
+      return;
+    }
+    el.innerHTML = '<thead><tr>' +
+      ['根 CA 公钥（完整，可复制加白）', '首次出现', '最近出现', '次数',
+       '自称呼号数', '最近自称呼号', '最近 clientid', '最近 IP'].map(function (h) {
+        return '<th>' + h + '</th>';
+      }).join('') + '</tr></thead><tbody>' +
+      rows.map(function (r) {
+        var suspicious = (r.distinct_cs || 0) > 3 || (r.hits || 0) > 20;
+        return '<tr>' +
+          '<td class="mono" style="white-space:normal;word-break:break-all;">' +
+            esc(r.root_pubkey) + '</td>' +
+          '<td class="mono">' + esc(r.first_ts || '') + '</td>' +
+          '<td class="mono">' + esc(r.ts || '') + '</td>' +
+          '<td>' + (r.hits || 0) + '</td>' +
+          '<td>' + (r.distinct_cs || 0) +
+            (suspicious ? ' <span class="tag FAIL">可疑</span>' : '') + '</td>' +
+          '<td>' + esc(r.last_callsign || '-') + '</td>' +
+          '<td class="mono">' + esc(r.last_clientid || '-') + '</td>' +
+          '<td class="mono">' + esc(r.last_ip || '-') + '</td>' +
+          '</tr>';
+      }).join('') + '</tbody>';
   }
 
   function loadSettings() {
@@ -664,8 +699,8 @@
     }).then(function (j) { alert(j.ok ? '策略已保存' : '失败'); loadSettings(); loadStatus(); });
   });
 
-  /* 暴露给内联按钮 */
-  window.BAS = {
+  /* 暴露给内联按钮（页面内 onclick 用的是 FUS.xxx） */
+  window.FUS = {
     ban: function (who) {
       var reason = prompt('拉黑 ' + who + ' 的原因（留痕）：', '管理员手动拉黑');
       if (reason === null) return;
@@ -722,6 +757,7 @@
       });
     }
   };
+  window.BAS = window.FUS;   // 兼容旧引用（历史名 BAS）
 
   /* ---------------- 启动 ---------------- */
   function boot() {

@@ -606,7 +606,8 @@ class BasHttp(object):
         if sub == "health" and method == "GET":
             h.send_json({"ok": True, "emqx": self.svc.emqx_status(),
                          "series": self.db.health_series(
-                             since=q.get("since", [None])[0], until=q.get("until", [None])[0])})
+                             since=q.get("since", [None])[0], until=q.get("until", [None])[0]),
+                         "untrusted_roots": self.db.list_untrusted_roots(limit=50)})
             return True
 
         # ---- 策略 ----

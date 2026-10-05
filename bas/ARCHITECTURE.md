@@ -42,7 +42,7 @@ EMQX 规则引擎(FMO/RAW) ──webhook──► :35929 /api/ingest  (X-Ingest-
                                         ├─ 不一致 → KICK(事件留痕) + EMQX 拉黑
                                         └─ 非法包 → FAIL 留痕
 EMQX REST ──轮询──► bas_emqx → bas_collector → bas_audit_db（在线/排行榜/重复身份检测）
-管理口 :35929 /admin/bas/* ──► 审计界面（在线、主题统计、黑名单、健康、设置）
+管理口 :35929 /admin/fus/* ──► 审计界面（在线、主题统计、黑名单、健康、设置）
 ```
 
 ## 4. 迁移与兼容

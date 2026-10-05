@@ -23,14 +23,14 @@
 #
 #  可用环境变量:
 #    FMO_BASE_URL 覆盖下载根地址      FMO_DIR 分系统安装目录
-#    FMO_PORT     公网 API 端口（默认 35928，审计界面在 端口+1 的 /admin/bas）
+#    FMO_PORT     公网 API 端口（默认 35928，门户在 端口+1 的 /admin，SAS 在 /admin/sas、FAS 在 /admin/fus）
 #    EMQX_URL / EMQX_API_KEY / EMQX_API_SECRET   安装时顺带配置 EMQX（可选）
 #    BAS_BACKUP_DIR  备份目录（默认 /var/backups/fmo-bas）
 #    BAS_SCAN_ONLY=1 / BAS_NO_BACKUP=1 / BAS_KEEP_OLD=1  等价于对应参数
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.7.6"
+BAS_VERSION="1.7.7"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -296,8 +296,10 @@ case "$CODE" in
     200|400|401) ok "      SAS /auth 可用（HTTP $CODE，EMQX 认证钩子就绪）" ;;
     *) err "      SAS /auth 异常（HTTP $CODE）"; FAIL=$((FAIL+1)) ;;
 esac
-BASRS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((SUBSYS_PORT+1))/admin/bas" 2>/dev/null || echo 000)"
-if [ "$BASRS" = "200" ]; then ok "      审计界面可用（/admin/bas）"; else err "      审计界面异常（HTTP $BASRS）"; FAIL=$((FAIL+1)); fi
+FASRS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((SUBSYS_PORT+1))/admin/fus" 2>/dev/null || echo 000)"
+if [ "$FASRS" = "200" ]; then ok "      审计界面可用（/admin/fus）"; else err "      审计界面异常（HTTP $FASRS）"; FAIL=$((FAIL+1)); fi
+PORTALRS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((SUBSYS_PORT+1))/admin" 2>/dev/null || echo 000)"
+if [ "$PORTALRS" = "200" ]; then ok "      FUS 门户可用（/admin）"; else err "      FUS 门户异常（HTTP $PORTALRS）"; FAIL=$((FAIL+1)); fi
 
 # ---- 身份链路诊断：client_attrs 是否真的会下发（这是身份审计能否生效的前提）----
 DIAG="$INSTALL_DIR/bas_diagnose.py"
@@ -348,7 +350,9 @@ echo ""
 echo "======================================"
 echo "  FUS 安装完成"
 echo "  认证(SAS): http://<公网IP>:$SUBSYS_PORT        （APP 注册/登录、EMQX 认证 /auth）"
-echo "  审计界面 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/bas"
+echo "  门户     : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin       （SAS / FAS 两个入口）"
+echo "  SAS 系统 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/sas"
+echo "  FAS 系统 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/fus"
 echo "  策略模式 : warn（只告警留证，不会自动封人；确认无误封后再去界面切 ban）"
 if [ "$SAS_FOUND" = "1" ] || [ "$FAS_FOUND" = "1" ]; then
     echo "  旧系统   : 已卸载（备份在 $BACKUP_DIR）"

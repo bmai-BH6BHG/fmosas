@@ -29,7 +29,9 @@ curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/uninst
 | 用途 | 地址 |
 |------|------|
 | APP 调用（公网） | `http://<域名或IP>:35928` |
-| 管理后台（内网，勿映射公网） | `http://<内网IP>:35929/admin` |
+| FUS 门户（内网，勿映射公网） | `http://<内网IP>:35929/admin` |
+| SAS 系统（认证服务） | `http://<内网IP>:35929/admin/sas` |
+| FAS 系统（审计服务） | `http://<内网IP>:35929/admin/fus` |
 | 健康检查 | `http://127.0.0.1:35928/api/health` |
 
 ## 手动部署
