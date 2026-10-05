@@ -1899,6 +1899,9 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'GET' and path == '/api/fus/stations':
                 self._handle_fmo_stations()
                 return True
+            if method == 'POST' and path == '/api/fus/stations/scan':
+                self._handle_fmo_stations_scan()
+                return True
             if method == 'POST' and path == '/api/cert/bind':
                 self._handle_cert_bind()
                 return True
@@ -2615,19 +2618,8 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
               % (payload['ca_name'], payload['fingerprint'][:24]))
 
     # ---------- GET /api/fus/stations ----------
-    def _handle_fmo_stations(self):
-        """
-        FMO 站点目录：可以进入的中继/服务器。
-
-        三路数据合并（任一路挂掉页面仍可用）：
-          1. 本机 MQTT 抄收的站点名片（monitor 累积，实时）
-          2. 总系统 subsystems 表登记的站点（只读直连，同机部署）
-          3. 本机自身
-        """
-        if not _STATIONS_AVAILABLE:
-            self.send_json({'ok': False,
-                            'error': 'fmo_stations 模块不可用'}, 503)
-            return
+    def _collect_fmo_stations(self):
+        """收集站点目录数据（三路数据源合并），供列表页与扫描共用。"""
         try:
             mon = getattr(self.__class__, 'monitor', None)
             mqtt_stations = mon.stations() if mon is not None else []
@@ -2651,9 +2643,62 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if CONFIG.get('app_domain'):
             self_info['api_url'] = 'http://%s:%s' % (
                 CONFIG.get('app_domain'), CONFIG.get('app_port') or PORT)
+        return mqtt_stations, self_info
 
+    def _handle_fmo_stations(self):
+        """
+        FMO 站点目录：可以进入的中继/服务器。
+
+        三路数据合并（任一路挂掉页面仍可用）：
+          1. 本机 MQTT 抄收的站点名片（monitor 累积，实时）
+          2. 总系统 subsystems 表登记的站点（只读直连，同机部署）
+          3. 本机自身
+        """
+        if not _STATIONS_AVAILABLE:
+            self.send_json({'ok': False,
+                            'error': 'fmo_stations 模块不可用'}, 503)
+            return
+        mqtt_stations, self_info = self._collect_fmo_stations()
         payload = fmo_stations.build_station_payload(
             CONFIG, mqtt_stations=mqtt_stations, self_info=self_info)
+        self.send_json(payload)
+
+    # ---------- POST /api/fus/stations/scan ----------
+    def _handle_fmo_stations_scan(self):
+        """
+        扫描全部台站：逐站探测健康接口，**通过才显示**。
+
+        站点名片谁都会广播，但站是不是活着、端口通不通，得实际打一次才知道。
+        返回 only_reachable=true 时只保留探测通过的站（默认，即「通过就显示」）。
+        """
+        if not _STATIONS_AVAILABLE:
+            self.send_json({'ok': False,
+                            'error': 'fmo_stations 模块不可用'}, 503)
+            return
+        body = self._read_json_body()
+        if body is None:
+            body = {}
+        only_reachable = body.get('only_reachable', True)
+        if isinstance(only_reachable, str):
+            only_reachable = only_reachable.lower() not in ('0', 'false', 'no')
+        try:
+            timeout = float(body.get('timeout') or fmo_stations.SCAN_TIMEOUT)
+            timeout = min(max(1.0, timeout), 10.0)
+        except (TypeError, ValueError):
+            timeout = fmo_stations.SCAN_TIMEOUT
+
+        mqtt_stations, self_info = self._collect_fmo_stations()
+        payload = fmo_stations.build_station_payload(
+            CONFIG, mqtt_stations=mqtt_stations, self_info=self_info)
+        all_stations = payload.get('stations') or []
+        scanned, summary = fmo_stations.scan_stations(
+            all_stations, timeout=timeout, only_reachable=bool(only_reachable))
+        payload['stations'] = scanned
+        payload['scan'] = summary
+        payload['only_reachable'] = bool(only_reachable)
+        print("[STATIONS] 台站扫描: 共 %d，通过 %d，失败 %d，用时 %dms"
+              % (summary['total'], summary['passed'], summary['failed'],
+                 summary['elapsed_ms']))
         self.send_json(payload)
 
     # ---------- POST /api/ca/init ----------

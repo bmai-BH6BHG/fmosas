@@ -211,6 +211,121 @@ class MasterDbTests(unittest.TestCase):
         self.assertEqual(as_bytes["name"], as_str["name"])
 
 
+class StationScanTests(unittest.TestCase):
+    """「扫描全部台站，通过才显示」。"""
+
+    def _station(self, name, url):
+        return {"callsign": name, "name": name, "entry_url": url,
+                "total_users": 0}
+
+    def test_probe_passes_on_our_own_health_endpoint(self):
+        """本机就有真探活端点，拿它当"通的站"。"""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/health":
+                    b = b'{"ok": true}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = srv.server_address[1]
+            st = self._station("ME", "http://127.0.0.1:%d" % port)
+            ok, detail = FS.probe_station(st, timeout=3)
+            self.assertTrue(ok, detail)
+            self.assertEqual(200, detail["code"])
+            self.assertIn("ms", detail)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_probe_fails_on_closed_port(self):
+        st = self._station("DEAD", "http://127.0.0.1:9")   # discard 端口，几乎必拒
+        ok, detail = FS.probe_station(st, timeout=1)
+        self.assertFalse(ok)
+        self.assertTrue(detail["error"])
+
+    def test_probe_rejects_non_http_scheme(self):
+        ok, detail = FS.probe_station(self._station("X", "ftp://x/y"), timeout=1)
+        self.assertFalse(ok)
+        self.assertEqual("地址协议不支持", detail["error"])
+
+    def test_probe_without_url(self):
+        ok, detail = FS.probe_station({"callsign": "X"}, timeout=1)
+        self.assertFalse(ok)
+        self.assertEqual("无进入地址", detail["error"])
+
+    def test_scan_only_reachable_keeps_passed(self):
+        good = self._station("GOOD", "http://127.0.0.1:1")
+        bad = self._station("BAD", "http://127.0.0.1:9")
+        # 用假探测器，避免依赖网络
+        orig = FS.probe_station
+        FS.probe_station = lambda st, timeout=0: (
+            (True, {"ok": True, "code": 200, "ms": 5, "error": ""})
+            if st["callsign"] == "GOOD"
+            else (False, {"ok": False, "code": 0, "ms": 1, "error": "超时"}))
+        try:
+            kept, summary = FS.scan_stations([good, bad], timeout=1)
+            self.assertEqual(2, summary["total"])
+            self.assertEqual(1, summary["passed"])
+            self.assertEqual(1, summary["failed"])
+            self.assertEqual(["GOOD"], [s["callsign"] for s in kept],
+                             "通过就显示：不通的不在结果里")
+            self.assertTrue(kept[0]["reachable"])
+        finally:
+            FS.probe_station = orig
+
+    def test_scan_can_keep_all(self):
+        st = self._station("A", "http://127.0.0.1:9")
+        orig = FS.probe_station
+        FS.probe_station = lambda s, timeout=0: (
+            False, {"ok": False, "code": 0, "ms": 1, "error": "超时"})
+        try:
+            kept, summary = FS.scan_stations([st], only_reachable=False)
+            self.assertEqual(1, len(kept))
+            self.assertFalse(kept[0]["reachable"])
+            self.assertEqual(0, summary["passed"])
+        finally:
+            FS.probe_station = orig
+
+    def test_scan_empty_list(self):
+        kept, summary = FS.scan_stations([])
+        self.assertEqual([], kept)
+        self.assertEqual(0, summary["total"])
+
+    def test_scan_route_registered_and_admin_only(self):
+        src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
+        self.assertIn("'/api/fus/stations/scan'", src)
+        self.assertIn("_handle_fmo_stations_scan", src)
+        block = src.split("PUBLIC_GET_PATHS", 1)[1].split(")", 1)[0]
+        self.assertNotIn("stations/scan", block)
+
+    def test_scan_api_used_by_page(self):
+        js = open(os.path.join(ROOT, "admin", "stations.js"),
+                  encoding="utf-8").read()
+        self.assertIn("/api/fus/stations/scan", js)
+        self.assertIn("only_reachable", js)
+
+    def test_page_has_scan_button(self):
+        html = open(os.path.join(ROOT, "admin", "stations.html"),
+                    encoding="utf-8").read()
+        self.assertIn("st-scan", html)
+        self.assertIn("扫描全部台站", html)
+        self.assertIn("st-passed", html)
+
+
 class StationPageTests(unittest.TestCase):
     def test_page_and_assets_exist(self):
         for f in ("stations.html", "stations.js"):

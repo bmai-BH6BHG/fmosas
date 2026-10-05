@@ -276,3 +276,111 @@ def build_station_payload(config, mqtt_stations=None, self_info=None,
                      "可在 config.json 配置 master_db_path 指向总系统库。"),
         },
     }
+
+
+# ============================================================
+#  台站扫描：主动探测每个站，通了才算「可以通过」
+# ============================================================
+# 「能不能进这个站」最终要靠**实际探测**：站点名片谁都会广播，但站是不是活着、
+# 端口通不通，只有打一次健康接口才知道。
+#
+# 探测目标：<进入地址>/api/health（各站公网 API 口都有这个探活端点，
+# 返回 {"ok": true}）。判定通过 = HTTP 200 且响应体含 "ok"。
+#
+# 安全：本接口只在管理口(35929)暴露；目标地址来自总系统登记表/本机，
+# 仍强制 http(s) 协议、限制响应体大小与超时，避免被当成任意请求跳板。
+
+SCAN_TIMEOUT = 3.0            # 单站探测超时（秒）
+SCAN_WORKERS = 8              # 并发数
+SCAN_MAX_BYTES = 4096         # 只读响应体前若干字节
+SCAN_PATH = "/api/health"
+
+
+def _probe_once(url, timeout):
+    import urllib.error
+    import urllib.request
+    t0 = time.time()
+    req = urllib.request.Request(url, headers={"User-Agent": "FUS-station-scan/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(SCAN_MAX_BYTES).decode("utf-8", "replace")
+            code = getattr(r, "status", None) or r.getcode()
+        ms = int((time.time() - t0) * 1000)
+        passed = (code == 200) and ('"ok"' in body.replace(" ", "")
+                                    or '"ok":true' in body.replace(" ", ""))
+        return {"ok": bool(passed), "code": code, "ms": ms,
+                "error": "" if passed else "响应异常"}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "code": e.code,
+                "ms": int((time.time() - t0) * 1000),
+                "error": "HTTP %s" % e.code}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": 0,
+                "ms": int((time.time() - t0) * 1000),
+                "error": _short_err(e)}
+
+
+def _short_err(e):
+    s = str(e) or e.__class__.__name__
+    for k, v in (("timed out", "超时"), ("Connection refused", "拒绝连接"),
+                 ("Name or service not known", "域名解析失败"),
+                 ("No route to host", "无法路由"),
+                 ("Network is unreachable", "网络不可达")):
+        if k in s:
+            return v
+    return s[:60]
+
+
+def probe_station(station, timeout=SCAN_TIMEOUT):
+    """探测单个站是否「可以通过」。返回 (ok, detail)。"""
+    url = station.get("entry_url") or ""
+    if not url:
+        return False, {"ok": False, "code": 0, "ms": 0, "error": "无进入地址"}
+    if not url.startswith(("http://", "https://")):
+        return False, {"ok": False, "code": 0, "ms": 0, "error": "地址协议不支持"}
+    detail = _probe_once(url.rstrip("/") + SCAN_PATH, timeout)
+    return bool(detail.get("ok")), detail
+
+
+def scan_stations(stations, timeout=SCAN_TIMEOUT, workers=SCAN_WORKERS,
+                  only_reachable=True):
+    """
+    并发扫描全部台站。返回 (stations_with_scan, summary)。
+
+    每站写入 station['scan'] = {ok, code, ms, error}，
+    station['reachable'] = bool（只有探测通过才算通过）。
+    only_reachable=True 时结果里只保留探测通过的站（「通过就显示」）。
+    """
+    items = list(stations or [])
+    if not items:
+        return [], {"total": 0, "passed": 0, "failed": 0, "elapsed_ms": 0}
+    t0 = time.time()
+
+    def job(st):
+        ok, detail = probe_station(st, timeout)
+        out = dict(st)
+        out["reachable"] = ok
+        out["scan"] = detail
+        return out
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            scanned = list(ex.map(job, items))
+    except Exception:  # noqa: BLE001
+        scanned = [job(st) for st in items]      # 退化为串行，仍有结果
+
+    passed = [s for s in scanned if s.get("reachable")]
+    failed = [s for s in scanned if not s.get("reachable")]
+    # 通过的在前，其次按在线/用户数
+    passed.sort(key=lambda s: (0 if s.get("is_self") else 1,
+                               -(int(s.get("total_users") or 0))))
+    summary = {
+        "total": len(scanned),
+        "passed": len(passed),
+        "failed": len(failed),
+        "elapsed_ms": int((time.time() - t0) * 1000),
+    }
+    if only_reachable:
+        return passed, summary
+    return passed + failed, summary
