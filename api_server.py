@@ -108,6 +108,15 @@ except Exception as _e_st:
     _STATIONS_AVAILABLE = False
     print("[INIT] fmo_stations 模块加载失败（站点目录不可用）: %s" % _e_st)
 
+# ==================== APRS 台站发现（FMO 台站只能从 APRS-IS 扫）====================
+try:
+    import fmo_aprs
+    _APRS_AVAILABLE = True
+except Exception as _e_aprs:
+    fmo_aprs = None
+    _APRS_AVAILABLE = False
+    print("[INIT] fmo_aprs 模块加载失败（APRS 台站发现不可用）: %s" % _e_aprs)
+
 # ==================== 全局配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = None  # 稍后在 CONFIG 加载后基于域名/IP 动态设置
@@ -2618,87 +2627,66 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
               % (payload['ca_name'], payload['fingerprint'][:24]))
 
     # ---------- GET /api/fus/stations ----------
-    def _collect_fmo_stations(self):
-        """收集站点目录数据（三路数据源合并），供列表页与扫描共用。"""
-        try:
-            mon = getattr(self.__class__, 'monitor', None)
-            mqtt_stations = mon.stations() if mon is not None else []
-        except Exception:  # noqa: BLE001
-            mqtt_stations = []
-
-        # 本机站点 = 最近抄收到的那张站点名片（本机 broker 上的站就是本机）
-        self_info = {
-            'callsign': '',
-            'name': '',
-            'desc': '',
-            'domain': CONFIG.get('app_domain') or CONFIG.get('domain') or '',
-            'api_url': '',
-            'subsystem_id': CONFIG.get('subsystem_id') or '',
-        }
-        if mqtt_stations:
-            newest = mqtt_stations[0]
-            self_info['callsign'] = str(newest.get('callsign') or '').upper()
-            self_info['name'] = newest.get('name') or ''
-            self_info['desc'] = newest.get('desc') or ''
-        if CONFIG.get('app_domain'):
-            self_info['api_url'] = 'http://%s:%s' % (
-                CONFIG.get('app_domain'), CONFIG.get('app_port') or PORT)
-        return mqtt_stations, self_info
-
     def _handle_fmo_stations(self):
         """
-        FMO 站点目录：可以进入的中继/服务器。
+        FMO 台站目录（APRS 扫描 + 可进入性探测）。
 
-        三路数据合并（任一路挂掉页面仍可用）：
-          1. 本机 MQTT 抄收的站点名片（monitor 累积，实时）
-          2. 总系统 subsystems 表登记的站点（只读直连，同机部署）
-          3. 本机自身
+        **FMO 台站不在任何数据库里**，是各站在 APRS-IS 上广播的站点名片
+        （FMO-V4,STATION 报文）。常驻采集线程长期累积 → 才能攒到几百个。
+
+        默认 only_enterable=1：只显示**探测过、且确实能进入**的台站
+        （能进 = 该台站的 MQTT broker 对 CONNECT 回了 CONNACK）。进不去的不显示。
+        带 ?all=1 可看全部（排障用）。
         """
-        if not _STATIONS_AVAILABLE:
+        if not _APRS_AVAILABLE:
             self.send_json({'ok': False,
-                            'error': 'fmo_stations 模块不可用'}, 503)
+                            'error': 'fmo_aprs 模块不可用'}, 503)
             return
-        mqtt_stations, self_info = self._collect_fmo_stations()
-        payload = fmo_stations.build_station_payload(
-            CONFIG, mqtt_stations=mqtt_stations, self_info=self_info)
-        self.send_json(payload)
+        store = getattr(self.__class__, 'aprs_store', None)
+        coll = getattr(self.__class__, 'aprs_collector', None)
+        if store is None:
+            self.send_json({'ok': False,
+                            'error': 'APRS 台站台账未初始化'}, 503)
+            return
+        qs = parse_qs(urlparse(self.path).query)
+        only_enterable = str((qs.get('all') or [''])[0]).lower() not in (
+            '1', 'true', 'yes')
+        self.send_json(fmo_aprs.build_aprs_station_payload(
+            store, coll, CONFIG, only_enterable=only_enterable))
 
     # ---------- POST /api/fus/stations/scan ----------
     def _handle_fmo_stations_scan(self):
         """
-        扫描全部台站：逐站探测健康接口，**通过才显示**。
-
-        站点名片谁都会广播，但站是不是活着、端口通不通，得实际打一次才知道。
-        返回 only_reachable=true 时只保留探测通过的站（默认，即「通过就显示」）。
+        启动/触发台站扫描。**不限时**：常驻采集器一直在听 APRS，
+        发现新台站立刻用本机证书真实登录探测。这里只做两件事：
+          1) 保证采集线程活着（死了拉起来）
+          2) 立刻对现有台账做一轮全量重探
+        然后**立即返回**当前结果（不阻塞等扫描），页面自己轮询看增长。
         """
-        if not _STATIONS_AVAILABLE:
+        if not _APRS_AVAILABLE:
             self.send_json({'ok': False,
-                            'error': 'fmo_stations 模块不可用'}, 503)
+                            'error': 'fmo_aprs 模块不可用'}, 503)
             return
-        body = self._read_json_body()
-        if body is None:
-            body = {}
-        only_reachable = body.get('only_reachable', True)
-        if isinstance(only_reachable, str):
-            only_reachable = only_reachable.lower() not in ('0', 'false', 'no')
-        try:
-            timeout = float(body.get('timeout') or fmo_stations.SCAN_TIMEOUT)
-            timeout = min(max(1.0, timeout), 10.0)
-        except (TypeError, ValueError):
-            timeout = fmo_stations.SCAN_TIMEOUT
-
-        mqtt_stations, self_info = self._collect_fmo_stations()
-        payload = fmo_stations.build_station_payload(
-            CONFIG, mqtt_stations=mqtt_stations, self_info=self_info)
-        all_stations = payload.get('stations') or []
-        scanned, summary = fmo_stations.scan_stations(
-            all_stations, timeout=timeout, only_reachable=bool(only_reachable))
-        payload['stations'] = scanned
-        payload['scan'] = summary
-        payload['only_reachable'] = bool(only_reachable)
-        print("[STATIONS] 台站扫描: 共 %d，通过 %d，失败 %d，用时 %dms"
-              % (summary['total'], summary['passed'], summary['failed'],
-                 summary['elapsed_ms']))
+        store = getattr(self.__class__, 'aprs_store', None)
+        coll = getattr(self.__class__, 'aprs_collector', None)
+        if store is None:
+            self.send_json({'ok': False,
+                            'error': 'APRS 台站台账未初始化'}, 503)
+            return
+        restarted = False
+        swept = 0
+        if coll is not None:
+            restarted = coll.ensure_running()
+            try:
+                swept = coll.sweep(force=True)
+            except Exception as e:  # noqa: BLE001
+                print("[APRS] 全量重探提交失败: %s" % e)
+        payload = fmo_aprs.build_aprs_station_payload(
+            store, coll, CONFIG, only_enterable=True)
+        payload['scan'] = {'continuous': True, 'restarted': restarted,
+                           'swept': swept, 'total': store.count()}
+        print("[APRS] 扫描已启动（不限时）: 台账 %d，本轮重探 %d，线程重启=%s"
+              % (store.count(), swept, restarted))
         self.send_json(payload)
 
     # ---------- POST /api/ca/init ----------
@@ -2998,12 +2986,31 @@ def main():
     else:
         print("[INIT] 语音监控: 未启用（monitor 或 SAS 模块不可用）")
 
+    # ---- 初始化 APRS 台站采集线程（FMO 台站不在库里，只能从 APRS-IS 累积）----
+    # 台站广播有周期，短听只有个位数；常驻累积才能攒到几百个。
+    aprs_store, aprs_collector = None, None
+    if _APRS_AVAILABLE:
+        try:
+            aprs_store = fmo_aprs.AprsStationStore(BASE_DIR)
+            aprs_collector = fmo_aprs.AprsCollector(aprs_store, logger=print,
+                                                    base_dir=BASE_DIR)
+            aprs_collector.start()
+            print("[INIT] APRS 台站采集: 已启动（%s:%d），台账现有 %d 个台站"
+                  % (fmo_aprs.APRS_HOST, fmo_aprs.APRS_PORT, aprs_store.count()))
+        except Exception as e:
+            print("[INIT] APRS 台站采集启动失败: %s" % e)
+            aprs_collector = None
+    else:
+        print("[INIT] APRS 台站采集: 未启用（fmo_aprs 模块不可用）")
+
     # ---- 把 SAS / Sync / Monitor / BAS 对象注入 ApiHandler 类属性 ----
     ApiHandler.sas_db = sas_db
     ApiHandler.ca_mgr = ca_mgr
     ApiHandler.sas_config = sas_config
     ApiHandler.sync_engine = sync_engine  # SyncApiMixin 通过 self.__class__.sync_engine 访问
     ApiHandler.monitor = monitor
+    ApiHandler.aprs_store = aprs_store
+    ApiHandler.aprs_collector = aprs_collector
     ApiHandler.bas_http = bas_http
     ApiHandler.bas_service = bas_service
 

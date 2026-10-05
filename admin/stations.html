@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FMO 站点 · 可以进入的中继</title>
+<title>FMO 台站 · APRS 扫描</title>
 <link rel="stylesheet" href="/admin/bas.css">
 <style>
   /* 站点卡片：一屏能看清「叫什么、是谁、多少人、进不进得去」 */
@@ -97,13 +97,10 @@
 <body>
 
 <header class="top">
-  <div class="brand">FMO 站点 <span class="muted">可以进入的中继 / 服务器</span></div>
+  <div class="brand">FMO 台站 <span class="muted">APRS 扫描 · 可以进入的中继/服务器</span></div>
   <div class="top-right">
     <span class="badge" id="st-count">—</span>
-    <button class="btn primary" id="st-scan">🔍 扫描全部台站</button>
-    <label class="muted small" style="display:flex;align-items:center;gap:6px;margin:0;">
-      <input type="checkbox" id="st-passed" checked> 只显示通过的
-    </label>
+    <button class="btn primary" id="st-scan">🔍 持续扫描台站</button>
     <button class="btn ghost" id="st-reload">刷新</button>
     <a class="btn ghost" href="/admin">← 返回门户</a>
   </div>
@@ -111,9 +108,12 @@
 
 <main>
   <p class="muted small" style="margin:6px 0 0;">
-    每个 FMO 站就是 MQTT 上的一个「房间」：拿证书连上该站的 broker 即等于进入。
-    站点名片来自各站广播的 <code>FMO/SERVER_INFO</code>；用户数/在线数来自总系统登记。
-    <b>点「扫描全部台站」会逐个探测各站的健康接口，探测通过的站才算「可以进入」。</b>
+    <b>FMO 台站不在数据库里</b>，而是各站在 <code>APRS-IS</code> 上周期性广播的站点名片
+    （<code>FMO-V4,STATION</code> 报文）。服务端常驻采集、长期累积。
+    <br>
+    <b>「能进入」是拿本机 CA 签发的证书真发一次 MQTT 登录判定的</b>：对方 broker 回
+    <code>CONNACK 0</code> 才算能进；回 <code>4/5</code> 说明<b>对方不信任本机根 CA</b>
+    （需要对方把本机根证书放进它的信任目录），这类台站<b>不显示</b>。
   </p>
   <div id="st-src" class="muted small" style="margin:8px 0;"></div>
   <div id="st-scanbar" class="muted small hidden" style="margin:8px 0;"></div>

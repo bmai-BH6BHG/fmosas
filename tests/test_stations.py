@@ -316,14 +316,128 @@ class StationScanTests(unittest.TestCase):
         js = open(os.path.join(ROOT, "admin", "stations.js"),
                   encoding="utf-8").read()
         self.assertIn("/api/fus/stations/scan", js)
-        self.assertIn("only_reachable", js)
+        self.assertIn("seconds", js)
 
     def test_page_has_scan_button(self):
         html = open(os.path.join(ROOT, "admin", "stations.html"),
                     encoding="utf-8").read()
         self.assertIn("st-scan", html)
         self.assertIn("扫描全部台站", html)
-        self.assertIn("st-passed", html)
+        self.assertIn("st-secs", html)
+
+    def test_page_hides_unreachable_stations(self):
+        """用户要求：进不去的不显示。"""
+        html = open(os.path.join(ROOT, "admin", "stations.html"),
+                    encoding="utf-8").read()
+        self.assertIn("不显示", html)
+        js = open(os.path.join(ROOT, "admin", "stations.js"),
+                  encoding="utf-8").read()
+        self.assertIn("进不去的已隐藏", js)
+
+    def test_aprs_module_discovers_stations(self):
+        """台站来自 APRS 扫描，不是数据库。"""
+        src = open(os.path.join(ROOT, "fmo_aprs.py"), encoding="utf-8").read()
+        self.assertIn("rotate.aprs2.net", src)
+        self.assertIn("FMO-V4", src)
+        self.assertIn("scan_now", src)
+        # 能不能进入 = 拿本机证书真发一次 MQTT 登录，看 CONNACK
+        self.assertIn("probe_station_login", src)
+        self.assertIn("CONNACK", src)
+
+    def test_aprs_parse_matches_spec(self):
+        """用真实 APRS 报文验证解析（现场抓的样本，含 SH:/P/U 字段）。"""
+        import fmo_aprs as A
+        line = ("BG8LAK-10>APFMO4,TCPIP*,qAC,T2HK:=2833.45NF10635.33Ei"
+                "FMO-V4,STATION,CN,精品毛血旺（渝）,SH:8.154.40.3,P1883,U7/81,"
+                "CERT:imNGTU8EaHVzZXJDZXJ0GQPpZkJHOExBSxkImFgg")
+        info = A.parse_aprs_line(line)
+        self.assertIsNotNone(info)
+        self.assertEqual("BG8LAK-10", info["callsign"])
+        self.assertEqual("STATION", info["subtype"])
+        self.assertEqual("FMO-V4", info["mark"])
+        self.assertEqual("精品毛血旺（渝）", info["name"])
+        self.assertTrue(info["cert"])
+
+    def test_aprs_station_without_host_is_rejected(self):
+        """没有地址的名片不算台站（进不去，也不该显示）。"""
+        import fmo_aprs as A
+        line = ("BG8LAK-10>APFMO4,TCPIP*,qAC,T2HK:=2833.45NF10635.33Ei"
+                "FMO-V4,STATION,CERT:imNGTU8EaHVzZXJDZXJ0")
+        self.assertIsNone(A.parse_aprs_line(line))
+
+    def test_aprs_parse_reads_name_host_port(self):
+        """带台站名/地址/端口的真实形态。"""
+        import fmo_aprs as A
+        line = ("BH8GYP-1>APFMO4,TCPIP*:=2934.28NF10631.32Ei"
+                "FMO-V4,STATION,CN,重庆互联中继,SH:47.116.197.122,P1883,U5/23")
+        info = A.parse_aprs_line(line)
+        self.assertIsNotNone(info)
+        self.assertEqual("BH8GYP-1", info["callsign"])
+        self.assertEqual("重庆互联中继", info["name"])
+        self.assertEqual("47.116.197.122", info["host"])
+        self.assertEqual(1883, info["port"])
+        self.assertEqual(5, info["online"])
+        self.assertEqual(23, info["total"])
+        self.assertEqual("47.116.197.122:1883", A.station_mqtt_addr(info))
+
+    def test_aprs_ignores_non_station_and_comments(self):
+        import fmo_aprs as A
+        self.assertIsNone(A.parse_aprs_line("# aprsc 2.1.20"))
+        self.assertIsNone(A.parse_aprs_line(""))
+        self.assertIsNone(A.parse_aprs_line("BH1AAA>APRS:no marker here"))
+        # subtype 不是 STATION 不算台站
+        self.assertIsNone(A.parse_aprs_line(
+            "BH1AAA>APFMO4:xFMO-V4,CLIENT,CN,某客户端"))
+
+    def test_aprs_probe_rejects_bad_target(self):
+        import fmo_aprs as A
+        ok, d = A.probe_station_login({"host": "", "port": 1883}, "/tmp",
+                                      timeout=1)
+        self.assertFalse(ok)
+        self.assertEqual("无 MQTT 地址", d["error"])
+
+    def test_probe_is_a_real_login_not_anonymous(self):
+        """回归：曾经用匿名 CONNECT 判断「能进入」，broker 对匿名连接回 4/5，
+        结果把所有台站都判成能进 —— 完全是假数据。现在必须带证书真登录，
+        且只有 CONNACK==0 才算能进。"""
+        src = open(os.path.join(ROOT, "fmo_aprs.py"), encoding="utf-8").read()
+        self.assertIn("build_probe_credentials", src)
+        self.assertIn("certPackage", src)
+        self.assertIn("CONNACK_MEANING", src)
+        self.assertIn("code == 0", src)
+        # clientid 必须 FMO- 前缀，否则现场 EMQX 的文件 ACL 会拒 connect
+        self.assertIn('PROBE_CLIENTID_PREFIX = "FMO-PROBE-"', src)
+        self.assertIn("FMO-*", src)
+
+    def test_aprs_store_accumulates(self):
+        import tempfile
+        import fmo_aprs as A
+        tmp = tempfile.mkdtemp(prefix="fus-aprs-")
+        try:
+            st = A.AprsStationStore(tmp)
+            st.note({"callsign": "BH1AAA-1", "name": "甲站",
+                     "host": "1.2.3.4", "port": 1883, "online": 3, "total": 9})
+            st.note({"callsign": "BH2BBB-2", "name": "乙站",
+                     "host": "5.6.7.8", "port": 1883})
+            st.note({"callsign": "BH1AAA-1", "name": "甲站",
+                     "host": "1.2.3.4", "port": 1883, "online": 4, "total": 9})
+            self.assertEqual(2, st.count())
+            got = {s["callsign"]: s for s in st.all()}
+            self.assertEqual(2, got["BH1AAA-1"]["hits"])
+            self.assertEqual(4, got["BH1AAA-1"]["online"])
+            # 能进入的判定
+            st.note_probe("BH1AAA-1", True, {"ms": 30, "code": 0, "error": ""})
+            st.note_probe("BH2BBB-2", False, {"ms": 4000, "code": None,
+                                              "error": "超时"})
+            got = {s["callsign"]: s for s in st.all()}
+            self.assertTrue(got["BH1AAA-1"]["reachable"])
+            self.assertFalse(got["BH2BBB-2"]["reachable"])
+            # 只回能进入的
+            payload = A.build_aprs_station_payload(st, only_enterable=True)
+            self.assertEqual(["BH1AAA-1"],
+                             [s["callsign"] for s in payload["stations"]])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class StationPageTests(unittest.TestCase):
@@ -343,7 +457,7 @@ class StationPageTests(unittest.TestCase):
         html = open(os.path.join(ROOT, "admin", "portal.html"),
                     encoding="utf-8").read()
         self.assertIn('href="/admin/stations"', html)
-        self.assertIn("FMO 站点", html)
+        self.assertIn("FMO 台站", html)
 
     def test_route_registered(self):
         src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
