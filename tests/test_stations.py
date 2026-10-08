@@ -316,14 +316,13 @@ class StationScanTests(unittest.TestCase):
         js = open(os.path.join(ROOT, "admin", "stations.js"),
                   encoding="utf-8").read()
         self.assertIn("/api/fus/stations/scan", js)
-        self.assertIn("seconds", js)
+        self.assertIn("continuous", js)      # 不限时持续扫描
 
     def test_page_has_scan_button(self):
         html = open(os.path.join(ROOT, "admin", "stations.html"),
                     encoding="utf-8").read()
         self.assertIn("st-scan", html)
-        self.assertIn("扫描全部台站", html)
-        self.assertIn("st-secs", html)
+        self.assertIn("持续扫描", html)
 
     def test_page_hides_unreachable_stations(self):
         """用户要求：进不去的不显示。"""

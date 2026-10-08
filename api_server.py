@@ -820,11 +820,45 @@ def init_db():
     conn.close()
 
 
+# 占位常开连接：库路径 -> 连接（只占位，不做任何查询/写入）
+_KEEPALIVE_CONNS = {}
+
+
+def _ensure_keepalive(path):
+    """
+    为某个库保持一条**常开连接**（占位用，不读不写）。
+
+    ★ 真实事故根因：SQLite 在**最后一个连接关闭时**会对 WAL 做一次 checkpoint。
+      本模块（以及审计库、语音库、同步库）都是"每次操作新建连接再 close"，
+      于是**每次写入的 close 都是最后一个连接** → 每次都全量 checkpoint →
+      实测在 NAS 上每次写入约 1 秒：
+          无保活：中位 1058 ms/次   有保活：中位 0.4 ms/次（快约 2500 倍）
+      只要这条连接一直开着，其它连接的 close 就不再是最后一个，问题消失，
+      而且**不需要改任何调用点**。
+    """
+    if path in _KEEPALIVE_CONNS:
+        return
+    try:
+        k = sqlite3.connect(path, timeout=10, check_same_thread=False)
+        k.execute("PRAGMA journal_mode=WAL;")
+        k.execute("PRAGMA busy_timeout=10000;")
+        _KEEPALIVE_CONNS[path] = k
+    except Exception:  # noqa: BLE001
+        pass          # 库还不存在等情况：下次再试
+
+
 def get_db():
-    """获取数据库连接（WAL 模式 + 超时，避免与 sync_engine 并发读写互锁）"""
+    """获取数据库连接（WAL 模式 + 超时，避免与 sync_engine 并发读写互锁）
+
+    ★ 先确保有一条常开占位连接，否则每次写入的 close 都会触发全量 WAL checkpoint
+      （实测每次约 1 秒，见 _ensure_keepalive）；另设 synchronous=NORMAL，
+      避免每次 commit 都 fsync。
+    """
+    _ensure_keepalive(DB_PATH)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=10000;")
     return conn
 
@@ -996,6 +1030,46 @@ def build_ca_root_payload(ca_mgr, config=None):
         'usage': ('把 cert 字段存成 <名字>.json 放进对方安装目录的 roots/，'
                   '重启后本机签发的证书（含国服绑定签发的）即被对方信任'),
     }
+
+
+# ==================== /auth 逐段计时（排障开关） ====================
+# 真实事故：EMQX 认证 HTTP 超时（>5s）会把**所有**证书一起判 not_authorized，
+# 对的证书也进不来。要定位 1.6~4.6 秒到底花在哪一段，需要在**线上进程**里计时。
+# 启用方式：在安装目录建一个空文件 AUTH_TRACE（删掉即关闭），零配置、零依赖。
+AUTH_TRACE_FLAG = os.path.join(BASE_DIR, "AUTH_TRACE")
+AUTH_TRACE_LOG = os.path.join(BASE_DIR, "auth_trace.log")
+_AUTH_TRACE_CACHE = [0.0, False]      # [检查时间, 是否开启]：加缓存，避免每次认证都 stat
+
+
+def _auth_tracing_on():
+    """是否开启 /auth 逐段计时（开关文件存在即开启）。5 秒缓存，热路径不做 syscall。"""
+    now = time.time()
+    c = _AUTH_TRACE_CACHE
+    if now - c[0] < 5.0:
+        return c[1]
+    try:
+        on = os.path.exists(AUTH_TRACE_FLAG)
+    except Exception:  # noqa: BLE001
+        on = False
+    c[0], c[1] = now, on
+    return on
+
+
+def _auth_trace_write(marks, extra=""):
+    """把各段耗时写进 auth_trace.log（不写 stdout，避免日志背压干扰测量）"""
+    try:
+        if len(marks) < 2:
+            return
+        total = marks[-1][1] - marks[0][1]
+        parts = ["%s=%.1f" % (marks[i + 1][0],
+                              (marks[i + 1][1] - marks[i][1]) * 1000)
+                 for i in range(len(marks) - 1)]
+        with open(AUTH_TRACE_LOG, "a", encoding="utf-8") as f:
+            f.write("%s total=%.1fms %s %s\n"
+                    % (time.strftime("%H:%M:%S"), total * 1000,
+                       " ".join(parts), extra))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ==================== 请求处理器 ====================
@@ -2006,11 +2080,24 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
     # ---------- POST /auth ----------
     def _handle_sas_auth(self):
         """MQTT broker 调用的认证端点，代理到 sas_server.authenticate"""
+        _tr = _auth_tracing_on()
+        _T = [("enter", time.time())]
+
+        def _t(tag):
+            if _tr:
+                _T.append((tag, time.time()))
+
         sas_db, ca_mgr = self._require_sas()
+        _t("require_sas")
         if sas_db is None:
+            if _tr:
+                _auth_trace_write(_T, "no_sas_db")
             return
         body = self._read_json_body()
+        _t("read_body")
         if body is None:
+            if _tr:
+                _auth_trace_write(_T, "bad_body")
             return
         username = body.get('username', '')
         password = body.get('password', '')
@@ -2024,17 +2111,25 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             # —— 真实事故：修好认证后全站订阅被拒（监控收不到语音、APP 互相听不到）。
             self.send_json({'result': 'ignore',
                             'reason': '缺少 password：按授权探测处理，交由后续授权源'})
+            _t("send_ignore")
+            if _tr:
+                _auth_trace_write(_T, "ignore(no-password)")
             return
         if ca_mgr is None:
             self.send_json({'result': 'deny', 'reason': 'CA 管理器未初始化'})
+            _t("send_deny_noca")
+            if _tr:
+                _auth_trace_write(_T, "deny(no-ca)")
             return
         try:
             result = authenticate(username, password, ca_mgr, sas_db)
+            _t("authenticate")
 
             # ---- APP 密钥绑定：确认连接来自「持有 APP 私钥的本 APP」----
             # 结果写进 client_attrs → EMQX 会挂到连接上 → 审计据此判定"本 APP"
             if result.get('result') == 'allow':
                 app = verify_app_mqtt_signature(password, clientid, username, log=print)
+                _t("app_signature")
                 attrs = result.setdefault('client_attrs', {})
                 attrs['app_verified'] = '1' if app['ok'] else '0'
                 attrs['app_sig'] = app['mode']
@@ -2059,6 +2154,7 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 print("[AUTH] 通过: callsign=%s uid=%s app_verified=%s(%s) clientid=%s" % (
                     attrs.get('callsign'), attrs.get('uid'),
                     attrs.get('app_verified'), attrs.get('app_sig'), clientid or '-'))
+                _t("print_ok")
                 # 登记"最近在线"：手机 APP 常频繁短线重连，
                 # 只靠"当前在线"会看不到刚断开的人（真实问题：某用户来回掉线，界面像没上线）
                 try:
@@ -2066,11 +2162,13 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                     if _svc is not None and hasattr(_svc, 'note_client_seen'):
                         _svc.note_client_seen(attrs.get('callsign') or username,
                                               attrs.get('uid', ''), clientid, peerhost)
+                    _t("note_client_seen")
                     # 认证通过也写一条身份审计（用户要求：审计里要看得到"通过"的事件）
                     if _svc is not None and hasattr(_svc, 'record_auth_ok'):
                         _svc.record_auth_ok(attrs.get('callsign') or username,
                                             attrs.get('uid', ''), clientid, peerhost,
                                             attrs.get('app_verified', ''))
+                    _t("record_auth_ok")
                 except Exception:  # noqa: BLE001
                     pass
             else:
@@ -2093,9 +2191,16 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                                      peerhost or '-'))
                 except Exception as _e_rec:  # noqa: BLE001
                     print("[AUTH] 拒绝事件记录失败（不影响认证）: %s" % _e_rec)
+                _t("record_reject")
             self.send_json(result)
+            _t("send_json")
+            if _tr:
+                _auth_trace_write(_T, "result=%s" % result.get('result'))
         except Exception as e:
             self.send_json({'result': 'deny', 'reason': '认证异常: ' + str(e)}, 500)
+            _t("send_exc")
+            if _tr:
+                _auth_trace_write(_T, "exception")
 
     # ---------- POST /api/cert/bind（国服 ID 绑定） ----------
     def _handle_cert_bind(self):

@@ -437,24 +437,86 @@ class MqttMiniClient:
 
 # -------------------- 语音段存储 --------------------
 
+class _SharedConn(object):
+    """常驻连接的包装：close() 是空操作（调用点写法都是 try/finally close）。"""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def close(self):          # noqa: D401 - 故意空操作
+        return None
+
+    def __enter__(self):
+        return self._raw
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class VoiceStore:
-    """voice.db：语音段 + 信标。WAL 模式，线程安全（每操作新连接）。"""
+    """
+    voice.db：语音段 + 信标。WAL + **常驻连接复用**，全部访问用锁串行化。
+
+    ★ 真实事故（监控老是掉线 / 服务"莫名其妙断连"）：
+      原实现是「每次操作新建连接」，而实测在 NAS 上
+      「新建连接后的首次写入 + 关闭」要 **约 1 秒**
+      （voice.db 800KB 时实测 758~1562ms；复用连接只要 0.1ms）。
+      而监控**每收一个 FMO/TELE 信标就写一次**，于是读循环几乎全程被
+      这个 1 秒写入堵住 → 服务端视角"客户端一直没发包" →
+      MQTT 按 keepalive 超时把监控踢掉 → 表现为服务器反复断连。
+      另外原实现没设 synchronous，默认 FULL 会让每次 commit 都 fsync。
+    """
 
     def __init__(self, db_path, retention_days=3):
         self.db_path = db_path
         self.retention_days = retention_days
+        self._lock = threading.RLock()
+        self._shared = None
         self._init_db()
 
-    def _conn(self):
-        conn = sqlite3.connect(self.db_path, timeout=10)
+    def _raw_conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
+        # ★ NORMAL：WAL 下已足够安全，且避免每次 commit 都 fsync（实测差 ~1000 倍）
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
         return conn
 
+    def _conn(self):
+        """复用常驻连接（见类注释：每操作新建连接要 ~1 秒）。失效时自动重建。"""
+        c = self._shared
+        if c is not None:
+            try:
+                c.execute("SELECT 1")
+                return _SharedConn(c)
+            except Exception:  # noqa: BLE001
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._shared = None
+        c = self._raw_conn()
+        self._shared = c
+        return _SharedConn(c)
+
+    def dispose(self):
+        with self._lock:
+            c, self._shared = self._shared, None
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def _init_db(self):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS voice_segments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -481,14 +543,12 @@ class VoiceStore:
                 CREATE INDEX IF NOT EXISTS ix_beacon_ts ON beacons(created_at);
             """)
             conn.commit()
-        finally:
-            conn.close()
 
     def add_segment(self, callsign, session, start_ts, end_ts, duration_ms,
                     codec, frames, audio):
         """写入语音段（幂等：同 callsign/session/start_ts 忽略）。返回行 id 或 None。"""
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             cur = conn.execute("""
                 INSERT OR IGNORE INTO voice_segments
                     (callsign, session, start_ts, end_ts, duration_ms, codec,
@@ -498,94 +558,76 @@ class VoiceStore:
                   frames, sqlite3.Binary(audio), time.time()))
             conn.commit()
             return cur.lastrowid if cur.rowcount else None
-        finally:
-            conn.close()
 
     def mark_reported(self, seg_id):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             conn.execute("UPDATE voice_segments SET reported=1 WHERE id=?", (seg_id,))
             conn.commit()
-        finally:
-            conn.close()
 
     def unreported(self, limit=20):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             return [dict(r) for r in conn.execute("""
                 SELECT id, callsign, session, start_ts, end_ts, duration_ms,
                        codec, frames, audio
                 FROM voice_segments WHERE reported=0
                 ORDER BY start_ts ASC LIMIT ?
             """, (limit,)).fetchall()]
-        finally:
-            conn.close()
 
     def segments_since(self, since=0.0, limit=200):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             return [dict(r) for r in conn.execute("""
                 SELECT id, callsign, session, start_ts, end_ts, duration_ms,
                        codec, frames
                 FROM voice_segments WHERE start_ts > ?
                 ORDER BY start_ts ASC LIMIT ?
             """, (since, limit)).fetchall()]
-        finally:
-            conn.close()
 
     def get_audio(self, seg_id):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             r = conn.execute(
                 "SELECT codec, audio FROM voice_segments WHERE id=?",
                 (seg_id,)).fetchone()
             return (r["codec"], r["audio"]) if r else (None, None)
-        finally:
-            conn.close()
 
     def add_beacon(self, callsign, freq1, freq2, tele_ts):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             conn.execute("""
                 INSERT INTO beacons (callsign, freq1, freq2, tele_ts, created_at)
                 VALUES (?, ?, ?, ?, ?)
             """, (callsign, freq1, freq2, tele_ts, time.time()))
             conn.commit()
-        finally:
-            conn.close()
 
     def beacons_since(self, since=0.0, limit=50):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             return [dict(r) for r in conn.execute("""
                 SELECT id, callsign, freq1, freq2, tele_ts, created_at
                 FROM beacons WHERE created_at > ?
                 ORDER BY created_at DESC LIMIT ?
             """, (since, limit)).fetchall()]
-        finally:
-            conn.close()
 
     def cleanup(self):
         """清理过期语音段与信标。"""
         cutoff = time.time() - self.retention_days * 86400
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             c1 = conn.execute("DELETE FROM voice_segments WHERE start_ts < ?", (cutoff,))
             c2 = conn.execute("DELETE FROM beacons WHERE created_at < ?", (cutoff,))
             conn.commit()
             return c1.rowcount, c2.rowcount
-        finally:
-            conn.close()
 
     def stats(self):
-        conn = self._conn()
-        try:
+        with self._lock:
+            conn = self._conn()
             seg = conn.execute(
                 "SELECT COUNT(*) c, COALESCE(SUM(frames),0) f FROM voice_segments").fetchone()
             bc = conn.execute("SELECT COUNT(*) c FROM beacons").fetchone()
             return {"segments": seg["c"], "frames": seg["f"], "beacons": bc["c"]}
-        finally:
-            conn.close()
 
 
 # -------------------- 监控主线程 --------------------

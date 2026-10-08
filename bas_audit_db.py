@@ -259,6 +259,35 @@ DEFAULT_SETTINGS = {
 }
 
 
+class _SharedConn(object):
+    """
+    常驻连接的包装：`close()` 是空操作。
+
+    为什么需要它：本类所有方法都是
+        conn = self._conn()
+        try: ... finally: conn.close()
+    的写法。要复用连接又不改几十个调用点，就让 close() 什么都不做，
+    真正的关闭由 AuditDB.dispose() 负责。
+    """
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def close(self):          # noqa: D401 - 故意空操作
+        return None
+
+    def __enter__(self):
+        return self._raw
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class AuditDB(object):
     """审计库。单写者模型：内部锁 + BEGIN IMMEDIATE，避免 `database is locked`。"""
 
@@ -266,6 +295,7 @@ class AuditDB(object):
         self.path = path
         self.retention_days = retention_days
         self._lock = threading.RLock()
+        self._shared = None          # 常驻连接（见 _conn 说明）
         d = os.path.dirname(os.path.abspath(path))
         if d and not os.path.isdir(d):
             try:
@@ -275,8 +305,10 @@ class AuditDB(object):
         self._init()
 
     # ---------------- 连接 ----------------
-    def _conn(self):
-        conn = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
+    def _raw_conn(self):
+        """新建一条底层连接并设好 PRAGMA。"""
+        conn = sqlite3.connect(self.path, timeout=10.0, isolation_level=None,
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         # 每条连接都显式设置（修正上游只设一次的问题）
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -284,6 +316,49 @@ class AuditDB(object):
         conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute("PRAGMA foreign_keys=OFF;")
         return conn
+
+    def _conn(self):
+        """
+        返回**常驻连接**（进程内复用，不每次新建）。
+
+        ★ 真实事故（服务"莫名其妙断连、所有证书都进不来"的根因）：
+          原实现每次操作都 sqlite3.connect() + PRAGMA + 写完 close()。
+          实测在 NAS 上「新建连接后的首次写入 + 关闭」要 **约 1 秒**
+          （复用连接只要 0.1ms）：
+              A) 新建连接+PRAGMA+写+关 = 839~1414 ms
+              B) 复用同一连接        = 0.1 ms
+              C) 只新建连接不写      = 0.8 ms   ← 连接本身不慢，慢在"新连接的首次写事务"
+          而认证路径里有两次写（note_client_seen + record_auth_ok），
+          合计约 2 秒，直接把 EMQX 的 5 秒认证 HTTP 超时打满 →
+          EMQX 判 not_authorized → **对的证书也一起被拒**。
+        因此这里改为复用一条常驻连接；本类所有访问都由 self._lock 串行化，
+        所以 check_same_thread=False + 单连接是安全的。
+        连接失效（库被替换/文件被删）时自动重建。
+        """
+        c = self._shared
+        if c is not None:
+            try:
+                c.execute("SELECT 1")
+                return _SharedConn(c)
+            except Exception:  # noqa: BLE001
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._shared = None
+        c = self._raw_conn()
+        self._shared = c
+        return _SharedConn(c)
+
+    def dispose(self):
+        """关闭常驻连接（进程退出/库被替换时调用）"""
+        with self._lock:
+            c, self._shared = self._shared, None
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _init(self):
         with self._lock:
