@@ -163,7 +163,7 @@ fi
 # ------------------------------ [2/8] 预检查 ---------------------------------
 echo "[2/8] 预检查（必需文件 + shell 语法）..."
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
-         gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
+         gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py \
          config.default.json config.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh uploads/.gitkeep \
@@ -218,7 +218,7 @@ copy_path() {
 
 # 代码（契约必须包含）
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
-         gen_app_key.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
+         gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py; do
     copy_path "$F" 1
 done
@@ -474,6 +474,15 @@ cp -a "$DIST/$TARNAME.sha256"          "$UPLOAD/$TARNAME.sha256"
 cp -a "$OUT_FLAT"                      "$UPLOAD/fmo-subsystem.tar.gz"
 cp -a "$DIST/fmo-subsystem.tar.gz.sha256" "$UPLOAD/fmo-subsystem.tar.gz.sha256"
 cp -a "$REPO/dist/VERSION"             "$UPLOAD/VERSION"
+# APP 密钥写入命令：单独放到上传根目录，发布工作流会把它压成扁平资产
+# （fus-set-appkey.py / bas-set-appkey.py）供单独下载；缺了会让发版那一步 cp 失败。
+if [ -f "$STAGE/set_appkey.py" ]; then
+    cp -a "$STAGE/set_appkey.py" "$UPLOAD/set_appkey.py"
+elif [ -f "$REPO/set_appkey.py" ]; then
+    cp -a "$REPO/set_appkey.py" "$UPLOAD/set_appkey.py"
+else
+    die "缺少 set_appkey.py：无法发布 APP 密钥写入命令（fus-set-appkey）"
+fi
 
 # BAS 子渠道：bas/ 下的文件进 <BASE>/bas/（一键安装脚本 + 旧系统扫描/迁移模块）
 mkdir -p "$UPLOAD/bas"

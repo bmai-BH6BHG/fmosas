@@ -125,6 +125,9 @@ jobs:
           cp out/bas/bas_emqx_auth.py  up/bas-emqx-auth.py
           cp out/bas/bas_diagnose.py   up/bas-diagnose.py
           cp out/bas/VERSION           up/bas-version.txt
+          # APP 密钥写入命令（单独下载即可用：装了系统但没部署 APP 密钥对的人）
+          cp out/set_appkey.py         up/fus-set-appkey.py
+          cp out/set_appkey.py         up/bas-set-appkey.py
           # FUS 别名（系统已更名 FUS；bas-* 保留兼容，两个名字都能下载）
           cp out/bas/install-bas.sh    up/fus-install.sh
           cp out/bas/uninstall-bas.sh  up/fus-uninstall.sh

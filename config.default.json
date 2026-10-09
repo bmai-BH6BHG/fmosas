@@ -22,7 +22,7 @@
         "enabled": true,
         "base_url": "https://dmriapi.radiowo.com",
         "timeout": 10,
-        "app_pubkey": "",
+        "app_pubkey": "4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0",
         "app_timestamp_window": 300,
         "verify_password": false,
         "kdf_algorithm": "pbkdf2",

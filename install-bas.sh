@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.4"
+BAS_VERSION="1.8.5"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -346,6 +346,43 @@ PYEOF
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+# ══════════════════════════════════════════════════════════════
+# 注册 APP 密钥写入命令：fus-set-appkey / bas-set-appkey
+#   给"装了系统但没部署 APP 密钥对"的人一条命令搞定。
+#   服务端只需要公钥；私钥(seed)只存在于 APP 里。
+# ══════════════════════════════════════════════════════════════
+APPKEY_CMD="(未注册)"
+if [ -f "$INSTALL_DIR/set_appkey.py" ]; then
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        # ★ 同时装 /usr/bin：sudo 会重置 PATH 为 secure_path，而它通常不含 /usr/local/bin
+        for _b in /usr/local/bin /usr/bin; do
+            [ -d "$_b" ] || continue
+            for _c in fus-set-appkey bas-set-appkey; do
+                cat > "$_b/$_c" <<EOF
+#!/bin/sh
+# FMO/FUS：写入 APP 签名公钥（由 install-bas.sh 自动生成，勿手改）
+exec ${PY} "${INSTALL_DIR}/set_appkey.py" "\$@"
+EOF
+                chmod 0755 "$_b/$_c" 2>/dev/null || true
+            done
+        done
+        APPKEY_CMD="fus-set-appkey"
+    else
+        APPKEY_CMD="${PY} ${INSTALL_DIR}/set_appkey.py"
+    fi
+    # 公钥没配上就直接补上官方公钥（幂等；已有配置不会被覆盖成别的）
+    APPKEY_STATE="$("$PY" "$INSTALL_DIR/set_appkey.py" --config "$INSTALL_DIR/config.json" --verify 2>&1 | tail -n 1)"
+    case "$APPKEY_STATE" in
+        *"✓ 配置正确"*) : ;;
+        *)
+            "$PY" "$INSTALL_DIR/set_appkey.py" --config "$INSTALL_DIR/config.json" >/dev/null 2>&1 \
+                && ok "      已写入官方 APP 公钥（dmrid.app_pubkey）" \
+                || warn "      写入 APP 公钥失败，请手动执行： sudo $APPKEY_CMD"
+            ;;
+    esac
+fi
+
 echo ""
 echo "======================================"
 echo "  FUS 安装完成"
@@ -361,6 +398,7 @@ fi
 echo ""
 echo "  首次使用：EMQX → 认证(Authentication) → HTTP 认证，URL 填"
 echo "            http://<本机IP>:$SUBSYS_PORT/auth （注意是「认证」不是「授权」）"
+echo "  APP 密钥 : $APPKEY_CMD   （查看: $APPKEY_CMD --show；只装公钥，私钥留在 APP 里）"
 echo "  日志     : journalctl -u ${SVC:-fmo-subsystem} -f"
 echo "  再跑一次 : 可安全重跑（幂等）"
 echo "  卸载     : curl -fsSL $BASE_URL/bas-uninstall.sh | sudo bash"

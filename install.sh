@@ -677,8 +677,8 @@ say "  port       : $(cfg_val CFG_PORT)  管理口: $ADMIN_PORT"
 say "  subsystem_id: $(cfg_val CFG_SUBSYSTEM_ID)$([ "$(cfg_val CFG_SUB_GENERATED)" = "yes" ] && echo "（本次按主机名+MAC 确定性生成）")"
 [ "$(cfg_val CFG_MASTER_WRITTEN)" = "yes" ] && say "  master_url : 已按 FMO_MASTER 写入"
 if [ "$(cfg_val CFG_APP_PUBKEY)" = "empty" ]; then
-    warn "dmrid.app_pubkey 为空，国服ID绑定将被拒绝。"
-    warn "修复：运行 python gen_app_key.py 生成密钥对，把 APP_PUBKEY 填入 config.json 的 dmrid.app_pubkey，APP_SEED 烧进 APP。"
+    warn "dmrid.app_pubkey 为空，国服ID绑定（APP 签名校验）将被拒绝。"
+    warn "修复：执行  sudo fus-set-appkey   即可写入官方 APP 公钥（无需自己生成密钥）。"
 fi
 
 # ==========================================================================
@@ -723,6 +723,38 @@ else
     chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" 2>/dev/null || true
     say "源码已同步到：$DIR（config.json / *_users.db / *_sas.db / ca/ / uploads/ / roots/ 均未被覆盖）"
 fi
+
+# ==========================================================================
+# 注册 APP 密钥写入命令：fus-set-appkey / bas-set-appkey
+#   给"装了系统但没部署 APP 密钥对"的人一条命令搞定，不用知道 config.json 结构。
+# ==========================================================================
+install_appkey_cmd() {
+    [ -f "$DIR/set_appkey.py" ] || { warn "未找到 set_appkey.py，跳过注册 fus-set-appkey"; return 0; }
+    if [ "$IS_ROOT" != 1 ]; then
+        say "非 root：跳过注册全局命令（可直接运行：$PY $DIR/set_appkey.py）"
+        return 0
+    fi
+    # ★ 必须同时装到 /usr/bin：sudo 会重置 PATH 为 secure_path，
+    #   而多数系统的 secure_path 里**没有** /usr/local/bin
+    #   （真实问题：装好命令后用 sudo fus-set-appkey 提示 command not found）。
+    INSTALLED=""
+    for BINDIR in /usr/local/bin /usr/bin; do
+        [ -d "$BINDIR" ] || continue
+        for CMDNAME in fus-set-appkey bas-set-appkey; do
+            cat > "$BINDIR/$CMDNAME" <<EOF
+#!/bin/sh
+# FMO/FUS：写入 APP 签名公钥（由 install.sh 自动生成，勿手改）
+exec ${PY} "${DIR}/set_appkey.py" "\$@"
+EOF
+            chmod 0755 "$BINDIR/$CMDNAME" 2>/dev/null || true
+        done
+        INSTALLED="$INSTALLED $BINDIR"
+    done
+    say "已注册命令：fus-set-appkey（别名 bas-set-appkey）→ $PY $DIR/set_appkey.py"
+    say "           安装位置：$INSTALLED"
+    return 0
+}
+install_appkey_cmd
 
 # ==========================================================================
 # 8/8 注册开机自启 / 防火墙 / 自检
