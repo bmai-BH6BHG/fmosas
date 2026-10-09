@@ -1,6 +1,21 @@
-/* MQTT 互联桥接管理页前端（零依赖）——数据来自 /api/bridge/*（管理口） */
+/* MQTT 互联集群管理页前端（零依赖）——数据来自 /api/bridge/*（管理口）
+ *
+ * 模型（用户明确要求的那一个）：
+ *   服务器级只有一个开关 —— 加入集群 / 退出集群。加入后，所有已加入集群的
+ *   服务器之间**自动全互通**，用户不需要也不应该去逐个挑服务器。
+ *
+ * 所以这个页面刻意**不提供**任何「逐对端」的开关：
+ *   * 没有「加入这个对端」勾选框；
+ *   * 没有「发送本机语音给这个对端」勾选框（拉取模型下后端也不再逐对端发送，
+ *     tx_frames 恒为 0，所以界面上不出现「发出」这种会误导的指标）；
+ *   * 成员列表只读，只有「手动补充」进来的地址才有删除按钮（自动发现的删不掉，
+ *     后端会重新发现，给按钮反而是骗人）。
+ */
 (function () {
   'use strict';
+
+  var STATUS_MS = 10000;   // 集群状态每 10 秒刷新
+  var CAND_MS = 30000;     // 自动发现预览每 30 秒刷新（APRS 本来就靠时间累积）
 
   function $(id) { return document.getElementById(id); }
 
@@ -35,16 +50,28 @@
     return Math.floor(sec / 86400) + ' 天 ' + Math.floor((sec % 86400) / 3600) + ' 小时';
   }
 
-  /* 后端 state 是英文枚举，这里只做展示映射，不改变语义 */
+  /* 后端 state 是英文枚举，这里只做展示映射，不改变语义。
+     ★ connected 只表示「已连上、还在等对方的名片」，不等于已互通 ——
+       真正互通看 member，所以卡片上 member 会盖掉这里的文案。 */
   var STATE = {
-    connected:  ['已连接', 'ok'],
-    connecting: ['连接中', 'mid'],
-    error:      ['错误', 'bad'],
-    disabled:   ['未加入', '']
+    connected:  ['已连接，等待集群名片', 'mid'],
+    connecting: ['连接中…', 'mid'],
+    error:      ['连不上', 'bad'],
+    not_member: ['对方未加入集群', 'off'],
+    disabled:   ['本机未加入集群', 'off'],
+    stopped:    ['连接已断开', 'off']
   };
   function stateOf(p) {
-    return STATE[p && p.state] || [p && p.state ? String(p.state) : '未知', ''];
+    var st = STATE[p && p.state];
+    if (st) return st;
+    return [p && p.state ? String(p.state) : '未知', 'off'];
   }
+
+  /* 本机 broker 连接状态：它坏了的话「已加入集群」只是名义上的 */
+  var LOCAL = {
+    connected: '已连接', connecting: '连接中',
+    disabled: '未加入集群', error: '连接失败', stopped: '已断开'
+  };
 
   function req(path, opts) {
     return fetch(path, opts).then(function (r) {
@@ -72,122 +99,199 @@
     if (el.textContent.indexOf(where + '失败') === 0) el.textContent = '';
   }
   function ok(msgEl, msg) {
-    clear('添加对端');
     msgEl.textContent = msg;
     setTimeout(function () { if (msgEl.textContent === msg) msgEl.textContent = ''; }, 3000);
   }
 
-  /* ---------------- 总状态 ---------------- */
+  /* ---------------- 集群主控区（那一个开关） ---------------- */
+  var busyJoin = false;    // 开关请求在飞：别让 10 秒轮询把按钮文案刷回旧状态
+  var busyPub = false;     // 对外发送开关同理
+  var curEnabled = false;  // 最近一次服务端确认的「加没加入」，点按钮时按它取反
+
   function renderTop(j) {
     var on = !!j.enabled;
-    var top = $('br-top');
-    top.className = 'br-top ' + (on ? 'on' : 'off');
-    $('br-state').textContent = on ? '桥接已启用' : '桥接已停用';
+    curEnabled = on;
+    $('br-top').className = 'br-top ' + (on ? 'on' : 'off');
+    $('br-state').textContent = on
+      ? '已加入集群 · 与所有成员自动互通'
+      : '未加入集群 · 暂不与其他服务器互联';
 
     var kv = [];
-    kv.push('节点 <b class="mono">' + esc(j.node_name || '未命名') + '</b>'
+    kv.push('本机节点 <b class="mono">' + esc(j.node_name || '未命名') + '</b>'
             + (j.node_id ? '（' + esc(j.node_id) + '）' : ''));
     kv.push('broker <b class="mono">' + esc(j.broker || '—') + '</b>');
-    kv.push('主题 ' + (j.topics && j.topics.length
+    kv.push('集群频道 ' + (j.topics && j.topics.length
       ? j.topics.map(function (t) { return '<b>' + esc(t) + '</b>'; }).join(' + ') : '—'));
     $('br-node').innerHTML = kv.join('');
 
-    // 只在没有用户交互时同步勾选态，避免和正在点的开关抢焦点
-    var en = $('br-enabled');
-    if (document.activeElement !== en) en.checked = on;
+    var ls = LOCAL[j.local_state] || (j.local_state ? String(j.local_state) : '未知');
+    $('br-local').innerHTML = '本机 broker 连接：<b>' + esc(ls) + '</b>'
+      + (j.local_connected ? '（本机语音可收发）' : '');
+
+    var le = $('br-local-err');
+    if (j.local_error) {
+      le.textContent = '本机 broker：' + j.local_error;
+      le.classList.remove('hidden');
+    } else {
+      le.textContent = '';
+      le.classList.add('hidden');
+    }
+
+    var btn = $('br-join');
+    if (!busyJoin) {
+      btn.textContent = on ? '退出集群' : '加入集群';
+      btn.className = 'btn br-join ' + (on ? 'danger' : 'primary');
+      btn.title = on
+        ? '退出后本机不再与其他服务器互通语音（不影响别人的互联）'
+        : '加入后自动与其他已加入的服务器互通语音';
+    }
+    if (!busyPub) {
+      $('br-pub').checked = !!j.publish_local;
+      $('br-pub-wrap').className = 'br-tg' + (j.publish_local ? ' on' : '');
+    }
   }
 
-  /* ---------------- 本机流量 ---------------- */
-  function card(k, v) {
-    return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div></div>';
+  /* ---------------- 运行统计 ---------------- */
+  function card(k, v, cls) {
+    return '<div class="card"><div class="k">' + esc(k) + '</div>'
+      + '<div class="v' + (cls ? ' ' + cls : '') + '">' + esc(v) + '</div></div>';
   }
-  function renderStats(local, peerCount) {
-    var l = local || {};
+  function renderStats(j) {
+    var l = j.local || {};
     $('br-stats').innerHTML =
+      card('已加入状态', j.enabled ? '已加入' : '未加入', j.enabled ? 'ok' : '') +
+      card('集群成员数', num(j.member_count)) +
       card('本机已发出', num(l.published)) +
-      card('已接收', num(l.rx_frames)) +
-      card('去重丢弃', num(l.deduped)) +
-      card('对端数量', num(peerCount));
-    $('br-stats-src').textContent = '已发出 = 本机向对端发布的帧数；已接收 = 从对端收到的帧数；'
-      + '去重丢弃 = 回路里重复到达、已丢弃的帧数。';
+      card('已接收（互联）', num(l.rx_frames)) +
+      card('去重丢弃', num(l.deduped));
+    $('br-stats-src').textContent = '已加入状态 = 本机有没有加入集群；集群成员数 = 已确认加入集群的服务器数；'
+      + '本机已发出 = 本机放到桥接主题上供成员拉取的帧数；已接收（互联）= 从集群成员收到的帧数；'
+      + '去重丢弃 = 重复到达、已丢弃的帧数。';
   }
 
-  /* ---------------- 对端卡片 ---------------- */
-  function peerCard(p) {
+  /* ---------------- 成员列表（只读为主） ---------------- */
+  var openMore = {};       // 记住哪些卡片的「详情」是展开的，刷新后不塌回去
+  var delPending = {};     // 「删除」二次确认的中间态
+  var holdRender = false;  // 有删除确认/请求在飞时不重建卡片，否则按钮状态会被轮询刷掉
+
+  function counts(j) {
+    var list = j.peers || [];
+    var m = (typeof j.member_count === 'number')
+      ? j.member_count
+      : list.filter(function (p) { return p.member; }).length;
+    $('br-count').textContent = '集群成员 ' + num(m) + ' 个';
+    $('br-member-n').textContent = num(m);
+    $('br-sum').textContent = '本机已发现 ' + num(list.length) + ' 个候选，其中 '
+      + num(m) + ' 个已加入集群。';
+    return m;
+  }
+
+  function memberCard(p) {
+    var id = p.id || '';
     var st = stateOf(p);
 
-    var bits = [];
-    bits.push('收到 <b>' + num(p.rx_frames) + '</b> 帧');
-    bits.push('发出 <b>' + num(p.tx_frames) + '</b> 帧');
-    var rx = ago(p.last_rx);
+    var badges = [];
+    if (p.member) {
+      badges.push('<span class="br-pill ok">✓ 已在集群</span>');
+    } else {
+      badges.push('<span class="br-pill ' + st[1] + '">' + esc(st[0]) + '</span>');
+    }
+    // 来源用徽章说明：提醒用户「这张卡片是自动来的，不能删」
+    badges.push(p.manual
+      ? '<span class="br-pill info">手动补充</span>'
+      : '<span class="br-pill">' + esc(p.note || '自动发现') + '</span>');
+
+    var meta = [];
+    meta.push('<span>收到 <b>' + num(p.rx_frames) + '</b> 帧</span>');
     var at = p.last_rx
       ? ' title="' + esc(new Date(Number(p.last_rx) * 1000).toLocaleString('zh-CN')) + '"'
       : '';
-    bits.push('最近收到 <b' + at + '>' + esc(rx) + '</b>');
-    bits.push('重连 <b>' + num(p.reconnects) + '</b> 次');
-    if (p.connected && p.uptime) bits.push('已持续 <b>' + esc(dur(p.uptime)) + '</b>');
+    meta.push('<span>最近收到 <b' + at + '>' + esc(ago(p.last_rx)) + '</b></span>');
 
-    return '<div class="br-card ' + esc(p.state || '') + (p.send ? ' sending' : '') +
-        '" data-id="' + esc(p.id || '') + '">' +
+    var more = [];
+    more.push('<span>重连 <b>' + num(p.reconnects) + '</b> 次</span>');
+    if (p.connected && p.uptime) {
+      more.push('<span>本次连接已持续 <b>' + esc(dur(p.uptime)) + '</b></span>');
+    }
+    if (!p.member && p.state === 'not_member') {
+      more.push('<span class="muted">对方没加入集群，稍后会自动重试</span>');
+    }
+
+    return '<div class="br-card ' + esc(p.state || '') + (p.member ? ' member' : '')
+        + '" data-id="' + esc(id) + '">' +
       '<div class="br-head">' +
-        '<span class="br-name">' + esc(p.name || p.id || '(未命名对端)') + '</span>' +
+        '<span class="br-name">' + esc(p.name || id || '(未命名候选)') + '</span>' +
         '<span class="br-host">' + esc((p.host || '—') + ':' + (p.port || 1883)) + '</span>' +
       '</div>' +
-      '<div><span class="br-dot ' + st[1] + '"></span> ' +
-        '<span class="br-st' + (st[1] ? ' ' + st[1] : '') + '">' + esc(st[0]) + '</span>' +
-        (p.enabled ? '' : ' <span class="muted small">（不加入）</span>') +
-      '</div>' +
-      '<div class="br-meta">' + bits.join('') + '</div>' +
-      (p.note ? '<div class="br-note">备注：' + esc(p.note) + '</div>' : '') +
+      '<div class="br-badges">' + badges.join('') + '</div>' +
+      '<div class="br-meta">' + meta.join('') + '</div>' +
+      (p.remote_id
+        ? '<div class="br-note">对端节点标识 <b class="mono">' + esc(p.remote_id) + '</b></div>'
+        : '') +
       (p.last_error ? '<div class="br-err">' + esc(p.last_error) + '</div>' : '') +
-      '<div class="br-ctl">' +
-        '<div class="br-toggles">' +
-          '<label class="br-tg' + (p.enabled ? ' on' : '') + '" title="加入＝本机连接对方，接收并播放对方语音">' +
-            '<input type="checkbox" data-toggle="enabled" data-id="' + esc(p.id) + '"' +
-            (p.enabled ? ' checked' : '') + '> 加入' +
-          '</label>' +
-          '<label class="br-tg send' + (p.send ? ' on' : '') + '" title="发送本机语音给对方">' +
-            '<input type="checkbox" data-toggle="send" data-id="' + esc(p.id) + '"' +
-            (p.send ? ' checked' : '') + '> 发送本机语音' +
-          '</label>' +
-        '</div>' +
-        '<button class="btn danger" data-del="' + esc(p.id) + '" style="margin-left:auto">删除</button>' +
-      '</div>' +
+      '<details class="br-more"' + (openMore[id] ? ' open' : '') + '>' +
+        '<summary>详情</summary>' +
+        '<div class="br-meta">' + more.join('') + '</div>' +
+        (p.manual && p.note ? '<div class="br-note">备注：' + esc(p.note) + '</div>' : '') +
+      '</details>' +
+      (p.manual
+        ? '<div class="br-ctl">'
+          + '<button class="btn danger" data-del="' + esc(id) + '">删除</button>'
+          + '<span class="muted small">只删这条手工补充的地址</span>'
+          + '</div>'
+        : '') +
     '</div>';
   }
 
-  function renderPeers(peers) {
-    peers = peers || [];
-    $('br-peer-n').textContent = peers.length;
-    $('br-count').textContent = peers.length + ' 个对端';
+  /* 未加入集群时，文案由上面的 #br-offline 提示条负责，空状态框不再重复说一遍 */
+  function emptyHtml() {
+    return '<div class="br-eh">还没发现其他 FUS 系统</div><div>'
+      + '确保对端也已加入集群；APRS 扫描需要一点时间累积。</div>';
+  }
+
+  function renderMembers(j) {
+    counts(j);
+    var list = j.peers || [];
+    var on = !!j.enabled;
+    $('br-offline').classList.toggle('hidden', on);
     var grid = $('br-peers');
-    if (!peers.length) {
+    grid.classList.toggle('off', !on);       // 未加入集群：列表置灰，别看着像在互通
+    if (!on) {
+      // 后端在未加入时不会去连任何人（peers 为空），这里只负责把残留卡片置灰
+      grid.innerHTML = list.map(memberCard).join('');
+      $('br-empty').classList.add('hidden');
+      return;
+    }
+    if (!list.length) {
       grid.innerHTML = '';
+      $('br-empty').innerHTML = emptyHtml();
       $('br-empty').classList.remove('hidden');
       return;
     }
     $('br-empty').classList.add('hidden');
-    grid.innerHTML = peers.map(peerCard).join('');
+    grid.innerHTML = list.map(memberCard).join('');
   }
 
-  /* ---------------- 推荐对端 ---------------- */
+  /* ---------------- 自动发现预览（只读） ---------------- */
   function renderCands(list) {
     var box = $('br-cands');
     list = list || [];
     if (!list.length) {
       box.innerHTML = '';
-      $('br-cand-msg').textContent = 'APRS 里暂时没有扫到可互联的节点。';
+      $('br-cand-msg').textContent =
+        'APRS 里暂时没有扫到可以自动互联的 FUS 系统（扫描需要时间累积，稍后自动再看）。';
       return;
     }
-    $('br-cand-msg').textContent = '共 ' + list.length + ' 个候选，已在列表里的会标注出来。';
+    var joined = list.filter(function (c) { return c.already; }).length;
+    $('br-cand-msg').textContent = '共 ' + num(list.length) + ' 个可自动互联的台站'
+      + (joined ? '，其中 ' + num(joined) + ' 个已互通' : '') + '。无需手工添加。';
     box.innerHTML = list.map(function (c) {
       return '<div class="br-cand' + (c.already ? ' already' : '') + '">' +
-        '<span class="br-cn">' + esc(c.name || c.callsign || '未命名节点') + '</span>' +
-        '<span class="br-ca">' + esc(c.callsign || '') + '</span>' +
-        '<span class="br-host">' + esc(c.mqtt_addr || ((c.host || '') + ':' + (c.port || 1883))) + '</span>' +
-        (c.already
-          ? '<span class="pill">已在对端列表</span>'
-          : '<button class="btn" style="margin-left:auto" data-cand="' + esc(c.callsign || '') + '">添加</button>') +
+        '<span class="br-cn">' + esc(c.name || c.callsign || '未命名台站') + '</span>' +
+        (c.callsign ? '<span class="br-ca">' + esc(c.callsign) + '</span>' : '') +
+        '<span class="br-host">'
+          + esc(c.mqtt_addr || ((c.host || '') + ':' + (c.port || 1883))) + '</span>' +
+        (c.already ? '<span class="br-pill ok">已互通</span>' : '') +
       '</div>';
     }).join('');
   }
@@ -196,127 +300,123 @@
     return req('/api/bridge/candidates')
       .then(function (j) { renderCands(j.candidates); })
       .catch(function (e) {
-        // 推荐列表是增值信息，取不到不算页面失败，只在那一行提示
-        $('br-cand-msg').textContent = '读取推荐失败：' + (e && e.message ? e.message : e);
+        // 预览是增值信息，取不到不算页面失败，只在那一行提示
+        $('br-cand-msg').textContent = '读取自动发现列表失败：' + (e && e.message ? e.message : e);
       });
   }
 
   /* ---------------- 轮询 ---------------- */
-  var busy = {};          // 正在切换的对端，避免 10 秒轮询把乐观更新刷回去
-  var delPending = {};    // 「删除」二次确认的中间态
-
   function load() {
     return req('/api/bridge/status').then(function (j) {
       renderTop(j);
-      renderStats(j.local, (j.peers || []).length);
-      var pending = Object.keys(busy).length > 0;
-      if (!pending) renderPeers(j.peers);
+      renderStats(j);
+      // 删除二次确认期间只更新计数，不重建卡片（否则「确认删除？」会被刷掉）
+      if (holdRender) counts(j); else renderMembers(j);
       clear('读取状态');
     }).catch(function (e) {
-      $('br-state').textContent = '读取桥接状态失败';
+      $('br-state').textContent = '读取集群状态失败';
       fail('读取状态', e);
     });
   }
 
-  /* 切换后立刻重新拉一次，以服务端实际状态为准（本地先乐观更新，点着不卡） */
-  function toggle(id, field, value, box) {
-    busy[id] = true;
-    var card = document.querySelector('.br-card[data-id="' + id.replace(/"/g, '') + '"]');
-    var tg = box.closest ? box.closest('.br-tg') : null;
-    if (tg) tg.classList.add('busy');
-    post('/api/bridge/peers/toggle', { id: id, field: field, value: !!value })
+  /* ---------------- 操作 ---------------- */
+  /* 加入 / 退出集群：全页唯一的开关，成功后立刻重新拉状态（以服务端为准） */
+  function setEnabled(value, btn) {
+    busyJoin = true;
+    btn.disabled = true;
+    var old = btn.textContent;
+    btn.textContent = value ? '正在加入集群…' : '正在退出集群…';
+    post('/api/bridge/config', { enabled: !!value })
       .catch(function (e) {
-        box.checked = !value;                    // 失败就把勾选还原，别让界面说谎
-        fail('切换开关', e);
+        fail(value ? '加入集群' : '退出集群', e);
+        btn.textContent = old;               // 失败就还原，别让界面说谎
+        return null;
       })
       .then(function () {
-        delete busy[id];                         // 先解除保护，后面的拉取才能重建列表
-        if (tg) tg.classList.remove('busy');
-        if (card) {                              // 拉取回来之前先给个即时反馈
-          var on = box.checked;
-          if (tg) tg.classList.toggle('on', on);
-          if (field === 'send') card.classList.toggle('sending', on);
-          if (field === 'enabled') card.classList.toggle('disabled', !on);
-        }
+        busyJoin = false;
+        btn.disabled = false;
         return load();
       });
   }
 
-  function setEnabled(value, box) {
+  /* 次级开关：本机语音要不要放出去给成员听 */
+  function setPublish(value, box) {
+    busyPub = true;
     box.disabled = true;
-    post('/api/bridge/config', { enabled: !!value })
-      .then(function () { return load(); })
-      .catch(function (e) { box.checked = !value; fail('切换桥接总开关', e); })
-      .then(function () { box.disabled = false; });
+    post('/api/bridge/config', { publish_local: !!value })
+      .catch(function (e) {
+        fail('切换对外发送', e);
+        return null;
+      })
+      .then(function () {
+        busyPub = false;
+        box.disabled = false;
+        return load();
+      });
   }
 
   function addPeer(data, msgEl) {
     return post('/api/bridge/peers', data).then(function () {
-      ok(msgEl, '已添加并生效');
+      ok(msgEl, '已补充，加入集群时会去互联');
       return load();
     }).catch(function (e) {
       msgEl.textContent = '';
-      fail('添加对端', e);
+      fail('手动补充', e);
     });
   }
+
+  /* 删除：只针对手动补充的条目。二次确认不弹窗打断，按钮自己变成确认态 3 秒 */
   function deletePeer(id, btn) {
     if (!delPending[id]) {
-      // 二次确认：不弹窗打断，按钮自己变成确认态 3 秒
       delPending[id] = true;
+      holdRender = true;
       btn.dataset.old = btn.textContent;
       btn.textContent = '确认删除？';
       setTimeout(function () {
-        if (delPending[id]) { delPending[id] = false; btn.textContent = btn.dataset.old || '删除'; }
+        if (delPending[id]) {
+          delPending[id] = false;
+          holdRender = Object.keys(delPending).length > 0;
+          if (document.body.contains(btn)) btn.textContent = btn.dataset.old || '删除';
+        }
       }, 3000);
       return;
     }
     delete delPending[id];
+    holdRender = Object.keys(delPending).length > 0;
     btn.disabled = true;
+    btn.textContent = '删除中…';
     post('/api/bridge/peers/delete', { id: id })
       .then(function () { return load(); })
-      .catch(function (e) { btn.disabled = false; fail('删除对端', e); });
+      .catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = '删除';
+        fail('删除候选', e);
+      });
   }
 
   /* ---------------- 事件绑定 ---------------- */
-  document.addEventListener('change', function (ev) {
-    var el = ev.target;
-    if (!el || !el.getAttribute) return;
-    var field = el.getAttribute('data-toggle');
-    if (!field) return;
-    toggle(el.getAttribute('data-id'), field, el.checked, el);
+  $('br-join').addEventListener('click', function () {
+    // 按最近一次服务端确认的状态取反，不做界面文案推断
+    setEnabled(!curEnabled, this);
   });
+
+  $('br-pub').addEventListener('change', function () { setPublish(this.checked, this); });
 
   document.addEventListener('click', function (ev) {
     var el = ev.target;
     if (!el || !el.getAttribute) return;
-
     var del = el.getAttribute('data-del');
-    if (del) { deletePeer(del, el); return; }
-
-    var cand = el.getAttribute('data-cand');
-    if (cand) {
-      var box = el.closest ? el.closest('.br-cand') : null;
-      var hostEl = box ? box.querySelector('.br-host') : null;
-      var addr = hostEl ? hostEl.textContent.trim() : '';
-      var i = addr.lastIndexOf(':');
-      var host = i > 0 ? addr.slice(0, i) : addr;
-      var port = i > 0 ? parseInt(addr.slice(i + 1), 10) || 1883 : 1883;
-      var nameEl = box ? box.querySelector('.br-cn') : null;
-      el.disabled = true;
-      el.textContent = '添加中…';
-      addPeer({
-        id: '', name: nameEl ? nameEl.textContent.trim() : cand,
-        host: host, port: port, enabled: true, send: true,
-        note: '来自 APRS 推荐（' + cand + '）'
-      }, $('br-cand-msg')).then(function () {
-        el.disabled = false;
-        el.textContent = '添加';
-        loadCands();
-      });
-    }
+    if (del) deletePeer(del, el);
   });
 
-  $('br-enabled').addEventListener('change', function () { setEnabled(this.checked, this); });
+  // details 的 toggle 事件不冒泡，用捕获阶段监听，记住「详情」展开状态
+  document.addEventListener('toggle', function (ev) {
+    var el = ev.target;
+    if (!el || !el.classList || !el.classList.contains('br-more')) return;
+    var box = el.closest ? el.closest('.br-card') : null;
+    var id = box ? box.getAttribute('data-id') : '';
+    if (id) openMore[id] = !!el.open;
+  }, true);
 
   $('br-reload').addEventListener('click', function () {
     $('br-err').textContent = '';
@@ -337,8 +437,6 @@
       name: $('br-f-name').value.trim(),
       host: host,
       port: port,
-      enabled: $('br-f-enabled').checked,
-      send: $('br-f-send').checked,
       note: $('br-f-note').value.trim()
     }, msg).then(function () {
       $('br-f-name').value = '';
@@ -349,11 +447,11 @@
 
   load();
   loadCands();
-  setInterval(load, 10000);        // 桥接状态每 10 秒刷新一次
+  setInterval(load, STATUS_MS);
   setInterval(function () {
-    // 表单里正在输入时不要动推荐区，免得把光标下的内容换掉
+    // 正在填「手动补充」表单时不要动预览区，免得把光标下的内容换掉
     var a = document.activeElement;
     if (a && a.closest && a.closest('[data-add-peer]')) return;
     loadCands();
-  }, 30000);
+  }, CAND_MS);
 })();

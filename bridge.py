@@ -72,12 +72,17 @@ BRIDGE_ROOT = "FMO/BRIDGE"
 # 有了名片，连上就能自动学到对方 node_id，不用人工填。
 ANNOUNCE_TOPIC = "%s/ANNOUNCE" % BRIDGE_ROOT
 ANNOUNCE_INTERVAL = 60.0              # 定期重播名片（配合 retain，新连上的对端也能立刻拿到）
+# 只有"加入集群"的服务器才会在名片里带这个标记；连上后靠它判断对方是不是集群成员。
+# 没带标记的（例如装了本系统但没加入集群、或根本不是 FUS）不算成员，不当互联对象。
+ANNOUNCE_CLUSTER_FIELD = "cluster"
 DEFAULT_PORT = 1883
 CHANNELS = ("RAW", "TELE")            # 可桥接的频道（对应 FMO/RAW、FMO/TELE）
 LOCAL_BROKER = ("127.0.0.1", 1883)
 
 RECONNECT_MIN = 5.0                   # 对端重连退避初值（秒）
 RECONNECT_MAX = 120.0
+MEMBER_CONFIRM_TIMEOUT = 12.0         # 连上后等多久算"对方没加入集群"
+NON_MEMBER_RETRY = 900.0              # 非成员（或没开桥接的站）多久后再试一次
 DEDUPE_TTL = 20.0                     # 同一帧在这段时间内只播一次
 DEDUPE_MAX = 4000
 CLIENTID_PREFIX = "FMO-BRIDGE-"
@@ -87,6 +92,9 @@ DEFAULT_BRIDGE = {
     "node_id": "",                    # 默认取 subsystem_id
     "node_name": "",
     "channels": ["RAW", "TELE"],
+    # 是否把本机语音放到桥接主题上供**别人拉取**（关掉 = 完全不给别人听）。
+    # 注意这是**全局**的：拉取模型下"听谁的"由听的人决定，所以发送方无法逐对端挑选听众。
+    "publish_local": True,
     "peers": [],
 }
 
@@ -101,71 +109,49 @@ def slot(value):
     return s or "unknown"
 
 
-def out_topic(node_id, peer_id, channel):
-    """本机发给指定对端的主题（发布在**本机** broker 上）。"""
-    return "%s/%s/to/%s/%s" % (BRIDGE_ROOT, slot(node_id), slot(peer_id),
-                               slot(channel))
+def out_topic(node_id, channel):
+    """
+    本机把**自己的**某频道语音放到**本机 broker** 上（4 层）。
+
+    谁想听就连过来订阅 FMO/BRIDGE/+/<频道> —— 这就是"拉取"模型：
+    听谁的由**听的人**决定（他加我为对端 = 他连过来听我），
+    所以"我加他 → 我就听他"成立，不需要双方互相添加。
+    """
+    return "%s/%s/%s" % (BRIDGE_ROOT, slot(node_id), slot(channel))
 
 
-def in_filter(node_id, channel):
-    """连对端 broker 时订阅的过滤器：任何节点发给「我」的某频道。"""
-    return "%s/+/to/%s/%s" % (BRIDGE_ROOT, slot(node_id), slot(channel))
+def in_filter(channel):
+    """连对端 broker 时订阅的过滤器：对方发布的源生语音（4 层）。"""
+    return "%s/+/%s" % (BRIDGE_ROOT, slot(channel))
 
 
 def local_relay_topic(origin_id, channel):
-    """把对端语音在本机重播时用的主题（供本机监控/APP 消费）。"""
-    return "%s/%s/%s" % (BRIDGE_ROOT, slot(origin_id), slot(channel))
-
-
-def peer_target(peer):
     """
-    「发给这个对端」时该用的地址 = **对端自己的 node_id**（不是本机给它起的别名）。
+    把对端语音在本机重播给本地消费者（监控/APP）用（**5 层**）。
 
-    对端还没广播名片时返回 ""，表示暂时无法寻址（等下一步握手完成即可）。
-    允许人工在配置里写 node_id 覆盖（极少数对端无法自动握手的场合）。
+    ★ 故意与 4 层的入站主题区分开：对端订阅的是 FMO/BRIDGE/+/<频道>（4 层），
+      匹配不到这里的 5 层 → 中继进来的语音**不会再被传给别人**，
+      既不形成中转洪泛，也不可能回环。
     """
-    p = peer or {}
-    explicit = str(p.get("node_id") or "").strip()
-    if explicit:
-        return slot(explicit)
-    learned = str(p.get("remote_id") or "").strip()
-    return slot(learned) if learned else ""
+    return "%s/local/%s/%s" % (BRIDGE_ROOT, slot(origin_id), slot(channel))
 
 
-def parse_in_topic(topic, node_id, channel):
+def parse_in_topic(topic):
     """
-    从收到的主题里取出**源节点**；不是"发给我的/该频道"就返回 ""。
+    解析对端发布在它自己 broker 上的源生语音，返回 (源节点, 频道)。
 
-    期望形状：FMO/BRIDGE/<源>/to/<我>/<频道>
-    """
-    origin, ch = parse_in_topic_any(topic, node_id)
-    if not origin:
-        return ""
-    return origin if ch == slot(channel) else ""
-
-
-def parse_in_topic_any(topic, node_id):
-    """
-    解析桥接入站主题，返回 (源节点, 频道)。
-
-    形状必须是 FMO/BRIDGE/<源>/to/<我>/<频道>（**正好 6 层**）。
-    层次/位置不对就当作不是发给我的：
-      * 本机重播给本地消费者用的 FMO/BRIDGE/<源>/<频道> 只有 4 层 → 不匹配，
-        这正是"中继进来的语音不会再被转发出去"的关键（不会形成回环）。
+    只认 4 层 FMO/BRIDGE/<源节点>/<频道>；层数不对（例如本机重播的 5 层主题、
+    或 FMO/RAW 这类源生主题）一律返回空 → 不会被误当成桥接入站流量。
     """
     parts = str(topic or "").split("/")
-    if len(parts) != 6:
+    if len(parts) != 4:
         return "", ""
     if parts[0] != "FMO" or parts[1] != "BRIDGE":
         return "", ""
-    if parts[3] != "to":
-        return "", ""
-    if parts[4] != slot(node_id):
-        return "", ""
     origin = parts[2] or ""
-    if not origin or origin in ("+", "#"):
+    if not origin or origin in ("+", "#", "local"):
         return "", ""
-    return origin, parts[5].upper()
+    return origin, parts[3].upper()
 
 
 def peer_id_from_host(host, port=None):
@@ -196,14 +182,12 @@ def normalize_peer(raw):
         "name": str(p.get("name") or "").strip() or host,
         "host": host,
         "port": port,
-        # enabled = 「加入」：我连它、听它的语音
+        # enabled = 「加入」：我连它、听它的语音（单方面添加即可收听）
         "enabled": bool(p.get("enabled", True)),
-        # send    = 「把我的语音发给它」
-        "send": bool(p.get("send", True)),
         "note": str(p.get("note") or ""),
         # node_id   = 人工指定的对端节点 id（一般留空，由名片自动学）
         "node_id": str(p.get("node_id") or "").strip(),
-        # remote_id = 从对端名片自动学到的节点 id（运行时字段，会持久化便于重启后直接用）
+        # remote_id = 从对端名片自动学到的节点 id（用于界面展示）
         "remote_id": str(p.get("remote_id") or "").strip(),
     }
 
@@ -244,6 +228,7 @@ class BridgeLink(threading.Thread):
         super().__init__(name="bridge-%s" % peer.get("id"), daemon=True)
         self.svc = svc
         self.peer_id = peer.get("id")
+        self.key = peer.get("key") or ("%s:%d" % (peer.get("host"), peer.get("port")))
         self.peer = dict(peer)
         self.stop_event = threading.Event()
         self.connected = False
@@ -255,6 +240,11 @@ class BridgeLink(threading.Thread):
         self.connected_at = 0.0
         self._client = None
         self._alive = True
+        # 集群成员确认：连上先只订阅名片，收到"已加入集群"的名片才开始收语音。
+        # 这样"装了本系统但没加入集群"的站不会被当成员，也不会白白收它的流量。
+        self.member = False
+        self.confirm_deadline = 0.0
+        self.not_member = False
 
     # ---- 状态 ----
     def snapshot(self):
@@ -264,8 +254,9 @@ class BridgeLink(threading.Thread):
             "host": self.peer.get("host"),
             "port": self.peer.get("port"),
             "enabled": bool(self.peer.get("enabled")),
-            "send": bool(self.peer.get("send")),
             "note": self.peer.get("note") or "",
+            "manual": bool(self.peer.get("manual")),
+            "member": bool(self.member),
             "connected": bool(self.connected),
             "state": self.state,
             "rx_frames": self.rx_frames,
@@ -274,19 +265,27 @@ class BridgeLink(threading.Thread):
             "reconnects": self.reconnects,
             "uptime": (time.time() - self.connected_at) if self.connected else 0.0,
             "alive": self._alive,
-            # 从对端名片学到的节点标识；有了它才能真正把语音发过去
+            # 从对端名片学到的节点标识（界面展示用）
             "remote_id": self.peer.get("remote_id") or "",
-            "addressed": bool(peer_target(self.peer)),
         }
 
     def stop(self):
         self.stop_event.set()
+
+    def subscribe_voice(self):
+        """成员确认后，补订阅它的语音主题（4 层：对方的源生语音）。"""
+        cli = self._client
+        if cli is None:
+            return
+        cli.subscribe([in_filter(ch) for ch in self.svc.channels])
 
     # ---- 连接生命周期 ----
     def run(self):
         backoff = RECONNECT_MIN
         while not self.stop_event.is_set():
             self.state = "connecting"
+            self.member = False
+            self.not_member = False
             client = None
             try:
                 creds = self.svc.credentials(self.peer["host"], self.peer["port"])
@@ -297,29 +296,36 @@ class BridgeLink(threading.Thread):
                     self.peer["host"], self.peer["port"],
                     "%s%s" % (CLIENTID_PREFIX, self.svc.client_suffix()),
                     username=username, password=password, keepalive=60,
-                    on_message=self._on_message)
+                    on_message=self._on_message, read_timeout=0.5)
                 self._client = client
                 client.connect()
-                subs = [in_filter(self.svc.node_id, ch) for ch in self.svc.channels]
-                subs.append(ANNOUNCE_TOPIC)          # 顺便取对端名片，学到它的 node_id
-                client.subscribe(subs)
+                # 第一步**只订阅名片**：先确认对方是不是"已加入集群"的成员。
+                # 确认后才订阅语音主题 —— 免得对没加入集群的站白收一堆流量。
+                client.subscribe([ANNOUNCE_TOPIC])
                 self.connected = True
                 self.state = "connected"
                 self.connected_at = time.time()
                 self.last_error = ""
+                self.confirm_deadline = time.time() + MEMBER_CONFIRM_TIMEOUT
                 backoff = RECONNECT_MIN
-                self.svc.log("[BRIDGE] 已连接对端 %s（%s:%d）" % (
+                self.svc.log("[BRIDGE] 已连接 %s（%s:%d），等待集群名片…" % (
                     self.peer.get("name"), self.peer["host"], self.peer["port"]))
                 while not self.stop_event.is_set():
                     client.poll_once()
+                    if not self.member and time.time() > self.confirm_deadline:
+                        # 对方没在名片里声明"已加入集群" → 不是集群成员
+                        self.not_member = True
+                        raise MqttError("对方未加入集群（未收到集群名片）")
             except Exception as e:  # noqa: BLE001
                 self.connected = False
-                self.state = "error"
+                self.state = "not_member" if self.not_member else "error"
                 self.last_error = str(e)
-                self.svc.log("[BRIDGE] 对端 %s 断开: %s（%.0fs 后重连）" % (
-                    self.peer.get("name") or self.peer.get("host"), e, backoff))
+                if not self.stop_event.is_set():
+                    self.svc.log("[BRIDGE] %s：%s" % (
+                        self.peer.get("name") or self.peer.get("host"), e))
             finally:
                 self.connected = False
+                self.member = False
                 self.connected_at = 0.0
                 self._client = None
                 if client is not None:
@@ -327,17 +333,21 @@ class BridgeLink(threading.Thread):
                         client.disconnect()
                     except Exception:  # noqa: BLE001
                         pass
+            if self.not_member:
+                # 非成员：由服务层决定多久后再试，本线程直接退出（不占连接）
+                break
             if self.stop_event.wait(backoff):
                 break
             backoff = min(backoff * 2, RECONNECT_MAX)
             self.reconnects += 1
         self._alive = False
-        self.state = "stopped"
+        if self.state not in ("not_member",):
+            self.state = "stopped"
 
     def _on_message(self, topic, payload):
-        # 节点名片：用于学到对端真实 node_id（寻址必需），不算语音流量
+        # 节点名片：判断对方是不是"已加入集群"的成员，并顺带学到它的节点名
         if topic == ANNOUNCE_TOPIC:
-            self.svc.on_peer_announce(self.peer_id, payload)
+            self.svc.on_peer_announce(self.key, payload)
             return
         self.rx_frames += 1
         self.last_rx = time.time()
@@ -358,11 +368,14 @@ class VoiceBridge(object):
     """
 
     def __init__(self, base_dir, config, save_fn=None, logger=None,
-                 broker=None):
+                 broker=None, candidate_source=None):
         self.base_dir = base_dir
         self.config = config if isinstance(config, dict) else {}
         self.save_fn = save_fn
         self._log_fn = logger
+        # 自动发现集群成员的候选来源（由 api_server 注入：返回 APRS 里"能进去"的台站，
+        # 也就是真正的 FUS 系统）。不注入时只用手动补充的地址。
+        self._candidate_source = candidate_source
         self._lock = threading.RLock()
         self._cfg = load_bridge_config(self.config)
         self.node_id = (str(self._cfg.get("node_id") or "").strip()
@@ -387,6 +400,7 @@ class VoiceBridge(object):
         self._stats = {"published": 0, "rx_frames": 0, "deduped": 0}
         self._peer_tx = {}                    # peer_id -> 已发出的消息数
         self._unaddressed = {}                # 已提示过"还没拿到名片"的对端
+        self._backoff_until = {}              # target key -> 非成员下次可试时间
         self._last_announce = 0.0
         self._cert_cache = None
         self._thread = None
@@ -547,11 +561,18 @@ class VoiceBridge(object):
         self._forward(channel, payload)
 
     def _publish_announce(self, client):
-        """广播本机名片（retain=保留，后连上的对端也能立刻拿到）。"""
+        """
+        广播本机名片（retain=保留，后连上的对端也能立刻拿到）。
+
+        带 `cluster: true` 表示"本机已加入集群" —— 对端靠这个标记判断要不要互联。
+        没加入集群时本机根本不会走到这里（本地循环只在 enabled 时才连），
+        所以这里固定带 true。
+        """
         try:
             payload = json.dumps({
                 "node_id": self.node_id,
                 "node_name": self.node_name,
+                ANNOUNCE_CLUSTER_FIELD: True,
                 "ver": 1,
                 "ts": int(time.time()),
             }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -559,90 +580,95 @@ class VoiceBridge(object):
         except Exception as e:  # noqa: BLE001
             self.log("[BRIDGE] 广播节点名片失败: %s" % e)
 
-    def on_peer_announce(self, peer_id, payload):
+    def on_peer_announce(self, key, payload):
         """
-        收到对端名片 → 记下它的真实 node_id（寻址必需）。
-        只在变化时落盘，避免每 60 秒写一次配置文件。
+        收到某个成员候选的名片。
+
+        - 名片里带 `cluster: true` → 对方**已加入集群**：确认成员、补订阅它的语音主题；
+        - 不带 → 对方没加入集群，不作为互联对象（链路会超时自己收掉，并进入长退避）。
         """
         try:
             data = json.loads((payload or b"").decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001
             return
-        rid = str(data.get("node_id") or "").strip()
-        if not rid or rid == self.node_id:
+        if not bool(data.get(ANNOUNCE_CLUSTER_FIELD)):
             return
+        rid = str(data.get("node_id") or "").strip()
         rname = str(data.get("node_name") or "").strip()
+        if rid and rid == self.node_id:
+            return                      # 自己的名片（自测把本机当成员时会走到这里）
         with self._lock:
-            for p in self._cfg["peers"]:
-                if p.get("id") != peer_id:
-                    continue
-                changed = (p.get("remote_id") != rid)
-                p["remote_id"] = rid
-                if rname and not p.get("name_manual"):
-                    # 对端名片里的名字更好看，但只在用户没自己命名时采用
-                    if p.get("name") in (p.get("host"), "") or changed:
-                        p["name"] = rname
-                break
-            else:
+            link = self._links.get(key)
+            if link is None:
                 return
-            link = self._links.get(peer_id)
-            if link is not None:
-                link.update_peer(p)
+            changed = False
+            if rid and link.peer.get("remote_id") != rid:
+                link.peer["remote_id"] = rid
+                changed = True
+            if rname and not link.peer.get("manual") \
+                    and link.peer.get("name") in (link.peer.get("host"), "", None):
+                link.peer["name"] = rname
+            # 手动补充的条目同步回配置，重启后界面还能显示对端节点名
+            for p in self._cfg["peers"]:
+                if p.get("id") == link.peer_id:
+                    if p.get("remote_id") != link.peer.get("remote_id", ""):
+                        p["remote_id"] = link.peer.get("remote_id", "")
+                        changed = True
+                    break
+        if not link.member:
+            link.member = True
+            try:
+                link.subscribe_voice()
+            except Exception as e:  # noqa: BLE001
+                self.log("[BRIDGE] 订阅 %s 的语音主题失败: %s" % (rname or key, e))
+            self.log("[BRIDGE] 集群成员已确认：%s（%s）" % (rname or key, rid or "?"))
         if changed:
             self._persist()
-            self.log("[BRIDGE] 学到对端 %s 的节点标识: %s" % (rname or peer_id, rid))
 
     def _forward(self, channel, payload):
+        """
+        把本机某频道语音放到**本机 broker** 上，供对端拉取。
+
+        拉取模型：这里只发一次，不逐对端点名 —— 谁想听谁就连过来订阅。
+        所以"我加他 → 我听他"成立，不需要双方互相添加。
+        """
         with self._lock:
             if not self._cfg.get("enabled"):
                 return
-            peers = [dict(p) for p in self._cfg["peers"] if p.get("send")]
+            if not self._cfg.get("publish_local", True):
+                return                      # 关掉了「对外发送本机语音」
             client = self._local_client
-        if client is None or not peers:
+        if client is None:
             return
         payload = payload or b""
-        for p in peers:
-            target = peer_target(p)
-            if not target:
-                # 还没收到对端名片 → 无法寻址。等下一步握手完成即可，
-                # 这里不刷屏（只提示一次），也绝不退化成"广播"（那会让"发给谁"失控）。
-                pid = p.get("id")
-                if pid not in self._unaddressed:
-                    self._unaddressed[pid] = True
-                    self.log("[BRIDGE] 对端 %s 尚未广播节点名片，暂不发送语音（等握手）"
-                             % p.get("name"))
-                continue
-            try:
-                # 逐对端主题 → "我的语音给谁"可精确控制
-                client.publish(out_topic(self.node_id, target, channel), payload)
-                with self._lock:
-                    self._stats["published"] += 1
-                    self._peer_tx[p["id"]] = self._peer_tx.get(p["id"], 0) + 1
-            except Exception as e:  # noqa: BLE001
-                self.log("[BRIDGE] 转发到 %s 失败: %s" % (p.get("name"), e))
-                return
+        try:
+            client.publish(out_topic(self.node_id, channel), payload)
+            with self._lock:
+                self._stats["published"] += 1
+        except Exception as e:  # noqa: BLE001
+            self.log("[BRIDGE] 发布本机语音失败: %s" % e)
 
     # ---------------- 发：对端语音 → 本机重播 ----------------
     def on_remote_frame(self, peer, topic, payload):
         """
-        收到对端（或经对端 broker 中转的第三方）语音。
+        收到集群成员发布在它自己 broker 上的源生语音。
 
+        - 该链路不是已确认成员 → 丢弃（没加入集群/已退出的一律不收）
         - 源节点是自己 → 丢弃（自己绕回来的）
-        - 该对端没「加入」或已删除 → 丢弃（自主选择：不加入就不接收）
         - 重复帧 → 丢弃
-        然后投递到队列，由本机连接线程重播给本机消费者。
+        然后投递到队列，由本机连接线程重播给本机消费者（5 层主题，不再外传）。
         """
         pid = (peer or {}).get("id")
+        key = (peer or {}).get("key") or pid
+        # 只接受**已确认的集群成员**发来的语音。
+        # 注意这里必须看链路自己（link.member），不能去 config 的手动对端列表里找 ——
+        # 自动发现的成员根本不在那个列表里（真实 bug：语音收到了却被丢在这）。
         with self._lock:
-            cur = None
-            for p in self._cfg["peers"]:
-                if p["id"] == pid:
-                    cur = p
-                    break
-            if cur is None or not cur.get("enabled"):
+            link = self._links.get(key)
+            if link is None or not link.member:
                 return
         payload = payload or b""
-        origin, channel = parse_in_topic_any(topic, self.node_id)
+        origin, channel = parse_in_topic(topic)
         if not origin:
             return
         if channel not in self.channels:
@@ -673,34 +699,92 @@ class VoiceBridge(object):
             d[key] = now
         return False
 
-    # ---------------- 对端链路管理 ----------------
+    # ---------------- 集群成员发现与链路管理 ----------------
+    def _collect_targets(self, include_auto=True):
+        """
+        汇总"要互联的服务器"：
+          * 手动补充的地址（配置里的 peers）—— 给 APRS 扫不到的站点用；
+          * **自动发现**：candidate_source（APRS 里"能进去"的台站，即真正的 FUS 系统）。
+        用户只需要决定"加不加入集群"，不用逐个挑服务器。
+
+        include_auto=False 时只返回手动条目 —— 界面上"未加入集群"也要能看到并管理
+        自己填过的地址（否则手动条目会在未加入时凭空消失，删都删不掉）。
+        """
+        out = {}
+        with self._lock:
+            for p in self._cfg.get("peers") or []:
+                if p.get("enabled") and p.get("host"):
+                    key = "%s:%d" % (p["host"], int(p["port"]))
+                    out[key] = dict(p, manual=True, key=key)
+        if not include_auto:
+            return out
+        src = self._candidate_source
+        if src:
+            try:
+                cands = src() or []
+            except Exception as e:  # noqa: BLE001
+                self.log("[BRIDGE] 获取发现候选失败: %s" % e)
+                cands = []
+            for c in cands:
+                try:
+                    host = str(c.get("host") or "").strip()
+                    if not host:
+                        continue
+                    port = int(c.get("port") or DEFAULT_PORT)
+                    key = "%s:%d" % (host, port)
+                    if key in out:
+                        continue
+                    out[key] = {
+                        "id": "auto-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10],
+                        "name": str(c.get("name") or c.get("callsign") or host),
+                        "host": host, "port": port,
+                        "enabled": True, "manual": False, "note": "自动发现",
+                        "node_id": "", "remote_id": "", "key": key,
+                    }
+                except Exception:  # noqa: BLE001
+                    continue
+        return out
+
     def _sync_links(self):
-        """按当前配置启停对端线程（配置改了不用重启进程）。"""
+        """按"是否加入集群"启停成员链路（配置改了不用重启进程）。"""
         with self._lock:
             enabled = bool(self._cfg.get("enabled"))
-            want = {}
-            if enabled:
-                for p in self._cfg["peers"]:
-                    if p.get("enabled") and p.get("host"):
-                        want[p["id"]] = p
-            # 停掉不再需要的
-            for pid in list(self._links.keys()):
-                if pid not in want:
-                    link = self._links.pop(pid)
+        want = self._collect_targets() if enabled else {}
+        now = time.time()
+        with self._lock:
+            links = dict(self._links)
+            backoff = dict(self._backoff_until)
+        # 停掉不再需要的
+        for key in list(links.keys()):
+            if key not in want:
+                link = self._links.pop(key, None)
+                if link is not None:
                     link.stop()
-                    self.log("[BRIDGE] 已停止对端链路 %s（不加入或已删除）"
-                             % (link.peer.get("name") or pid))
-            # 启动新增的
-            for pid, p in want.items():
-                link = self._links.get(pid)
-                if link is None or not link.is_alive():
-                    link = BridgeLink(self, p)
-                    self._links[pid] = link
-                    link.start()
-                    self.log("[BRIDGE] 已建立对端链路 %s（%s:%d）"
-                             % (p.get("name"), p.get("host"), p.get("port")))
-                else:
-                    link.update_peer(p)
+                    self.log("[BRIDGE] 已停止成员链路 %s（已退出集群或已删除）"
+                             % (link.peer.get("name") or key))
+        # 启动新的
+        for key, p in want.items():
+            link = self._links.get(key)
+            if link is not None and link.is_alive():
+                link.update_peer(p)
+                continue
+            if link is not None and link.not_member:
+                # 确认不是集群成员：记退避，过一阵再试，避免反复连它
+                self._links.pop(key, None)
+                self._backoff_until[key] = now + NON_MEMBER_RETRY
+                continue
+            if backoff.get(key, 0) > now:
+                continue
+            link = BridgeLink(self, p)
+            self._links[key] = link
+            link.start()
+            self.log("[BRIDGE] 尝试互联成员候选：%s（%s:%d）%s"
+                     % (p.get("name"), p.get("host"), p.get("port"),
+                        "（手动补充）" if p.get("manual") else "（自动发现）"))
+        # 清理过期的退避记录，避免无界增长
+        if len(self._backoff_until) > 2000:
+            for k in [k for k, t in self._backoff_until.items() if t < now]:
+                self._backoff_until.pop(k, None)
 
     # ---------------- 配置读写 ----------------
     def _persist(self):
@@ -711,6 +795,7 @@ class VoiceBridge(object):
                 "node_id": self._cfg.get("node_id") or "",
                 "node_name": self._cfg.get("node_name") or "",
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
+                "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg.get("peers") or []],
             }
             snapshot = json.loads(json.dumps(self.config["bridge"]))
@@ -723,7 +808,7 @@ class VoiceBridge(object):
         return True
 
     def set_config(self, enabled=None, node_name=None, channels=None,
-                   node_id=None):
+                   node_id=None, publish_local=None):
         with self._lock:
             if enabled is not None:
                 was = bool(self._cfg.get("enabled"))
@@ -745,6 +830,8 @@ class VoiceBridge(object):
                 chans = [c for c in chans if c in CHANNELS] or ["RAW"]
                 self._cfg["channels"] = chans
                 self.channels = list(chans)
+            if publish_local is not None:
+                self._cfg["publish_local"] = bool(publish_local)
         self._persist()
         self._sync_links()
         return self.public_config()
@@ -767,7 +854,7 @@ class VoiceBridge(object):
         return np, ""
 
     def set_peer_field(self, pid, field, value):
-        if field not in ("enabled", "send"):
+        if field not in ("enabled",):
             return None, "不支持的字段: %s" % field
         with self._lock:
             for p in self._cfg["peers"]:
@@ -798,6 +885,7 @@ class VoiceBridge(object):
                 "node_id": self.node_id,
                 "node_name": self.node_name,
                 "channels": list(self.channels),
+                "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg["peers"]],
             }
 
@@ -808,44 +896,62 @@ class VoiceBridge(object):
     def status(self):
         with self._lock:
             cfg = self.public_config()
+            enabled = cfg["enabled"]
             links = dict(self._links)
             stats = dict(self._stats)
             peer_tx = dict(self._peer_tx)
-            peers_cfg = list(cfg["peers"])
+            backoff = dict(self._backoff_until)
+            local_state = self._local_state
+            local_error = self._local_error
+            local_ready = self._local_ready
+        now = time.time()
+        # 成员列表 = 手动补充 + 自动发现（用户不用自己挑服务器）。
+        # 未加入集群时仍列出**手动条目**，否则界面上会"消失"、也删不掉。
+        targets = self._collect_targets(include_auto=enabled)
         out_peers = []
-        for p in peers_cfg:
-            link = links.get(p["id"])
+        for key, t in targets.items():
+            link = links.get(key)
             if link is not None and link.is_alive():
                 snap = link.snapshot()
+                snap["key"] = key
             else:
+                st = "connecting"
+                if not enabled:
+                    st = "disabled"
+                elif backoff.get(key, 0) > now:
+                    st = "not_member"        # 已确认对方没加入集群，等退避
                 snap = {
-                    "id": p["id"], "name": p.get("name"), "host": p.get("host"),
-                    "port": p.get("port"), "enabled": bool(p.get("enabled")),
-                    "send": bool(p.get("send")), "note": p.get("note") or "",
-                    "connected": False,
-                    "state": ("disabled" if not (cfg["enabled"] and p.get("enabled"))
-                              else "connecting"),
+                    "id": t.get("id"), "name": t.get("name"), "host": t.get("host"),
+                    "port": t.get("port"), "enabled": True,
+                    "note": t.get("note") or "", "manual": bool(t.get("manual")),
+                    "member": False, "connected": False, "state": st,
                     "rx_frames": 0, "last_rx": 0.0, "last_error": "",
                     "reconnects": 0, "uptime": 0.0, "alive": False,
-                    "remote_id": p.get("remote_id") or "",
-                    "addressed": bool(peer_target(p)),
+                    "remote_id": t.get("remote_id") or "", "key": key,
                 }
-            snap["tx_frames"] = peer_tx.get(p["id"], 0)
+            snap["tx_frames"] = peer_tx.get(key, 0)
             out_peers.append(snap)
+        # 成员排前面，其次已连接，再按名字 —— 让界面第一眼看到"谁真的在集群里"
+        out_peers.sort(key=lambda x: (not x.get("member"), not x.get("connected"),
+                                      x.get("name") or ""))
+        members = [p for p in out_peers if p.get("member")]
         return {
             "ok": True,
             "enabled": cfg["enabled"],
             "node_id": cfg["node_id"],
             "node_name": cfg["node_name"],
+            "publish_local": cfg.get("publish_local", True),
             "broker": "%s:%d" % (self.broker_host, self.broker_port),
             "topics": list(cfg["channels"]),
-            "local_state": self._local_state,
-            "local_error": self._local_error,
-            "local_connected": bool(self._local_ready),
+            "local_state": local_state,
+            "local_error": local_error,
+            "local_connected": bool(local_ready),
+            "member_count": len(members),
             "local": {
                 "published": stats.get("published", 0),
                 "rx_frames": stats.get("rx_frames", 0),
                 "deduped": stats.get("deduped", 0),
             },
             "peers": out_peers,
+            "members": members,
         }

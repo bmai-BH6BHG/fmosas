@@ -3,31 +3,55 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MQTT 互联桥接 · FUS</title>
+<title>MQTT 互联集群 · FUS</title>
 <link rel="stylesheet" href="/admin/bas.css">
 <style>
-  /* 总状态条：一眼看清「桥接开没开、我是谁、连到哪个 broker」 */
+  /* 集群主控区：一眼看清「加没加入、我是谁、连哪个 broker、桥哪些频道」。
+     这里是页面唯一的操作点——加入/退出集群，所以给它最高视觉权重。 */
   .br-top {
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    display: flex; align-items: flex-start; gap: 18px; flex-wrap: wrap;
     background: var(--panel); border: 1px solid var(--line);
     border-left: 3px solid var(--muted);
-    border-radius: 10px; padding: 12px 16px; margin: 12px 0;
+    border-radius: 10px; padding: 14px 16px; margin: 12px 0;
   }
-  .br-top.on { border-left-color: var(--ok); }
+  .br-top.on  { border-left-color: var(--ok); }
   .br-top.off { border-left-color: var(--muted); }
-  .br-top .br-state { font-size: 16px; font-weight: 700; }
-  .br-top.on .br-state { color: var(--ok); }
+  .br-tmain { flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 7px; }
+  .br-top .br-state { font-size: 17px; font-weight: 700; }
+  .br-top.on .br-state  { color: var(--ok); }
   .br-top.off .br-state { color: var(--muted); }
   .br-kv { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
   .br-kv b { color: var(--text); font-weight: 600; }
   .br-kv .mono { color: var(--accent); }
-  .br-switch { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 
-  /* 对端卡片：tint 由状态决定，沿用 stations.html 的「顶部渐变条 + hover 发光」 */
+  /* 主开关做成显式按钮：勾选框容易被当成「次要选项」，而这是全页唯一的决定 */
+  .br-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; }
+  .btn.br-join { font-size: 14px; padding: 9px 20px; font-weight: 700; }
+
+  /* 次级开关：勾选=把本机语音放出去 */
+  .br-tg {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    font-size: 12.5px; color: var(--muted); border: 1px solid var(--line);
+    background: var(--panel2); border-radius: 999px; padding: 5px 12px 5px 8px;
+    user-select: none; transition: border-color .16s ease, color .16s ease;
+  }
+  .br-tg input { margin: 0; }
+  .br-tg.on { color: var(--ok); border-color: rgba(34, 197, 94, .55); }
+
+  /* 未加入集群时的提示条 */
+  .br-offline {
+    border: 1px dashed var(--line); border-radius: 10px; padding: 10px 14px;
+    color: var(--warn); background: rgba(245, 158, 11, .06);
+    margin: 10px 0; font-size: 13px; line-height: 1.8;
+  }
+
+  /* 成员卡片：tint 由状态决定，沿用 stations.html 的「顶部渐变条 + hover 发光」 */
   .br-grid {
     display: grid; gap: 14px; margin: 12px 0;
     grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
   }
+  /* 未加入集群时成员列表整体压低存在感：后端这时不会去连任何人 */
+  .br-grid.off { opacity: .6; }
   .br-card {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 12px; padding: 14px 16px;
@@ -43,24 +67,41 @@
     border-color: var(--tint, var(--accent));
     box-shadow: 0 10px 30px #0006, 0 0 22px -8px var(--tint, var(--accent));
   }
-  .br-card.connected  { --tint: var(--ok); }
+  /* member 优先于其它状态着色：真正在互通才是这张卡片的重点 */
+  .br-card.member     { --tint: var(--ok); }
+  .br-card.connected  { --tint: var(--warn); }
   .br-card.connecting { --tint: var(--warn); }
   .br-card.error      { --tint: var(--danger); }
-  .br-card.disabled   { --tint: #64748b; opacity: .78; }
-  .br-card.sending    { border-color: rgba(167, 139, 250, .5); }
+  .br-card.not_member { --tint: #64748b; }
+  .br-card.disabled,
+  .br-card.stopped    { --tint: #64748b; }
 
   .br-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .br-name { font-size: 16px; font-weight: 700; color: var(--text); }
+  .br-card.member .br-name { color: var(--ok); }
   .br-host {
     font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
     color: var(--muted); word-break: break-all; flex: 1; min-width: 120px;
   }
-  .br-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
-  /* 相邻的「数字」之间要有间隔：拼接出来是「收到 120 帧发出 340 帧」，
+  .br-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* 状态徽章：文字本身就是信息，颜色只是冗余提示 */
+  .br-pill {
+    font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .br-pill.ok   { color: var(--ok); border-color: var(--ok); background: rgba(34, 197, 94, .10); font-weight: 600; }
+  .br-pill.mid  { color: var(--warn); border-color: rgba(245, 158, 11, .6); }
+  .br-pill.bad  { color: var(--danger); border-color: var(--danger); background: rgba(239, 68, 68, .10); }
+  .br-pill.info { color: var(--accent); border-color: var(--line); background: var(--panel2); }
+
+  .br-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  /* 相邻的「数字」之间要有间隔：拼接出来是「收到 120 帧最近收到 3 秒前」，
      光靠空格在中文与数字混排时几乎看不出来 */
   .br-meta > span { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
   .br-meta b { color: var(--text); font-weight: 600; }
   .br-note { font-size: 12px; color: var(--muted); word-break: break-word; }
+  .br-note b { color: var(--text); }
   .br-err {
     font-size: 12px; color: var(--danger); line-height: 1.6;
     background: rgba(239, 68, 68, .08); border: 1px solid rgba(239, 68, 68, .35);
@@ -71,31 +112,28 @@
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
 
-  /* 状态点：文字才是主信息，点只是辅助 */
-  .br-dot {
-    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-    background: var(--muted); vertical-align: 0;
+  /* 卡片内的「详情」折叠：次要信息（重连、持续时长、备注）收起来，
+     主行永远只放「在不在集群、收到多少、最近什么时候收到」 */
+  .br-more summary {
+    cursor: pointer; font-size: 12px; color: var(--accent); outline: none;
+    list-style: none;
   }
-  .br-dot.ok  { background: var(--ok); box-shadow: 0 0 7px var(--ok); }
-  .br-dot.mid { background: var(--warn); box-shadow: 0 0 7px var(--warn); }
-  .br-dot.bad { background: var(--danger); box-shadow: 0 0 7px var(--danger); }
-  .br-st { color: var(--muted); font-size: 13px; }
-  .br-st.ok  { color: var(--ok); }
-  .br-st.mid { color: var(--warn); }
-  .br-st.bad { color: var(--danger); }
+  .br-more summary::-webkit-details-marker { display: none; }
+  .br-more summary::before { content: "▸ "; }
+  .br-more[open] summary::before { content: "▾ "; }
+  .br-more > div { margin-top: 7px; }
 
-  /* 开关：勾选=参与，未勾选=不参与（加入 / 发送本机语音） */
-  .br-toggles { display: flex; gap: 12px; flex-wrap: wrap; }
-  .br-tg {
-    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-    font-size: 12px; color: var(--muted); border: 1px solid var(--line);
-    background: var(--panel2); border-radius: 999px; padding: 4px 10px 4px 6px;
-    user-select: none; transition: border-color .16s ease, color .16s ease;
+  /* 折叠区（自动发现 / 手动补充）：默认收起，不抢主开关的注意力 */
+  .br-fold {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 14px; margin: 12px 0;
   }
-  .br-tg input { margin: 0; }
-  .br-tg.on { color: var(--ok); border-color: rgba(34, 197, 94, .55); }
-  .br-tg.send.on { color: #a78bfa; border-color: rgba(167, 139, 250, .6); }
-  .br-tg.busy { opacity: .5; }
+  .br-fold > summary {
+    cursor: pointer; font-size: 14px; font-weight: 600; color: var(--text);
+    outline: none;
+  }
+  .br-fold > summary::marker { color: var(--accent); }
+  .br-fold[open] > summary { margin-bottom: 8px; }
 
   .br-cands {
     display: grid; gap: 10px;
@@ -113,7 +151,7 @@
     border: 1px solid var(--line);
   }
   .br-cand .br-host { flex: 1 1 100%; }
-  .br-cand.already { opacity: .62; }
+  .br-cand.already { opacity: .72; }
 
   .empty {
     padding: 24px; text-align: center; color: var(--muted);
@@ -127,6 +165,7 @@
     .top-right { margin-left: 0; width: 100%; }
     main { padding: 12px; }
     .br-kv, .br-meta { gap: 10px; }
+    .br-actions { width: 100%; }
     .br-grid { grid-template-columns: minmax(0, 1fr); }
     .br-cands { grid-template-columns: minmax(0, 1fr); }
   }
@@ -138,7 +177,7 @@
 <body>
 
 <header class="top">
-  <div class="brand">MQTT 互联桥接 <span class="muted">无主节点 · 互通语音</span></div>
+  <div class="brand">MQTT 互联集群 <span class="muted">加入即全互通 · 无需逐个添加服务器</span></div>
   <div class="top-right">
     <span class="badge" id="br-count">—</span>
     <button class="btn ghost" id="br-reload">刷新</button>
@@ -148,63 +187,81 @@
 
 <main>
   <p class="muted small" style="margin:6px 0 0;">
-    无主节点形式：<b>每个系统独立连接，互不影响；对端一个断了，其他照常</b>。
-    本机既是服务端也是客户端，不依赖任何中心节点。<br>
-    <b>「加入」</b>＝本机主动连接对方，接收并播放对方的语音；
-    <b>「发送本机语音」</b>＝把本机语音发给对方。两者可单独开关。
+    <b>加入集群后，所有已加入集群的服务器之间自动语音互通，不需要逐个添加服务器。</b><br>
+    服务器级只有一个开关：<b>加入集群 / 退出集群</b>。加入后本机自动发现其他已加入的服务器并与之互联；
+    无主节点，任意一条链路断了，其他链路照常工作。
   </p>
 
   <div id="br-top" class="br-top off">
-    <span class="br-state" id="br-state">正在读取桥接状态…</span>
-    <span class="br-kv" id="br-node"></span>
-    <label class="br-switch">
-      <input type="checkbox" id="br-enabled"> 启用桥接
-    </label>
+    <div class="br-tmain">
+      <div class="br-state" id="br-state">正在读取集群状态…</div>
+      <div class="br-kv" id="br-node"></div>
+      <div class="br-kv" id="br-local"></div>
+      <div class="br-err small hidden" id="br-local-err"></div>
+    </div>
+    <div class="br-actions">
+      <button class="btn primary br-join" id="br-join">加入集群</button>
+      <label class="br-tg" id="br-pub-wrap" title="关掉后本机语音不再放到桥接主题上">
+        <input type="checkbox" id="br-pub"> 对外发送本机语音
+      </label>
+      <div class="muted small" style="max-width:300px;line-height:1.7;">
+        关掉后别人听不到本机语音，但本机仍能听别人。
+      </div>
+    </div>
   </div>
+
   <div id="br-err" class="err small"></div>
 
-  <h3>本机流量</h3>
+  <h3>运行统计</h3>
   <div class="grid" id="br-stats"></div>
   <div class="muted small" id="br-stats-src"></div>
 
-  <h3>对端列表（<span id="br-peer-n">0</span>）</h3>
-  <div class="muted small">每 10 秒自动刷新。开关切换后立即重新拉取状态，以服务端实际状态为准。</div>
-  <div class="br-grid" id="br-peers"></div>
-  <div class="empty hidden" id="br-empty">
-    <div class="br-eh">还没有配置任何对端</div>
-    <div>
-      这是<b>无主互联</b>：没有中心节点，只要填上对方的 <code>host:port</code> 就能互通语音，
-      不需要谁先批准。先添加一个对端，或在下面「推荐对端」里一键添加。
-    </div>
+  <h3>集群成员（<span id="br-member-n">0</span>）</h3>
+  <div class="muted small" id="br-sum">正在读取成员列表…</div>
+  <div class="muted small">每 10 秒自动刷新。列表由服务端排序（已在集群的成员排在前面），本页不再重排。</div>
+  <div class="br-offline hidden" id="br-offline">
+    未加入集群，暂不互联。点上面的「加入集群」后，系统会自动发现其他已加入的服务器并全互通。
   </div>
+  <div class="br-grid" id="br-peers"></div>
+  <div class="empty hidden" id="br-empty"></div>
 
-  <h3>添加对端</h3>
-  <div class="panel" data-add-peer>
-    <div class="form">
-      <label>名称<input id="br-f-name" placeholder="某某站（可留空，用主机名）"></label>
-      <label>主机<input id="br-f-host" placeholder="fs.example.com 或 1.2.3.4"></label>
-      <label>端口<input id="br-f-port" type="number" min="1" max="65535" value="1883"></label>
-      <label>备注<input id="br-f-note" placeholder="备注（选填）"></label>
+  <details class="br-fold">
+    <summary>自动发现来源（APRS）</summary>
+    <div class="muted small" style="margin:6px 0;line-height:1.8;">
+      系统从 APRS 扫到、且能通过本机证书登录的 FUS 系统。加入集群后会自动与其中的成员互联，无需手工操作。
+      这里只用来让你知道「系统在跟谁自动互联」，<b>不需要添加</b>。
     </div>
     <div class="row">
-      <label class="checkbox"><input type="checkbox" id="br-f-enabled" checked> 加入（接收并播放对方语音）</label>
-      <label class="checkbox"><input type="checkbox" id="br-f-send" checked> 发送本机语音给对方</label>
-      <button class="btn primary" id="br-add">添加对端</button>
-      <span class="muted small" id="br-add-msg"></span>
+      <button class="btn ghost" id="br-cand-reload">刷新列表</button>
+      <span class="muted small" id="br-cand-msg">还没有读取自动发现列表。</span>
     </div>
-  </div>
+    <div class="br-cands" id="br-cands"></div>
+  </details>
 
-  <h3>推荐对端 <span class="muted small">（从 APRS 扫到的台站里找可互联的节点）</span></h3>
-  <div class="row">
-    <button class="btn ghost" id="br-cand-reload">刷新推荐</button>
-    <span class="muted small" id="br-cand-msg">还没有读取推荐列表。</span>
-  </div>
-  <div class="br-cands" id="br-cands"></div>
+  <details class="br-fold" data-add-peer>
+    <summary>手动补充（APRS 扫不到的站点）</summary>
+    <div class="muted small" style="margin:6px 0;line-height:1.8;">
+      一般不需要。只有对端不在 APRS 上、或主机地址扫不到时才用。
+      补充进来的地址会和自动发现的站点一样，按「加入集群」的开关去互联。
+    </div>
+    <div class="panel">
+      <div class="form">
+        <label>名称<input id="br-f-name" placeholder="某某站（可留空）"></label>
+        <label>主机<input id="br-f-host" placeholder="fs.example.com 或 1.2.3.4"></label>
+        <label>端口<input id="br-f-port" type="number" min="1" max="65535" value="1883"></label>
+        <label>备注<input id="br-f-note" placeholder="备注（选填）"></label>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="br-add">补充这个地址</button>
+        <span class="muted small" id="br-add-msg"></span>
+      </div>
+    </div>
+  </details>
 </main>
 
 <footer class="foot">
-  <div class="foot-name">MQTT 互联桥接 · FUS 分系统</div>
-  <div class="foot-cn">FMO 统一安全服务端 · 无主节点互联，对端独立不影响</div>
+  <div class="foot-name">MQTT 互联集群 · FUS 分系统</div>
+  <div class="foot-cn">FMO 统一安全服务端 · 加入集群即与所有成员自动语音互通</div>
   <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
   <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
 </footer>

@@ -38,11 +38,11 @@ from cert_gen import (b64url_encode, b64url_decode, ed25519_sign,
 
 TOPICS = ["FMO/RAW", "FMO/TELE", "FMO/SERVER_INFO"]
 
-# 互联桥接：别的 FUS 系统转发过来的语音会在本机重播到 FMO/BRIDGE/<源节点>/<频道>。
-# 监控也订阅它 —— 否则"互联进来的语音"在本机看不到、进不了 voice.db、界面上听不到。
-# 注意只订阅 4 层的重播主题；桥接的**出站**主题是 6 层（/to/<对端>/），不会被这里收到，
-# 所以监控不会把自己发出去的语音又抄回来。
-BRIDGE_TOPICS = ["FMO/BRIDGE/+/RAW", "FMO/BRIDGE/+/TELE"]
+# 互联桥接：别的 FUS 节点转来的语音会在本机重播到
+# FMO/BRIDGE/local/<源节点>/<频道>（**5 层**，故意与对端订阅的 4 层发布主题区分开，
+# 这样中继进来的语音不会再被传给其他节点）。监控订阅它 —— 否则"互联进来的语音"
+# 在本机看不到、进不了 voice.db、界面上听不到。
+BRIDGE_TOPICS = ["FMO/BRIDGE/local/+/RAW", "FMO/BRIDGE/local/+/TELE"]
 
 FRAME_GAP_SEC = 3.0        # 同一 (呼号,会话) 帧间隔超过该值则切段
 SEG_MAX_SEC = 300.0        # 单段最长时长（强制切段）
@@ -1016,16 +1016,16 @@ class VoiceMonitor(threading.Thread):
     # ---------- 语音段聚合 ----------
     def _on_message(self, topic, payload):
         now = time.time()
-        # 互联桥接：monitor 也订阅了 FMO/BRIDGE/<源节点>/<频道>（4 层）。
+        # 互联桥接：monitor 也订阅了 FMO/BRIDGE/local/<源节点>/<频道>（5 层）。
         # 拆掉前缀后按同频道处理 —— 别人转来的语音照样入库、可听，
         # 只是记下 origin，界面上就能区分"本地收的"和"互联来的"。
         origin = ""
-        if topic.startswith("FMO/BRIDGE/"):
+        if topic.startswith("FMO/BRIDGE/local/"):
             parts = topic.split("/")
-            if len(parts) != 4:
-                return          # 6 层的出站主题不会被订阅到；这里只做兜底
-            origin = parts[2]
-            topic = "FMO/%s" % parts[3]
+            if len(parts) != 5:
+                return
+            origin = parts[3]
+            topic = "FMO/%s" % parts[4]
         if topic == "FMO/RAW":
             frame = parse_fmo_frame(payload)
             if not frame or not frame["callsign"]:

@@ -883,6 +883,39 @@ def _ensure_keepalive(path):
         pass          # 库还不存在等情况：下次再试
 
 
+def _bridge_candidates_source():
+    """
+    自动发现集群成员的候选：APRS 里**能进去**的台站。
+
+    为什么只取"能进去"的：能通过本机证书登录，说明①它确实是 FUS 系统、
+    ②它信任本机根 CA —— 这正是互联的前置条件。这样候选集很小（个位数），
+    不用对着几百个台站乱连（也就不可能重演早先的"探测风暴"）。
+    对方是否**已加入集群**还要靠名片确认，这里只是候选。
+    """
+    out = []
+    store = getattr(ApiHandler, 'aprs_store', None)
+    if store is None:
+        return out
+    try:
+        stations = store.all()
+    except Exception:  # noqa: BLE001
+        return out
+    for st in stations:
+        try:
+            if not st.get('reachable'):
+                continue
+            host = str(st.get('host') or '').strip()
+            if not host:
+                continue
+            port = int(st.get('port') or 1883)
+            out.append({'host': host, 'port': port,
+                        'name': st.get('name') or st.get('callsign') or host,
+                        'callsign': st.get('callsign') or ''})
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def get_db():
     """获取数据库连接（WAL 模式 + 超时，避免与 sync_engine 并发读写互锁）
 
@@ -2076,7 +2109,8 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 cfg = svc.set_config(enabled=body.get('enabled'),
                                      node_name=body.get('node_name'),
                                      channels=body.get('channels'),
-                                     node_id=body.get('node_id'))
+                                     node_id=body.get('node_id'),
+                                     publish_local=body.get('publish_local'))
                 if cfg.get('enabled'):
                     svc.start()      # 之前可能处于禁用状态，这里把连接线程拉起来
                 self.send_json({'ok': True, 'config': cfg})
@@ -3259,12 +3293,13 @@ def main():
     if _BRIDGE_AVAILABLE:
         try:
             _BRIDGE = VoiceBridge(BASE_DIR, CONFIG, save_fn=save_config,
-                                  logger=print)
+                                  logger=print,
+                                  candidate_source=_bridge_candidates_source)
             if _BRIDGE.public_config().get('enabled'):
                 _BRIDGE.start()
             else:
                 _BRIDGE._local_state = 'disabled'
-                print("[INIT] 互联桥接: 未启用（bridge.enabled=false，可在 /admin/bridge 打开）")
+                print("[INIT] 互联桥接: 未加入集群（可在 /admin/bridge 一键加入）")
         except Exception as e:
             print("[INIT] 互联桥接启动失败: %s" % e)
             _BRIDGE = None
