@@ -1,4 +1,4 @@
-/* MQTT 互联集群管理页前端（零依赖）——数据来自 /api/bridge/*（管理口）
+﻿/* MQTT 互联集群管理页前端（零依赖）——数据来自 /api/bridge/*（管理口）
  *
  * 模型（用户明确要求的那一个）：
  *   服务器级只有一个开关 —— 加入集群 / 退出集群。加入后，所有已加入集群的
@@ -8,14 +8,14 @@
  *   * 没有「加入这个对端」勾选框；
  *   * 没有「发送本机语音给这个对端」勾选框（拉取模型下后端也不再逐对端发送，
  *     tx_frames 恒为 0，所以界面上不出现「发出」这种会误导的指标）；
- *   * 成员列表只读，只有「手动补充」进来的地址才有删除按钮（自动发现的删不掉，
+ *   * 成员列表只读，只有「手动补充」进来的地址才有删除按钮（名册里的删不掉，
  *     后端会重新发现，给按钮反而是骗人）。
  */
 (function () {
   'use strict';
 
   var STATUS_MS = 10000;   // 集群状态每 10 秒刷新
-  var CAND_MS = 30000;     // 自动发现预览每 30 秒刷新（APRS 本来就靠时间累积）
+  var CAND_MS = 30000;     // 集群名册预览每 30 秒刷新（名册来自总服务器）
 
   function $(id) { return document.getElementById(id); }
 
@@ -199,7 +199,7 @@
     // 来源用徽章说明：提醒用户「这张卡片是自动来的，不能删」
     badges.push(p.manual
       ? '<span class="br-pill info">手动补充</span>'
-      : '<span class="br-pill">' + esc(p.note || '自动发现') + '</span>');
+      : '<span class="br-pill">' + esc(p.note || '总服务器名册') + '</span>');
 
     var meta = [];
     meta.push('<span>收到 <b>' + num(p.rx_frames) + '</b> 帧</span>');
@@ -246,7 +246,7 @@
   /* 未加入集群时，文案由上面的 #br-offline 提示条负责，空状态框不再重复说一遍 */
   function emptyHtml() {
     return '<div class="br-eh">还没发现其他 FUS 系统</div><div>'
-      + '确保对端也已加入集群；APRS 扫描需要一点时间累积。</div>';
+      + '确保对方也加入了集群；总服务器名册需要对方上报后才会出现。</div>';
   }
 
   function renderMembers(j) {
@@ -272,26 +272,30 @@
     grid.innerHTML = list.map(memberCard).join('');
   }
 
-  /* ---------------- 自动发现预览（只读） ---------------- */
+  /* ---------------- 集群名册预览（只读，来自总服务器） ---------------- */
   function renderCands(list) {
     var box = $('br-cands');
     list = list || [];
     if (!list.length) {
       box.innerHTML = '';
       $('br-cand-msg').textContent =
-        'APRS 里暂时没有扫到可以自动互联的 FUS 系统（扫描需要时间累积，稍后自动再看）。';
+        '总服务器名册里还没有其他 FUS 分系统（或暂时拉不到名册，稍后自动再看）。';
       return;
     }
     var joined = list.filter(function (c) { return c.already; }).length;
-    $('br-cand-msg').textContent = '共 ' + num(list.length) + ' 个可自动互联的台站'
-      + (joined ? '，其中 ' + num(joined) + ' 个已互通' : '') + '。无需手工添加。';
+    var offline = list.filter(function (c) { return c.online === false; }).length;
+    $('br-cand-msg').textContent = '总服务器名册共 ' + num(list.length) + ' 台 FUS 分系统'
+      + (joined ? '，其中 ' + num(joined) + ' 台已在互联' : '')
+      + (offline ? '，' + num(offline) + ' 台离线' : '')
+      + '。加入集群后自动互联，无需手工操作。';
     box.innerHTML = list.map(function (c) {
       return '<div class="br-cand' + (c.already ? ' already' : '') + '">' +
-        '<span class="br-cn">' + esc(c.name || c.callsign || '未命名台站') + '</span>' +
-        (c.callsign ? '<span class="br-ca">' + esc(c.callsign) + '</span>' : '') +
+        '<span class="br-cn">' + esc(c.name || c.subsystem_id || '未命名分系统') + '</span>' +
+        (c.subsystem_id ? '<span class="br-ca">' + esc(c.subsystem_id) + '</span>' : '') +
         '<span class="br-host">'
           + esc(c.mqtt_addr || ((c.host || '') + ':' + (c.port || 1883))) + '</span>' +
-        (c.already ? '<span class="br-pill ok">已互通</span>' : '') +
+        (c.online === false ? '<span class="br-pill off">离线</span>' : '') +
+        (c.already ? '<span class="br-pill ok">已在互联</span>' : '') +
       '</div>';
     }).join('');
   }
@@ -301,7 +305,7 @@
       .then(function (j) { renderCands(j.candidates); })
       .catch(function (e) {
         // 预览是增值信息，取不到不算页面失败，只在那一行提示
-        $('br-cand-msg').textContent = '读取自动发现列表失败：' + (e && e.message ? e.message : e);
+        $('br-cand-msg').textContent = '读取集群名册失败：' + (e && e.message ? e.message : e);
       });
   }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MQTT 互联桥接测试（集群模型）
@@ -261,7 +261,7 @@ class BridgeTestCase(unittest.TestCase):
                "bridge": {"enabled": enabled, "node_id": node_id,
                           "node_name": node_id, "publish_local": publish_local,
                           "peers": peers or []}}
-        # 候选来源模拟"APRS 自动发现"：一串 {host, port, name}
+        # 名册来源模拟"从总服务器拉到的 FUS 分系统清单"：{host, port, name, subsystem_id}
         src = None
         if candidates is not None:
             src = lambda: [dict(c) for c in candidates]      # noqa: E731
@@ -273,8 +273,9 @@ class BridgeTestCase(unittest.TestCase):
         return svc
 
     @staticmethod
-    def cand(broker, name):
-        return {"host": "127.0.0.1", "port": broker.port, "name": name}
+    def cand(broker, name, subsystem_id=""):
+        return {"host": "127.0.0.1", "port": broker.port, "name": name,
+                "subsystem_id": subsystem_id}
 
 
 # ---------------------------------------------------------------- 主题
@@ -338,6 +339,55 @@ class ConfigTests(unittest.TestCase):
 # ---------------------------------------------------------------- 集群集成
 
 class ClusterTests(BridgeTestCase):
+    def test_member_count_includes_self(self):
+        """
+        ★ 用户反馈：点了加入集群还显示 0，看不出自己进去没有。
+        刚加入、还没有别的成员时，集群成员数应当是 **1**（本机自己）。
+        """
+        local = self.new_broker()
+        a = self.new_bridge(local, node_id="sub-A", candidates=[])
+        st = a.status()
+        self.assertTrue(st["enabled"])
+        self.assertEqual(1, st["member_count"], "加入集群后成员数应含自己=1")
+        self.assertEqual(0, st["peer_member_count"])
+        self.assertTrue(st["self_joined"])
+        # 退出后应回到 0
+        a.set_config(enabled=False)
+        self.assertEqual(0, a.status()["member_count"])
+
+    def test_registry_identity_mismatch_is_rejected(self):
+        """
+        ★ 相互验证：总服务器名册登记了这个地址对应哪个 subsystem_id，
+        对方名片里的节点标识必须与之一致。不一致 → 不认作成员。
+        （真实场景：同一台机器在名册里登记了两个域名，其中一个指向本机自己。）
+        """
+        local = self.new_broker()
+        other = self.new_broker()
+        b = self.new_bridge(other, node_id="sub-REAL", candidates=[])
+        b.start()
+        a = self.new_bridge(local, node_id="sub-A",
+                            candidates=[self.cand(other, "冒名", "sub-OTHER")])
+        a.start()
+        self.assertTrue(wait_for(lambda: a.status()["local_connected"]))
+        self.assertTrue(wait_for(
+            lambda: any(p["state"] == "not_member" for p in a.status()["peers"]),
+            timeout=20), "名册不符的不能算成员")
+        st = a.status()
+        self.assertEqual(0, st["peers"][0]["member"])
+        self.assertEqual(1, st["member_count"], "只有本机自己")
+
+    def test_registry_identity_match_is_accepted(self):
+        """名册登记与名片一致 → 正常认作成员。"""
+        local = self.new_broker()
+        other = self.new_broker()
+        b = self.new_bridge(other, node_id="sub-B", candidates=[])
+        b.start()
+        a = self.new_bridge(local, node_id="sub-A",
+                            candidates=[self.cand(other, "B站", "sub-B")])
+        a.start()
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1, timeout=15),
+                        "应确认 1 个对端成员")
+
     def test_join_cluster_connects_automatically(self):
         """
         加入集群后，**不用手工添加对端**：自动发现的候选里，
@@ -353,7 +403,7 @@ class ClusterTests(BridgeTestCase):
                             candidates=[self.cand(other, "B站")])
         a.start()
         self.assertTrue(wait_for(lambda: a.status()["local_connected"]))
-        self.assertTrue(wait_for(lambda: a.status()["member_count"] == 1),
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1),
                         "应自动把已加入集群的 B 站认成成员，实际=%s"
                         % json.dumps([{k: p[k] for k in ("name", "state", "member")}
                                       for p in a.status()["peers"]],
@@ -372,7 +422,7 @@ class ClusterTests(BridgeTestCase):
         self.assertTrue(wait_for(lambda: a.status()["local_connected"]))
         time.sleep(2.0)
         st = a.status()
-        self.assertEqual(0, st["member_count"], "未加入集群的站不该算成员")
+        self.assertEqual(0, st["peer_member_count"], "未加入集群的站不该算成员")
         self.assertTrue(all(not p["member"] for p in st["peers"]))
         b.stop()
 
@@ -391,8 +441,8 @@ class ClusterTests(BridgeTestCase):
         b.start()
         self.assertTrue(wait_for(lambda: a.status()["local_connected"]))
         self.assertTrue(wait_for(lambda: b.status()["local_connected"]))
-        self.assertTrue(wait_for(lambda: a.status()["member_count"] == 1))
-        self.assertTrue(wait_for(lambda: b.status()["member_count"] == 1))
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1))
+        self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
 
         # A 站本地有人说话 → B 站应当能听到（重播到 B 的 broker）
         broker_a.push("FMO/RAW", b"voice-from-A")
@@ -419,7 +469,7 @@ class ClusterTests(BridgeTestCase):
         for x in (a, b, c):
             x.start()
         for x in (a, b, c):
-            self.assertTrue(wait_for(lambda x=x: x.status()["member_count"] == 2,
+            self.assertTrue(wait_for(lambda x=x: x.status()["peer_member_count"] == 2,
                                      timeout=15),
                             "每个成员应自动互联其余两个")
         ba.push("FMO/RAW", b"from-A")
@@ -442,9 +492,9 @@ class ClusterTests(BridgeTestCase):
                             candidates=[self.cand(ba, "A"), self.cand(bb, "B")])
         for x in (a, b, c):
             x.start()
-        self.assertTrue(wait_for(lambda: a.status()["member_count"] == 2, timeout=15),
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 2, timeout=15),
                         "A 应同时确认 B 和 C 两个成员")
-        self.assertTrue(wait_for(lambda: c.status()["member_count"] == 2, timeout=15))
+        self.assertTrue(wait_for(lambda: c.status()["peer_member_count"] == 2, timeout=15))
 
         bb.stop()                       # B 挂了
         time.sleep(2.0)
@@ -452,7 +502,7 @@ class ClusterTests(BridgeTestCase):
         self.assertTrue(wait_for(lambda: bc.got(B.local_relay_topic("sub-A", "RAW")),
                                  timeout=12),
                         "B 挂掉后 A 与 C 仍必须互通")
-        self.assertGreaterEqual(c.status()["member_count"], 1,
+        self.assertGreaterEqual(c.status()["peer_member_count"], 1,
                                 "C 至少还应保留与 A 的互联")
 
     def test_leaving_cluster_stops_everything(self):
@@ -463,7 +513,7 @@ class ClusterTests(BridgeTestCase):
         a = self.new_bridge(local, node_id="sub-A",
                             candidates=[self.cand(other, "B")])
         a.start()
-        self.assertTrue(wait_for(lambda: a.status()["member_count"] == 1))
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1))
 
         a.set_config(enabled=False)
         self.assertFalse(a.status()["local_connected"], "退出集群后本机连接要断")
@@ -482,7 +532,7 @@ class ClusterTests(BridgeTestCase):
                             candidates=[self.cand(ba, "A")])
         a.start()
         b.start()
-        self.assertTrue(wait_for(lambda: a.status()["member_count"] == 1))
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1))
         ba.push("FMO/RAW", b"should-not-leave")
         time.sleep(1.5)
         self.assertEqual([], b.status()["peers"][0].get("rx_frames")
@@ -494,7 +544,7 @@ class ClusterTests(BridgeTestCase):
         a = self.new_bridge(ba, node_id="sub-A", candidates=[self.cand(bb, "B")])
         b = self.new_bridge(bb, node_id="sub-B", candidates=[self.cand(ba, "A")])
         a.start(); b.start()
-        self.assertTrue(wait_for(lambda: b.status()["member_count"] == 1))
+        self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
         ba.push("FMO/RAW", b"dup")
         want = B.local_relay_topic("sub-A", "RAW")
         self.assertTrue(wait_for(lambda: bb.got(want)))
@@ -510,7 +560,7 @@ class ClusterTests(BridgeTestCase):
         a = self.new_bridge(ba, node_id="sub-A", candidates=[self.cand(bb, "B")])
         b = self.new_bridge(bb, node_id="sub-B", candidates=[self.cand(ba, "A")])
         a.start(); b.start()
-        self.assertTrue(wait_for(lambda: b.status()["member_count"] == 1))
+        self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
         bb.push("FMO/BRIDGE/sub-A/RAW", b"echo")
         time.sleep(1.0)
         self.assertEqual([], ba.got(B.local_relay_topic("sub-A", "RAW")),
@@ -539,7 +589,8 @@ class ClusterTests(BridgeTestCase):
                             candidates=[self.cand(self.new_broker(), "X")])
         st = a.status()
         for k in ("ok", "enabled", "node_id", "node_name", "broker", "topics",
-                  "local", "peers", "members", "member_count", "publish_local"):
+                  "local", "peers", "members", "member_count", "peer_member_count",
+                  "self_joined", "publish_local"):
             self.assertIn(k, st)
         p = st["peers"][0]
         for k in ("id", "name", "host", "port", "member", "connected", "state",
@@ -578,12 +629,26 @@ class ApiAndPackagingTests(unittest.TestCase):
                       "/api/bridge/config", "/api/bridge/candidates"):
             self.assertIn(route, api, "缺少接口 %s" % route)
 
-    def test_candidate_source_uses_reachable_aprs_only(self):
-        """自动发现只取"能进去"的台站，避免对着几百个台站乱连（探测风暴教训）。"""
+    def test_roster_source_pulls_from_master(self):
+        """
+        ★ 集群名册必须**从总服务器拉取**（装了我们 FUS 的分系统注册表），
+        而不是拿 APRS 台站凑数 —— APRS 上绝大多数根本不是 FUS 服务器。
+        总服务器的 /api/server/list 在公网口放行，分系统直接 GET 即可。
+        """
         api = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
-        self.assertIn("_bridge_candidates_source", api)
-        block = api.split("def _bridge_candidates_source", 1)[1].split("def ", 1)[0]
-        self.assertIn("reachable", block)
+        self.assertIn("_bridge_roster_source", api)
+        block = api.split("def _bridge_roster_source", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("/api/server/list", block, "应从总服务器 /api/server/list 拉名册")
+        self.assertIn("master_url", block)
+        self.assertIn("subsystem_id", block, "名册条目要带 subsystem_id（用于相互验证）")
+        self.assertNotIn("aprs_store", block, "不该再拿 APRS 台站当集群候选")
+        self.assertIn("_ROSTER_CACHE", api, "名册要缓存，别每轮都去打总服务器")
+
+    def test_identity_verification_uses_roster(self):
+        """相互验证：名片里的节点标识必须与名册登记的 subsystem_id 一致。"""
+        src = open(os.path.join(ROOT, "bridge.py"), encoding="utf-8").read()
+        self.assertIn("expect_id", src)
+        self.assertIn("与总服务器名册不符", src)
 
     def test_bridge_api_not_public(self):
         api = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()

@@ -245,6 +245,7 @@ class BridgeLink(threading.Thread):
         self.member = False
         self.confirm_deadline = 0.0
         self.not_member = False
+        self.reject_reason = ""
 
     # ---- 状态 ----
     def snapshot(self):
@@ -312,10 +313,12 @@ class BridgeLink(threading.Thread):
                     self.peer.get("name"), self.peer["host"], self.peer["port"]))
                 while not self.stop_event.is_set():
                     client.poll_once()
-                    if not self.member and time.time() > self.confirm_deadline:
-                        # 对方没在名片里声明"已加入集群" → 不是集群成员
+                    if not self.member and (self.reject_reason
+                                            or time.time() > self.confirm_deadline):
+                        # 对方没在名片里声明"已加入集群"（或身份与名册不符）→ 不是成员
                         self.not_member = True
-                        raise MqttError("对方未加入集群（未收到集群名片）")
+                        raise MqttError(self.reject_reason
+                                        or "对方未加入集群（未收到集群名片）")
             except Exception as e:  # noqa: BLE001
                 self.connected = False
                 self.state = "not_member" if self.not_member else "error"
@@ -508,6 +511,7 @@ class VoiceBridge(object):
                 self.log("[BRIDGE] 已连接本机 broker %s:%d，订阅 %s" % (
                     self.broker_host, self.broker_port,
                     ", ".join("FMO/%s" % c for c in self.channels)))
+                last_sync = time.time()
                 while not self._stop.is_set():
                     client.poll_once()
                     self._drain_out_queue(client)   # 跨线程的重播请求在这里落地
@@ -515,6 +519,13 @@ class VoiceBridge(object):
                     # （否则会一直挂着旧连接，界面上看起来"关了还连着"）
                     if not self._cfg.get("enabled"):
                         break
+                    # ★ 定期回收/重启成员链路。
+                    #   本机循环连着 broker 时会一直待在这个内层循环里，如果不再调用
+                    #   _sync_links()，那些"已确认不是成员而退出"的链路线程会一直挂在
+                    #   self._links 里：状态卡在"连接中"、退避重试也永远不会发生。
+                    if time.time() - last_sync >= 5.0:
+                        last_sync = time.time()
+                        self._sync_links()
                     if time.time() - self._last_announce > ANNOUNCE_INTERVAL:
                         self._last_announce = time.time()
                         self._publish_announce(client)
@@ -600,6 +611,16 @@ class VoiceBridge(object):
         with self._lock:
             link = self._links.get(key)
             if link is None:
+                return
+            # ★ 相互验证：总服务器名册登记了这个地址对应哪个 subsystem_id，
+            #   对方名片里的节点标识必须与之一致。不一致说明该地址上跑的不是名册里
+            #   那套系统（冒充、或换了部署），**不认作成员**。
+            expect = str(link.peer.get("expect_id") or "").strip()
+            if expect and rid and rid != expect:
+                if not link.reject_reason:
+                    link.reject_reason = ("节点标识与总服务器名册不符（名册=%s 实际=%s）"
+                                          % (expect, rid))
+                    self.log("[BRIDGE] 拒绝 %s：%s" % (key, link.reject_reason))
                 return
             changed = False
             if rid and link.peer.get("remote_id") != rid:
@@ -723,7 +744,7 @@ class VoiceBridge(object):
             try:
                 cands = src() or []
             except Exception as e:  # noqa: BLE001
-                self.log("[BRIDGE] 获取发现候选失败: %s" % e)
+                self.log("[BRIDGE] 获取集群名册失败: %s" % e)
                 cands = []
             for c in cands:
                 try:
@@ -731,15 +752,23 @@ class VoiceBridge(object):
                     if not host:
                         continue
                     port = int(c.get("port") or DEFAULT_PORT)
+                    sid = str(c.get("subsystem_id") or "").strip()
+                    if sid and sid == self.node_id:
+                        continue        # 名册里的自己，跳过
                     key = "%s:%d" % (host, port)
                     if key in out:
                         continue
                     out[key] = {
-                        "id": "auto-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10],
-                        "name": str(c.get("name") or c.get("callsign") or host),
+                        "id": "roster-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10],
+                        "name": str(c.get("name") or host),
                         "host": host, "port": port,
-                        "enabled": True, "manual": False, "note": "自动发现",
-                        "node_id": "", "remote_id": "", "key": key,
+                        "enabled": True, "manual": False,
+                        "note": "总服务器名册",
+                        "node_id": "", "remote_id": "",
+                        # 名册登记的节点标识：用于"相互验证"（见 on_peer_announce）
+                        "expect_id": sid,
+                        "online": bool(c.get("online", True)),
+                        "key": key,
                     }
                 except Exception:  # noqa: BLE001
                     continue
@@ -911,7 +940,9 @@ class VoiceBridge(object):
         out_peers = []
         for key, t in targets.items():
             link = links.get(key)
-            if link is not None and link.is_alive():
+            if link is not None:
+                # 用链路自己的快照（线程已退出时也保留 state/last_error，
+                # 界面才能正确显示"对方未加入集群/连不上"，而不是笼统的"连接中"）
                 snap = link.snapshot()
                 snap["key"] = key
             else:
@@ -935,9 +966,13 @@ class VoiceBridge(object):
         out_peers.sort(key=lambda x: (not x.get("member"), not x.get("connected"),
                                       x.get("name") or ""))
         members = [p for p in out_peers if p.get("member")]
+        # ★ 集群成员数**含本机自己**：刚加入、还没别的成员时应该是 1，不是 0
+        #   （用户反馈：点了加入集群还显示 0，看不出自己到底进去没有）
+        count = (1 if cfg["enabled"] else 0) + len(members)
         return {
             "ok": True,
             "enabled": cfg["enabled"],
+            "self_joined": bool(cfg["enabled"]),
             "node_id": cfg["node_id"],
             "node_name": cfg["node_name"],
             "publish_local": cfg.get("publish_local", True),
@@ -946,7 +981,8 @@ class VoiceBridge(object):
             "local_state": local_state,
             "local_error": local_error,
             "local_connected": bool(local_ready),
-            "member_count": len(members),
+            "peer_member_count": len(members),
+            "member_count": count,
             "local": {
                 "published": stats.get("published", 0),
                 "rx_frames": stats.get("rx_frames", 0),

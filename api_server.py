@@ -883,37 +883,123 @@ def _ensure_keepalive(path):
         pass          # 库还不存在等情况：下次再试
 
 
-def _bridge_candidates_source():
-    """
-    自动发现集群成员的候选：APRS 里**能进去**的台站。
+# 总服务器名册缓存。★ 关键：**读取永不阻塞** —— 由后台线程负责刷新，
+# 接口/桥接只读缓存立刻返回。总服务器忙起来单次响应可能要几十秒（实测 50~77s），
+# 若在请求路径里同步拉，会把桥接循环和接口一起拖死。
+_ROSTER_CACHE = {"at": 0.0, "failed": True, "data": []}
+_ROSTER_LOCK = threading.Lock()
+_ROSTER_THREAD = None
+_ROSTER_REFRESH_SEC = 300.0     # 后台刷新间隔（正常 5 分钟一次）
+_ROSTER_RETRY_SEC = 60.0        # 失败后多久再试
+_ROSTER_TIMEOUT = 90.0          # 单次请求超时（总服务器忙时要宽容）
 
-    为什么只取"能进去"的：能通过本机证书登录，说明①它确实是 FUS 系统、
-    ②它信任本机根 CA —— 这正是互联的前置条件。这样候选集很小（个位数），
-    不用对着几百个台站乱连（也就不可能重演早先的"探测风暴"）。
-    对方是否**已加入集群**还要靠名片确认，这里只是候选。
+
+def _bridge_roster_source():
     """
-    out = []
-    store = getattr(ApiHandler, 'aprs_store', None)
-    if store is None:
-        return out
+    集群成员名册 = **从总服务器拉取**（`{master_url}/api/server/list`）的缓存快照。
+
+    为什么用总服务器而不是 APRS：APRS 上什么台站都有，绝大多数根本不是装了 FUS 的
+    服务器；总服务器上才有**装了我们 FUS 的分系统注册表**（每个都有 subsystem_id /
+    域名 / 名称 / 在线状态），这才是权威名单。该接口在总服务器公网口放行。
+
+    ★ 本函数只读缓存、**绝不发起网络请求**（见模块顶部注释），所以不会拖慢任何人。
+    """
+    with _ROSTER_LOCK:
+        return [dict(x) for x in _ROSTER_CACHE["data"]]
+
+
+def _roster_fetch():
+    """真正去总服务器拉一次（只在后台线程里调用）。返回 (ok, data)。"""
+    master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
+    if not master:
+        return False, []
+    # 优先本机地址：总服务器常与分系统同机，而 master_url 配的是公网域名 ——
+    # 从自己访问自己的公网地址要走 NAT 环回，很不稳定。
+    bases = []
     try:
-        stations = store.all()
+        mp = urlparse(master)
+        mport = mp.port or (443 if mp.scheme == 'https' else 80)
+        if mp.scheme and mport:
+            bases.append('%s://127.0.0.1:%d' % (mp.scheme, mport))
+            try:
+                lip = socket.gethostbyname(socket.gethostname())
+                if lip and lip != '127.0.0.1':
+                    bases.append('%s://%s:%d' % (mp.scheme, lip, mport))
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
-        return out
-    for st in stations:
+        pass
+    bases.append(master)        # 兜底：总服务器在远端时走配置地址
+
+    out, last_err = [], ''
+    for base in bases:
+        url = base + '/api/server/list'
         try:
-            if not st.get('reachable'):
-                continue
-            host = str(st.get('host') or '').strip()
-            if not host:
-                continue
-            port = int(st.get('port') or 1883)
-            out.append({'host': host, 'port': port,
-                        'name': st.get('name') or st.get('callsign') or host,
-                        'callsign': st.get('callsign') or ''})
-        except Exception:  # noqa: BLE001
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=_ROSTER_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+            for s in payload.get('servers') or []:
+                addr = str(s.get('address') or '').strip()
+                if not addr:
+                    continue
+                # address 形如 "fmo.fmrs.cn:35928"（分系统 API 口）→ 取主机名；
+                # MQTT 口按默认 1883（EMQX 默认）；非默认口可用「手动补充」覆盖。
+                host = addr.split('/')[0].split('@')[-1]
+                if host.count(':') == 1:
+                    host = host.split(':')[0]
+                host = host.strip()
+                if not host:
+                    continue
+                name = ''.join(ch for ch in str(s.get('name') or '')
+                               if ch.isprintable()).strip()
+                out.append({
+                    'host': host,
+                    'port': 1883,
+                    'name': name or str(s.get('subsystem_id') or host),
+                    'subsystem_id': str(s.get('subsystem_id') or '').strip(),
+                    'online': bool(s.get('online')),
+                })
+            return True, out
+        except Exception as e:  # noqa: BLE001
+            last_err = '%s → %s' % (url, e)
             continue
-    return out
+    print("[BRIDGE] 拉取总服务器名册失败: %s" % last_err)
+    return False, []
+
+
+def _roster_refresh_once():
+    ok, data = _roster_fetch()
+    with _ROSTER_LOCK:
+        _ROSTER_CACHE['at'] = time.time()
+        _ROSTER_CACHE['failed'] = not ok
+        if ok:
+            _ROSTER_CACHE['data'] = data
+    return ok, data
+
+
+def _roster_loop(stop_event):
+    """后台刷新线程：定期拉名册，失败缩短重试间隔。"""
+    while not stop_event.is_set():
+        ok, _data = _roster_refresh_once()
+        n = len(_bridge_roster_source())
+        if ok:
+            print("[BRIDGE] 已从总服务器更新集群名册：%d 台 FUS 分系统" % n)
+            wait = _ROSTER_REFRESH_SEC
+        else:
+            wait = _ROSTER_RETRY_SEC
+        stop_event.wait(wait)
+
+
+def start_roster_refresher():
+    """启动名册后台刷新线程（幂等）。"""
+    global _ROSTER_THREAD
+    if _ROSTER_THREAD is not None and _ROSTER_THREAD.is_alive():
+        return _ROSTER_THREAD
+    stop_event = threading.Event()
+    _ROSTER_THREAD = threading.Thread(target=_roster_loop, args=(stop_event,),
+                                      name="bridge-roster", daemon=True)
+    _ROSTER_THREAD.start()
+    return _ROSTER_THREAD
 
 
 def get_db():
@@ -2126,37 +2212,37 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
 
     def _bridge_candidates(self, svc):
         """
-        推荐可互联的对端：从 APRS 扫到的 FMO 台站里挑（那些就是别的 FUS 系统）。
-        纯便利功能，减少手工填 host；不做任何自动连接。
+        返回"集群名册"预览：**从总服务器拉到的 FUS 分系统清单**。
+        让用户看到"系统在跟谁互联"的权威名单，不需要手工操作。
         """
         out = []
-        store = getattr(self.__class__, 'aprs_store', None)
-        if store is not None:
-            have = {str(p.get('host') or '').strip().lower() for p in svc.peers()}
-            for st in store.all():
-                host = str(st.get('host') or '').strip()
-                if not host:
-                    continue
-                try:
-                    port = int(st.get('port') or 1883)
-                except (TypeError, ValueError):
-                    port = 1883
-                addr = host
-                if _APRS_AVAILABLE:
-                    try:
-                        addr = fmo_aprs.station_mqtt_addr(st)
-                    except Exception:  # noqa: BLE001
-                        addr = "%s:%d" % (host, port)
+        try:
+            for c in _bridge_roster_source() or []:
+                sid = str(c.get('subsystem_id') or '')
+                if sid and sid == svc.node_id:
+                    continue                    # 自己不算候选
                 out.append({
-                    'callsign': st.get('callsign') or '',
-                    'name': st.get('name') or '',
-                    'host': host,
-                    'port': port,
-                    'mqtt_addr': addr,
-                    'already': host.lower() in have,
+                    'callsign': sid,
+                    'name': c.get('name') or c.get('host'),
+                    'host': c.get('host'),
+                    'port': int(c.get('port') or 1883),
+                    'mqtt_addr': '%s:%d' % (c.get('host'), int(c.get('port') or 1883)),
+                    'subsystem_id': sid,
+                    'online': bool(c.get('online', True)),
+                    'already': False,
                 })
-        out.sort(key=lambda x: (x['already'], x['callsign']))
-        return {'ok': True, 'candidates': out}
+        except Exception as e:  # noqa: BLE001
+            return {'ok': False, 'error': '拉取总服务器名册失败: ' + str(e),
+                    'candidates': []}
+        # 标记哪些已经在当前成员/候选列表里
+        try:
+            have = {str(p.get('host') or '').lower() for p in svc.peers()}
+            for c in out:
+                c['already'] = c['host'].lower() in have
+        except Exception:  # noqa: BLE001
+            pass
+        out.sort(key=lambda x: (not x['online'], x['name'] or ''))
+        return {'ok': True, 'candidates': out, 'source': 'master'}
 
     def _handle_sas_routes(self, method, path):
         """
@@ -3286,15 +3372,16 @@ def main():
     else:
         print("[INIT] 语音监控: 未启用（monitor 或 SAS 模块不可用）")
 
-    # ---- 初始化 MQTT 互联桥接（无主：每个对端一条独立连接）----
+    # ---- 初始化 MQTT 互联桥接（集群模型：一个开关加入集群，成员自动互通）----
     # 放在监控之后：桥接连 broker 要用的本机监控证书由监控线程签发。
-    # 即使证书还没就绪也不会卡住 —— 桥接自身有退避重连。
+    # 名册由后台线程从总服务器拉取并缓存（读取永不阻塞，见 _bridge_roster_source）。
     global _BRIDGE
     if _BRIDGE_AVAILABLE:
         try:
+            start_roster_refresher()
             _BRIDGE = VoiceBridge(BASE_DIR, CONFIG, save_fn=save_config,
                                   logger=print,
-                                  candidate_source=_bridge_candidates_source)
+                                  candidate_source=_bridge_roster_source)
             if _BRIDGE.public_config().get('enabled'):
                 _BRIDGE.start()
             else:

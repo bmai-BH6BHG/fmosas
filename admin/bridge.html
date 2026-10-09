@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -226,9 +226,9 @@
   <div class="empty hidden" id="br-empty"></div>
 
   <details class="br-fold">
-    <summary>自动发现来源（APRS）</summary>
+    <summary>集群名册（来自总服务器）</summary>
     <div class="muted small" style="margin:6px 0;line-height:1.8;">
-      系统从 APRS 扫到、且能通过本机证书登录的 FUS 系统。加入集群后会自动与其中的成员互联，无需手工操作。
+      系统从**总服务器**拉到的 FUS 分系统名册（每个都有子系统标识）。加入集群后会自动与其中的成员互联，并校验对方身份，无需手工操作。
       这里只用来让你知道「系统在跟谁自动互联」，<b>不需要添加</b>。
     </div>
     <div class="row">
@@ -239,9 +239,9 @@
   </details>
 
   <details class="br-fold" data-add-peer>
-    <summary>手动补充（APRS 扫不到的站点）</summary>
+    <summary>手动补充（名册里没有的站点）</summary>
     <div class="muted small" style="margin:6px 0;line-height:1.8;">
-      一般不需要。只有对端不在 APRS 上、或主机地址扫不到时才用。
+      一般不需要。只有对端还没上报到总服务器、或它的 MQTT 不是默认端口时才用。
       补充进来的地址会和自动发现的站点一样，按「加入集群」的开关去互联。
     </div>
     <div class="panel">
