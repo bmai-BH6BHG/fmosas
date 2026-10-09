@@ -81,18 +81,23 @@
     }
     .hero .node b { color: var(--accent); font-weight: 600; }
 
-    /* ---------- 两个子系统入口 ---------- */
+    /* ---------- 子系统入口 ---------- */
+    /* 卡片从 3 个变 4 个。若还按 3 列排，第 4 张会孤零零占一行且左侧空一半；
+       这里改成「最多 2 列」的 2×2，宽屏窄屏都成对。minmax(0,1fr) 而不是 1fr
+       是必须的：默认 1fr 的轨道下限等于卡片内容的最小宽度，长描述会让轨道撑开。
+       窄屏（≤980px / ≤720px）的两档换行行为与原设计一致，没有改动。 */
     .entries {
         width: 100%;
         max-width: 1240px;
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 22px;
     }
     .entry {
         position: relative;
         display: flex;
         flex-direction: column;
+        min-width: 0;
         background: var(--bg-card);
         border: 1px solid var(--line);
         border-radius: 14px;
@@ -114,6 +119,7 @@
     .entry.sas { --tint: var(--sas); }
     .entry.fas { --tint: var(--fas); }
     .entry.st  { --tint: var(--st); }
+    .entry.mqtt { --tint: #f59e0b; }
     .entry:hover {
         transform: translateY(-4px);
         border-color: var(--tint);
@@ -271,11 +277,26 @@
         </div>
         <div class="go"><span>进入 FMO 台站</span><span class="arrow">→</span></div>
     </a>
+
+    <a class="entry mqtt" href="/admin/bridge">
+        <div class="ico">🔗</div>
+        <div class="name">MQTT 互联桥接</div>
+        <div class="cn-name">无主节点互联 · 语音互传</div>
+        <div class="en-name">MQTT Peer Bridge (Brokerless)</div>
+        <div class="desc">与其他 FUS 系统互联，语音互传 · 无主节点 · 可自由加入。每个系统独立连接，对端一个断了其他照常。</div>
+        <div class="chips">
+            <span class="chip">无主节点</span>
+            <span class="chip">语音互传</span>
+            <span class="chip">自由加入</span>
+            <span class="chip">对端独立</span>
+        </div>
+        <div class="go"><span>进入互联桥接</span><span class="arrow">→</span></div>
+    </a>
 </div>
 
 <footer class="foot">
     <div class="foot-name">FUS — FMO Unified Security Server</div>
-    <div class="foot-cn">FMO 统一安全服务端 · SAS 认证 + FAS 审计 + 站点目录</div>
+    <div class="foot-cn">FMO 统一安全服务端 · SAS 认证 + FAS 审计 + 站点目录 + MQTT 互联</div>
     <div class="foot-credit">Original design by BG5ESN · FUS edition by BH6BHG</div>
     <div class="foot-credit">原始设计：BG5ESN　FUS 统一安全版：BH6BHG</div>
 </footer>

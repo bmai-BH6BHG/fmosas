@@ -117,6 +117,18 @@ except Exception as _e_aprs:
     _APRS_AVAILABLE = False
     print("[INIT] fmo_aprs 模块加载失败（APRS 台站发现不可用）: %s" % _e_aprs)
 
+# ==================== MQTT 互联桥接（FUS 之间语音互传，无主）====================
+try:
+    from bridge import VoiceBridge, load_bridge_config
+    _BRIDGE_AVAILABLE = True
+except Exception as _e_br:
+    VoiceBridge = None
+    load_bridge_config = None
+    _BRIDGE_AVAILABLE = False
+    print("[INIT] bridge 模块加载失败（MQTT 互联不可用）: %s" % _e_br)
+
+_BRIDGE = None          # 桥接服务单例（main() 里创建）
+
 # ==================== 全局配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = None  # 稍后在 CONFIG 加载后基于域名/IP 动态设置
@@ -425,6 +437,27 @@ def save_sas_runtime_config():
         print("[SAS] 运行时配置已保存")
     except Exception as e:
         print("[SAS] 运行时配置保存失败: %s" % e)
+
+
+def save_config(cfg=None):
+    """
+    把当前 CONFIG 落盘到 config.json（原子替换）。
+
+    先写临时文件再 os.replace：避免写一半被中断，把别人的配置文件截断成半截 JSON
+    （那会导致下次启动直接起不来）。
+
+    参数 cfg 只是为了兼容 save_fn(cfg) 这种调用约定 —— 调用方（如互联桥接）拿到的
+    就是 CONFIG 本身并**原地修改**，所以这里直接存 CONFIG 即可。
+    """
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+        os.replace(tmp, CONFIG_PATH)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("[CONFIG] 保存失败: %s" % e)
+        return False
 
 
 # 启动时加载 SAS 运行时配置
@@ -1076,6 +1109,8 @@ def _auth_trace_write(marks, extra=""):
 
 
 # ==================== 请求处理器 ====================
+
+
 class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
     """
     分系统 API 请求处理器。
@@ -1215,6 +1250,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if self.handle_bas_routes('GET', path, parsed):
             return
 
+        # ---- 互联桥接路由（/api/bridge/*）----
+        if self._handle_bridge_routes('GET', path, parsed):
+            return
+
         # ---- SAS 路由分发（先检查新增路由，匹配则处理；不匹配则走原有逻辑）----
         if self._handle_sas_routes('GET', path):
             return
@@ -1242,6 +1281,9 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if path in ('/admin/stations', '/admin/stations/',
                     '/admin/stations/index.html'):
             self._serve_admin_file('stations.html')
+            return
+        if path in ('/admin/bridge', '/admin/bridge/', '/admin/bridge/index.html'):
+            self._serve_admin_file('bridge.html')
             return
         if path == '/admin/index.html':
             self.send_response(302)
@@ -1382,6 +1424,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
 
         # ---- BAS 审计路由分发（/api/ingest 与 /api/bas/*）----
         if self.handle_bas_routes('POST', path, parsed):
+            return
+
+        # ---- 互联桥接路由（/api/bridge/*）----
+        if self._handle_bridge_routes('POST', path, parsed):
             return
 
         # ---- SAS 路由分发 ----
@@ -1966,6 +2012,117 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': True, 'beacons': rows, 'now': time.time()})
         except Exception as e:
             self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    # ---------- MQTT 互联桥接（/api/bridge/*） ----------
+    def _handle_bridge_routes(self, method, path, parsed=None):
+        """
+        互联桥接管理接口。
+
+        设计要点：桥接是**无主**的 —— 这里只操作本机自己的对端列表，不跟任何
+        "中心"协商；每个对端独立连接、独立重连，所以某个对端挂了不影响其他。
+        这些接口只在管理口暴露（公网口白名单里没有，公网访问会 403）。
+        """
+        if not path.startswith('/api/bridge/'):
+            return False
+        try:
+            svc = _BRIDGE
+            if svc is None:
+                self.send_json({'ok': False,
+                                'error': '桥接模块不可用（bridge.py 未加载）'}, 503)
+                return True
+            if method == 'GET' and path == '/api/bridge/status':
+                self.send_json(svc.status())
+                return True
+            if method == 'GET' and path == '/api/bridge/peers':
+                self.send_json({'ok': True, 'peers': svc.peers()})
+                return True
+            if method == 'GET' and path == '/api/bridge/candidates':
+                self.send_json(self._bridge_candidates(svc))
+                return True
+            if method == 'POST' and path == '/api/bridge/peers':
+                body = self._read_json_body()
+                if body is None:
+                    return True
+                peer, err = svc.upsert_peer(body)
+                if err:
+                    self.send_json({'ok': False, 'error': err}, 400)
+                else:
+                    self.send_json({'ok': True, 'peer': peer})
+                return True
+            if method == 'POST' and path == '/api/bridge/peers/toggle':
+                body = self._read_json_body()
+                if body is None:
+                    return True
+                peer, err = svc.set_peer_field(str(body.get('id') or ''),
+                                               str(body.get('field') or ''),
+                                               bool(body.get('value')))
+                if err:
+                    self.send_json({'ok': False, 'error': err}, 400)
+                else:
+                    self.send_json({'ok': True, 'peer': peer})
+                return True
+            if method == 'POST' and path == '/api/bridge/peers/delete':
+                body = self._read_json_body()
+                if body is None:
+                    return True
+                pid = str(body.get('id') or '')
+                ok = svc.delete_peer(pid) if pid else False
+                self.send_json({'ok': bool(ok), 'deleted': bool(ok)})
+                return True
+            if method == 'POST' and path == '/api/bridge/config':
+                body = self._read_json_body()
+                if body is None:
+                    return True
+                cfg = svc.set_config(enabled=body.get('enabled'),
+                                     node_name=body.get('node_name'),
+                                     channels=body.get('channels'),
+                                     node_id=body.get('node_id'))
+                if cfg.get('enabled'):
+                    svc.start()      # 之前可能处于禁用状态，这里把连接线程拉起来
+                self.send_json({'ok': True, 'config': cfg})
+                return True
+            self.send_json({'ok': False, 'error': '未知的桥接接口: %s' % path}, 404)
+            return True
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.send_json({'ok': False, 'error': '桥接处理异常: ' + str(e)}, 500)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+    def _bridge_candidates(self, svc):
+        """
+        推荐可互联的对端：从 APRS 扫到的 FMO 台站里挑（那些就是别的 FUS 系统）。
+        纯便利功能，减少手工填 host；不做任何自动连接。
+        """
+        out = []
+        store = getattr(self.__class__, 'aprs_store', None)
+        if store is not None:
+            have = {str(p.get('host') or '').strip().lower() for p in svc.peers()}
+            for st in store.all():
+                host = str(st.get('host') or '').strip()
+                if not host:
+                    continue
+                try:
+                    port = int(st.get('port') or 1883)
+                except (TypeError, ValueError):
+                    port = 1883
+                addr = host
+                if _APRS_AVAILABLE:
+                    try:
+                        addr = fmo_aprs.station_mqtt_addr(st)
+                    except Exception:  # noqa: BLE001
+                        addr = "%s:%d" % (host, port)
+                out.append({
+                    'callsign': st.get('callsign') or '',
+                    'name': st.get('name') or '',
+                    'host': host,
+                    'port': port,
+                    'mqtt_addr': addr,
+                    'already': host.lower() in have,
+                })
+        out.sort(key=lambda x: (x['already'], x['callsign']))
+        return {'ok': True, 'candidates': out}
 
     def _handle_sas_routes(self, method, path):
         """
@@ -3094,6 +3251,25 @@ def main():
             monitor = None
     else:
         print("[INIT] 语音监控: 未启用（monitor 或 SAS 模块不可用）")
+
+    # ---- 初始化 MQTT 互联桥接（无主：每个对端一条独立连接）----
+    # 放在监控之后：桥接连 broker 要用的本机监控证书由监控线程签发。
+    # 即使证书还没就绪也不会卡住 —— 桥接自身有退避重连。
+    global _BRIDGE
+    if _BRIDGE_AVAILABLE:
+        try:
+            _BRIDGE = VoiceBridge(BASE_DIR, CONFIG, save_fn=save_config,
+                                  logger=print)
+            if _BRIDGE.public_config().get('enabled'):
+                _BRIDGE.start()
+            else:
+                _BRIDGE._local_state = 'disabled'
+                print("[INIT] 互联桥接: 未启用（bridge.enabled=false，可在 /admin/bridge 打开）")
+        except Exception as e:
+            print("[INIT] 互联桥接启动失败: %s" % e)
+            _BRIDGE = None
+    else:
+        print("[INIT] 互联桥接: 未启用（bridge 模块不可用）")
 
     # ---- 初始化 APRS 台站采集线程（FMO 台站不在库里，只能从 APRS-IS 累积）----
     # 台站广播有周期，短听只有个位数；常驻累积才能攒到几百个。

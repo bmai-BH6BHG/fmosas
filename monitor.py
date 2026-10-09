@@ -38,6 +38,12 @@ from cert_gen import (b64url_encode, b64url_decode, ed25519_sign,
 
 TOPICS = ["FMO/RAW", "FMO/TELE", "FMO/SERVER_INFO"]
 
+# 互联桥接：别的 FUS 系统转发过来的语音会在本机重播到 FMO/BRIDGE/<源节点>/<频道>。
+# 监控也订阅它 —— 否则"互联进来的语音"在本机看不到、进不了 voice.db、界面上听不到。
+# 注意只订阅 4 层的重播主题；桥接的**出站**主题是 6 层（/to/<对端>/），不会被这里收到，
+# 所以监控不会把自己发出去的语音又抄回来。
+BRIDGE_TOPICS = ["FMO/BRIDGE/+/RAW", "FMO/BRIDGE/+/TELE"]
+
 FRAME_GAP_SEC = 3.0        # 同一 (呼号,会话) 帧间隔超过该值则切段
 SEG_MAX_SEC = 300.0        # 单段最长时长（强制切段）
 REPORT_RETRY_SEC = 60.0    # 未上报段重试间隔
@@ -284,7 +290,7 @@ class MqttMiniClient:
     循环读取下行 PUBLISH 并回调。仅供监控订阅使用。"""
 
     def __init__(self, host, port, client_id, username=None, password=None,
-                 keepalive=60, on_message=None):
+                 keepalive=60, on_message=None, read_timeout=5.0):
         self.host = host
         self.port = int(port)
         self.client_id = client_id
@@ -292,6 +298,9 @@ class MqttMiniClient:
         self.password = password
         self.keepalive = keepalive
         self.on_message = on_message
+        # 读循环的 socket 超时。默认 5s 够监控用；互联桥接的**本机**连接要调小
+        # （0.2s）—— 否则桥接靠"读完一个包再处理队列"，中继语音会被拖到 5 秒才播出去。
+        self.read_timeout = float(read_timeout)
         self._sock = None
         self._buf = b""
         self._last_io = 0.0
@@ -345,7 +354,7 @@ class MqttMiniClient:
     # ---- 协议 ----
     def connect(self, timeout=10):
         self._sock = socket.create_connection((self.host, self.port), timeout=timeout)
-        self._sock.settimeout(5)  # 读循环短超时，便于 keepalive
+        self._sock.settimeout(self.read_timeout)  # 读循环短超时，便于 keepalive/及时处理队列
         self._buf = b""
         flags = 0x02  # clean session
         payload = _mqtt_utf8(self.client_id)
@@ -373,6 +382,27 @@ class MqttMiniClient:
         pkt = bytes([0x82]) + _mqtt_remaining_length(len(vh) + len(payload)) + vh + payload
         self._send(pkt)
         # SUBACK 由 run_forever 循环自然读取（也可在此同步等待，从简）
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        """
+        发布一条消息（默认 QoS0）。
+
+        桥接互联要用：把本机语音转发给对端、把对端语音在本机重播。
+        QoS0 足够 —— 语音是实时流，丢一帧比等重传更合适；而且 QoS0 无需
+        维护 PUBACK/重传队列，保持这个"最小客户端"不膨胀。
+        ★ 注意：本对象的 socket 不是线程安全的，调用方必须保证
+          同一时刻只有一个线程在读写（桥接里用队列把跨线程发布收敛到读循环线程）。
+        """
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        payload = payload or b""
+        flags = 0x30 | (0x01 if retain else 0x00) | ((qos & 0x03) << 1)
+        vh = _mqtt_utf8(topic)
+        if qos:
+            self._pkt_id = (self._pkt_id + 1) & 0xFFFF or 1
+            vh += struct.pack(">H", self._pkt_id)
+        body = vh + payload
+        self._send(bytes([flags]) + _mqtt_remaining_length(len(body)) + body)
 
     def ping(self):
         self._send(b"\xc0\x00")
@@ -542,20 +572,31 @@ class VoiceStore:
                 );
                 CREATE INDEX IF NOT EXISTS ix_beacon_ts ON beacons(created_at);
             """)
+            # 迁移：互联桥接要记录"这段语音来自哪个对端节点"（老的库补列，可空）
+            try:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(voice_segments)")]
+                if "origin" not in cols:
+                    conn.execute("ALTER TABLE voice_segments ADD COLUMN origin TEXT")
+            except Exception as e:  # noqa: BLE001
+                log("MONITOR", "voice_segments 补 origin 列失败（不影响录音）: %s" % e)
             conn.commit()
 
     def add_segment(self, callsign, session, start_ts, end_ts, duration_ms,
-                    codec, frames, audio):
-        """写入语音段（幂等：同 callsign/session/start_ts 忽略）。返回行 id 或 None。"""
+                    codec, frames, audio, origin=""):
+        """
+        写入语音段（幂等：同 callsign/session/start_ts 忽略）。返回行 id 或 None。
+        origin 非空表示这段语音是**互联桥接**从别的 FUS 节点转过来的。
+        """
         with self._lock:
             conn = self._conn()
             cur = conn.execute("""
                 INSERT OR IGNORE INTO voice_segments
                     (callsign, session, start_ts, end_ts, duration_ms, codec,
-                     frames, audio, reported, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                     frames, audio, reported, created_at, origin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """, (callsign, session, start_ts, end_ts, duration_ms, codec,
-                  frames, sqlite3.Binary(audio), time.time()))
+                  frames, sqlite3.Binary(audio), time.time(),
+                  str(origin or "")))
             conn.commit()
             return cur.lastrowid if cur.rowcount else None
 
@@ -580,7 +621,7 @@ class VoiceStore:
             conn = self._conn()
             return [dict(r) for r in conn.execute("""
                 SELECT id, callsign, session, start_ts, end_ts, duration_ms,
-                       codec, frames
+                       codec, frames, origin
                 FROM voice_segments WHERE start_ts > ?
                 ORDER BY start_ts ASC LIMIT ?
             """, (since, limit)).fetchall()]
@@ -975,10 +1016,21 @@ class VoiceMonitor(threading.Thread):
     # ---------- 语音段聚合 ----------
     def _on_message(self, topic, payload):
         now = time.time()
+        # 互联桥接：monitor 也订阅了 FMO/BRIDGE/<源节点>/<频道>（4 层）。
+        # 拆掉前缀后按同频道处理 —— 别人转来的语音照样入库、可听，
+        # 只是记下 origin，界面上就能区分"本地收的"和"互联来的"。
+        origin = ""
+        if topic.startswith("FMO/BRIDGE/"):
+            parts = topic.split("/")
+            if len(parts) != 4:
+                return          # 6 层的出站主题不会被订阅到；这里只做兜底
+            origin = parts[2]
+            topic = "FMO/%s" % parts[3]
         if topic == "FMO/RAW":
             frame = parse_fmo_frame(payload)
             if not frame or not frame["callsign"]:
                 return
+            frame["origin"] = origin
             self._on_voice_frame(frame, now)
         elif topic == "FMO/TELE":
             tele = parse_tele(payload)
@@ -1002,8 +1054,12 @@ class VoiceMonitor(threading.Thread):
             return
         with self._lock:
             seg = self._segments.get(key)
+            # 来源变化也收尾：同一呼号可能既有本机直收、又有互联转来的，
+            # 不能让两路混成一段（key 仍是 (呼号,session)，不动它 —— 流式播放
+            # 的按 (呼号,session) 查找依赖这个形状）。
             if seg and (now - seg["last_ts"] > FRAME_GAP_SEC
-                        or seg["codec"] != ("adpcm" if blocks_adpcm else "opus")):
+                        or seg["codec"] != ("adpcm" if blocks_adpcm else "opus")
+                        or seg.get("origin", "") != frame.get("origin", "")):
                 self._finalize_segment_locked(seg)
                 seg = None
             if seg is None:
@@ -1015,6 +1071,8 @@ class VoiceMonitor(threading.Thread):
                     "last_ts": now,
                     "frames": 0,
                     "buf": bytearray(),
+                    # 互联来源（空 = 本机直收）
+                    "origin": frame.get("origin", ""),
                 }
                 self._segments[key] = seg
             for vp, idx, payload in blocks_adpcm:
@@ -1060,11 +1118,14 @@ class VoiceMonitor(threading.Thread):
         try:
             seg_id = self.store.add_segment(
                 seg["callsign"], seg["session"], seg["start_ts"], seg["last_ts"],
-                duration_ms, seg["codec"], seg["frames"], audio)
+                duration_ms, seg["codec"], seg["frames"], audio,
+                origin=seg.get("origin", ""))
             if seg_id:
-                log("MONITOR", "语音段 #%d %s %.1fs %s x%d" % (
+                _origin = seg.get("origin") or ""
+                log("MONITOR", "语音段 #%d %s %.1fs %s x%d%s" % (
                     seg_id, seg["callsign"], duration_ms / 1000.0,
-                    seg["codec"], seg["frames"]))
+                    seg["codec"], seg["frames"],
+                    ("（互联来自 %s）" % _origin) if _origin else ""))
                 if self.report_voice:
                     self._report_segments([{
                         "id": seg_id, "callsign": seg["callsign"],
@@ -1194,10 +1255,11 @@ class VoiceMonitor(threading.Thread):
                     keepalive=60, on_message=self._on_message)
                 self._client = client
                 client.connect()
-                client.subscribe(TOPICS)
+                client.subscribe(TOPICS + BRIDGE_TOPICS)
                 self._set_state("connected", "%s:%d" % (self.mqtt_host, self.mqtt_port))
                 log("MONITOR", "已连接 MQTT %s:%d，订阅 %s" % (
-                    self.mqtt_host, self.mqtt_port, ", ".join(TOPICS)))
+                    self.mqtt_host, self.mqtt_port,
+                    ", ".join(TOPICS + BRIDGE_TOPICS)))
                 backoff = 2.0
                 # 消息循环 + 定期维护
                 last_sweep = 0.0

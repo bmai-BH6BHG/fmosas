@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.5"
+BAS_VERSION="1.8.6"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -387,9 +387,10 @@ echo ""
 echo "======================================"
 echo "  FUS 安装完成"
 echo "  认证(SAS): http://<公网IP>:$SUBSYS_PORT        （APP 注册/登录、EMQX 认证 /auth）"
-echo "  门户     : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin       （SAS / FAS 两个入口）"
+echo "  门户     : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin       （SAS / FAS / 互联 入口）"
 echo "  SAS 系统 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/sas"
 echo "  FAS 系统 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/fus"
+echo "  互联桥接 : http://${IP:-<内网IP>}:$((SUBSYS_PORT+1))/admin/bridge   （与其他 FUS 系统语音互传，无主、可自选）"
 echo "  策略模式 : warn（只告警留证，不会自动封人；确认无误封后再去界面切 ban）"
 if [ "$SAS_FOUND" = "1" ] || [ "$FAS_FOUND" = "1" ]; then
     echo "  旧系统   : 已卸载（备份在 $BACKUP_DIR）"

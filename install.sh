@@ -897,8 +897,8 @@ fi
 
 if [ "$HEALTH_OK" = 1 ]; then
     say "自检通过：$HEALTH_URL → $(printf '%s' "$BODY" | head -c 200)"
-    # FUS 三个入口都要能出 HTML：/admin（门户）→ /admin/sas（SAS）→ /admin/fus（FAS）
-    for _u in "/admin" "/admin/sas" "/admin/fus"; do
+    # FUS 各入口都要能出 HTML：门户 → SAS → FAS → 互联桥接
+    for _u in "/admin" "/admin/sas" "/admin/fus" "/admin/bridge"; do
         _BODY="$(http_get "http://127.0.0.1:${ADMIN_PORT}${_u}" | head -c 4000 || true)"
         if printf '%s' "$_BODY" | grep -qi '<html\|<!doctype'; then
             say "  页面可访问：http://127.0.0.1:${ADMIN_PORT}${_u}"
@@ -932,6 +932,7 @@ echo "  公网 API : $PORT          （路由器只需映射此端口）"
 echo "  FUS 门户 : http://<本机IP>:$ADMIN_PORT/admin        （内网访问，勿映射公网）"
 echo "  SAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/sas"
 echo "  FAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/fus"
+echo "  互联桥接 : http://<本机IP>:$ADMIN_PORT/admin/bridge  （与其他 FUS 系统语音互传，无主、可自选）"
 echo "  健康检查 : $HEALTH_URL"
 echo "  配置文件 : $DIR/config.json"
 if [ "$SERVICE_STARTED" = 1 ]; then
