@@ -191,6 +191,11 @@ class SyncEngine:
         :param base_dir: str 基础目录（默认同 db_path 所在目录）
         """
         self.config = config or {}
+        # ★ 由外部注入：返回"本机确认到的集群成员节点 id"（互联桥接提供）。
+        #   用于让那些**有桥接功能但版本较早、没有"已加入"上报字段**的节点
+        #   也能被总系统认作集群成员 —— 否则总系统会一直显示 0 台，
+        #   且名册会变空、把本来在互通的桥接全断掉（真实踩过）。
+        self.member_source = None
         self.db_path = db_path
         self.mode = mode
         self.base_dir = base_dir or os.path.dirname(os.path.abspath(db_path))
@@ -825,6 +830,17 @@ class SyncEngine:
         # ★ 是否**已真正加入集群**（桥接开关已打开）：总系统的集群成员数只算已加入的
         #   —— 集群的意义是桥接互通，没加入桥接的台站不该显示成成员。
         payload['cluster_joined'] = bool(bridge.get('enabled'))
+        # ★ 我确认到的集群成员：本机对每个成员都做过**名片 + 与总服务器名册的身份比对**。
+        #   有些节点有桥接功能、也确实在互通，但版本较早、没有"已加入"上报字段；
+        #   只等它们自己报的话，总系统会一直显示 0 台，而且名册会变空、
+        #   把正在工作的桥接全部断掉。所以这里顺带把结论报给总系统。
+        try:
+            if self.member_source:
+                members = list(self.member_source() or [])
+                if members:
+                    payload['cluster_members'] = members
+        except Exception:  # noqa: BLE001
+            pass
         if self.sync_token:
             payload['sync_token'] = self.sync_token
         return payload

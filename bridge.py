@@ -94,6 +94,28 @@ LOCAL_BROKER = ("127.0.0.1", 1883)
 RECONNECT_MIN = 5.0                   # 对端重连退避初值（秒）
 RECONNECT_MAX = 120.0
 MEMBER_CONFIRM_TIMEOUT = 90.0         # 连上后等多久算"对方没加入集群"
+# ★ 认证被拒（rc=5：对方不认我方证书）时的重试间隔。
+#   这种失败**不是网络抖动**：重试再密也不会成功，得等对方升级、或把我们的根公钥
+#   加进它的信任表。间隔太短的话，日志会被"连接被拒绝 rc=5"刷满，
+#   看起来像"一直连不上"（用户真实反馈过）。
+AUTH_FAIL_RETRY = 3600.0              # 认证被拒：1 小时后再试（期间不刷日志）
+FAIL_LOG_INTERVAL = 600.0             # 同一对端同类失败日志的最小间隔（秒）
+
+
+def _is_auth_reject(msg):
+    """
+    判断这个连接错误是不是"对方在认证/证书层面拒绝了我们"。
+
+    需要覆盖英式/美式拼写（authorised / authorized）—— MQTT 库与不同 broker
+    返回的措辞不一样，漏判就会退化成"每 30 秒重试一次 + 刷日志"。
+    """
+    s = str(msg or "").lower()
+    if not s:
+        return False
+    return ("rc=5" in s or "rc = 5" in s
+            or "authoris" in s or "authoriz" in s
+            or "bad user name or password" in s
+            or "证书" in s or "不受信任" in s)
 # ★ 必须**大于名片周期**（ANNOUNCE_INTERVAL=60s）：对方名片是保留消息时一订阅就到，
 #   但万一是非保留的（旧版本/别家实现）就得等它下一次广播。以前只有 12 秒 ——
 #   那样大多数情况会误判成"对方未加入集群"（真实踩过）。
@@ -119,6 +141,8 @@ DEFAULT_BRIDGE = {
     #   总系统只返回同集群的成员。默认「主集群」= 原有的全局互联，
     #   所以升级后不选任何东西，行为与以前完全一致。
     "cluster": DEFAULT_CLUSTER_NAME,
+    # 已确认过的集群成员节点 id（向总系统汇报"谁在集群里"用；写进配置防链路抖动死锁）
+    "member_ids": [],
     "channels": ["RAW", "TELE"],
     # 是否把本机语音放到桥接主题上供**别人拉取**（关掉 = 完全不给别人听）。
     # 注意这是**全局**的：拉取模型下"听谁的"由听的人决定，所以发送方无法逐对端挑选听众。
@@ -272,6 +296,10 @@ class BridgeLink(threading.Thread):
         self.connected = False
         self.state = "connecting"
         self.last_error = ""
+        # 失败日志限流状态（见 _log_fail）
+        self._fail_kind = ""
+        self._fail_log_at = 0.0
+        self._fail_n = 0
         self.rx_frames = 0
         self.last_rx = 0.0
         self.reconnects = 0
@@ -383,8 +411,13 @@ class BridgeLink(threading.Thread):
                 self.state = "not_member" if self.not_member else "error"
                 self.last_error = str(e)
                 if not self.stop_event.is_set():
-                    self.svc.log("[BRIDGE] %s：%s" % (
-                        self.peer.get("name") or self.peer.get("host"), e))
+                    self._log_fail(str(e))
+                    # ★ 认证被拒（rc=5：对方不认我方证书）不是"网络抖一下"，
+                    #   30 秒重试一次也永远不会成功 —— 得等对方升级、或把我们的根公钥
+                    #   加进它的信任表。所以把重试间隔拉长，避免无谓连接把日志刷满
+                    #   （用户看到的就是"老是显示证书被拒绝"）。
+                    if _is_auth_reject(str(e)):
+                        backoff = max(backoff, AUTH_FAIL_RETRY)
             finally:
                 self.connected = False
                 self.member = False
@@ -405,6 +438,26 @@ class BridgeLink(threading.Thread):
         self._alive = False
         if self.state not in ("not_member",):
             self.state = "stopped"
+
+    def _log_fail(self, msg):
+        """
+        失败日志限流。
+
+        同一个对端、同一类错误，每 FAIL_LOG_INTERVAL 才打一行（并带上重复次数）。
+        否则一个连不上的对端每 30 秒刷一行，真正的故障反而被淹掉 ——
+        用户看到的就是"日志里老是这一条"。
+        """
+        now = time.time()
+        kind = str(msg)[:48]
+        if kind == self._fail_kind and (now - self._fail_log_at) < FAIL_LOG_INTERVAL:
+            self._fail_n += 1
+            return
+        extra = "" if self._fail_n <= 1 else "（同类错误此前已重复 %d 次，已限流）" % self._fail_n
+        self._fail_kind = kind
+        self._fail_log_at = now
+        self._fail_n = 1
+        self.svc.log("[BRIDGE] %s：%s%s" % (
+            self.peer.get("name") or self.peer.get("host"), msg, extra))
 
     def _on_message(self, topic, payload):
         # 节点名片：判断对方是不是"已加入集群"的成员，并顺带学到它的节点名
@@ -782,6 +835,12 @@ class VoiceBridge(object):
                     break
         if not link.member:
             link.member = True
+            # 记住这个成员（写进配置），链路断了也能继续向总系统汇报
+            if rid:
+                try:
+                    self._remember_member(rid)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 link.subscribe_voice()
             except Exception as e:  # noqa: BLE001
@@ -975,6 +1034,8 @@ class VoiceBridge(object):
                 #   漏了就会出现"选了集群、界面上也变了，但总系统永远收不到归属"
                 #   （真实踩过），且重启后选择还会丢。
                 "cluster": self.cluster,
+                # 已确认过的集群成员节点 id（链路断了也能继续向总系统汇报，防死锁）
+                "member_ids": list(self._cfg.get("member_ids") or []),
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
                 "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg.get("peers") or []],
@@ -1065,6 +1126,44 @@ class VoiceBridge(object):
             self._persist()
             self._sync_links()
         return removed > 0
+
+    def member_ids(self):
+        """
+        已被确认身份、**真正在集群里**的对端节点 id 列表。
+
+        ★ 用于向总系统汇报"谁在集群里"：早期版本（v1.8.10~1.8.13）已有桥接功能、
+          也确实在互通，但没有"已加入"上报字段；只等它们自己报的话，总系统会一直
+          显示 0 台已加入，与分系统这边看到的互通情况对不上。
+          本机对每个成员都做过**名片 + 与总服务器名册的身份比对**，这个结论是可靠的。
+        ★ 结果会**记进配置**：链路临时断开时也要能继续汇报，否则会出现死锁 ——
+          名册空 → 连不上对端 → 没人能证明它们在集群里 → 名册继续空。
+        """
+        out = set()
+        try:
+            if not self._cfg.get("enabled"):
+                return []          # 退出集群后就不再替别人背书
+            out = set(str(x) for x in (self._cfg.get("member_ids") or []) if x)
+            with self._lock:
+                links = list(self._links.values())
+            for link in links:
+                if link.member and link.peer.get("remote_id"):
+                    out.add(str(link.peer["remote_id"]))
+        except Exception:  # noqa: BLE001
+            pass
+        return sorted(out)
+
+    def _remember_member(self, remote_id):
+        """把"确认过的成员"记进配置（变更才落盘，避免频繁写文件）。"""
+        rid = str(remote_id or "").strip()
+        if not rid:
+            return
+        with self._lock:
+            cur = list(self._cfg.get("member_ids") or [])
+            if rid in cur:
+                return
+            cur.append(rid)
+            self._cfg["member_ids"] = cur
+        self._persist()
 
     def public_config(self):
         with self._lock:

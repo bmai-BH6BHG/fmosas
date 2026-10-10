@@ -815,6 +815,28 @@ class ClusterTests(BridgeTestCase):
         self.assertEqual("华东集群", (saved.get("bridge") or {}).get("cluster"),
                          "配置里必须保存 cluster")
 
+    def test_member_ids_reports_confirmed_members(self):
+        """
+        ★ 本机要能报出"我确认到的集群成员"给总系统。
+
+        为什么必须有：有些节点**有桥接功能、也确实在互通**，但版本较早
+        （v1.8.10~v1.8.13），没有 `cluster_joined` 上报字段。若总系统只认自报的，
+        就会显示 0 台已加入，而且名册会变空 —— **把正在工作的桥接全部断掉**
+        （真实踩过）。这些成员本机都做过名片 + 名册身份比对，结论可靠。
+        """
+        ba, bb = self.new_broker(), self.new_broker()
+        a = self.new_bridge(ba, node_id="sub-A",
+                            candidates=[self.cand(bb, "B", "sub-B")])
+        b = self.new_bridge(bb, node_id="sub-B",
+                            candidates=[self.cand(ba, "A", "sub-A")])
+        a.start(); b.start()
+        self.assertTrue(wait_for(lambda: a.status()["peer_member_count"] == 1))
+        a._cfg["enabled"] = False
+        self.assertEqual([], a.member_ids(), "没加入集群就不该报成员")
+        a._cfg["enabled"] = True
+        self.assertEqual(["sub-B"], a.member_ids())
+        b.stop()
+
     def test_status_shape(self):
         local = self.new_broker()
         a = self.new_bridge(local, node_id="sub-A",
@@ -954,6 +976,46 @@ class FUSClusterTests(unittest.TestCase):
         # 加入/退出集群时必须立刻上报（否则总系统的成员数一直显示旧值）
         api = self._read("api_server.py")
         self.assertIn("_report_cluster_now(svc.cluster)", api)
+
+    def test_report_carries_cluster_members(self):
+        """上报载荷要带 cluster_members（总系统据此把他证成员算进集群）。"""
+        se = self._read("sync_engine.py")
+        self.assertIn("payload['cluster_members']", se)
+        self.assertIn("member_source", se)
+        api = self._read("api_server.py")
+        self.assertIn("engine.member_source", api)
+
+    def test_master_confirms_peers_and_keeps_selfreport_priority(self):
+        """
+        总系统侧：他证只在对方**从未自报**时采纳 —— 自己明确说没加入的，不能被别人算进来。
+        """
+        ms = self._read_master("master_server.py")
+        self.assertIn("def confirm_cluster_members", ms)
+        self.assertIn("cluster_reported", ms)
+        # 自报优先：已自报的跳过
+        self.assertIn("已自报 → 以它自己的为准", ms)
+
+    @staticmethod
+    def _read_master(rel):
+        import io as _io
+        p = os.path.join(os.path.dirname(ROOT), "fmo-master-deploy", rel)
+        with _io.open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def test_auth_reject_backoff(self):
+        """
+        ★ 认证被拒（rc=5）不是网络抖动：重试再密也不会成功，得等对方升级或补信任。
+        必须把重试间隔拉长并给日志限流，否则日志被"连接被拒绝 rc=5"刷满，
+        看起来像"一直连不上"（用户真实反馈过）。
+        """
+        self.assertTrue(B._is_auth_reject("连接被拒绝 rc=5（对端不认我方证书）"))
+        self.assertTrue(B._is_auth_reject("Connection Refused: not authorised."))
+        self.assertFalse(B._is_auth_reject("timed out"))
+        self.assertFalse(B._is_auth_reject(""))
+        self.assertGreaterEqual(B.AUTH_FAIL_RETRY, 600.0, "认证失败应显著拉长重试间隔")
+        self.assertGreaterEqual(B.FAIL_LOG_INTERVAL, 120.0, "同类失败日志必须限流")
+        br = self._read("bridge.py")
+        self.assertIn("_log_fail", br, "失败日志要走限流函数")
 
     def test_ui_has_cluster_selector(self):
         html = self._read("admin/bridge.html")
