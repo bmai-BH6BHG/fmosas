@@ -1002,6 +1002,38 @@ def start_roster_refresher():
     return _ROSTER_THREAD
 
 
+# 桥接看门狗：桥接线程一旦退出（异常、被误杀），配置仍是 enabled=true，
+# 界面上照样显示"已加入集群"，但实际不再发名片、不再互联 —— 表现成
+# "看着加入了，语音一直不通"且没有任何报错。这里定期检查并自动重启。
+_BRIDGE_WATCHDOG = None
+
+
+def _bridge_watchdog(stop_event):
+    while not stop_event.is_set():
+        stop_event.wait(30.0)
+        br = _BRIDGE
+        if br is None:
+            continue
+        try:
+            if getattr(br, "enabled", False) and not br.thread_alive():
+                print("[BRIDGE] 检测到桥接线程已退出，正在自动重启…")
+                br.start()
+        except Exception as e:  # noqa: BLE001
+            print("[BRIDGE] 看门狗检查异常: %s" % e)
+
+
+def start_bridge_watchdog():
+    """启动桥接看门狗（幂等）。"""
+    global _BRIDGE_WATCHDOG
+    if _BRIDGE_WATCHDOG is not None and _BRIDGE_WATCHDOG.is_alive():
+        return _BRIDGE_WATCHDOG
+    stop_event = threading.Event()
+    _BRIDGE_WATCHDOG = threading.Thread(target=_bridge_watchdog, args=(stop_event,),
+                                        name="bridge-watchdog", daemon=True)
+    _BRIDGE_WATCHDOG.start()
+    return _BRIDGE_WATCHDOG
+
+
 def get_db():
     """获取数据库连接（WAL 模式 + 超时，避免与 sync_engine 并发读写互锁）
 
@@ -3384,8 +3416,10 @@ def main():
                                   candidate_source=_bridge_roster_source)
             if _BRIDGE.public_config().get('enabled'):
                 _BRIDGE.start()
+                start_bridge_watchdog()      # 线程万一死了自动拉起来
             else:
                 _BRIDGE._local_state = 'disabled'
+                start_bridge_watchdog()      # 加入集群后也要能自动拉起
                 print("[INIT] 互联桥接: 未加入集群（可在 /admin/bridge 一键加入）")
         except Exception as e:
             print("[INIT] 互联桥接启动失败: %s" % e)
