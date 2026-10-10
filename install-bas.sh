@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.8"
+BAS_VERSION="1.8.9"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
@@ -383,6 +383,28 @@ EOF
     esac
 fi
 
+# ══════════════════════════════════════════════════════════════
+# 注册一键升级命令：fus-upgrade / bas-upgrade
+#   **只升级系统**，不动 config.json / *.db / ca/ 等用户数据。
+# ══════════════════════════════════════════════════════════════
+UPGRADE_CMD="(未注册)"
+if [ -f "$INSTALL_DIR/upgrade.sh" ]; then
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        for _b in /usr/local/bin /usr/bin; do
+            [ -d "$_b" ] || continue
+            for _c in fus-upgrade bas-upgrade; do
+                printf '%s\n' "#!/bin/sh" \
+                    "# FMO/FUS：一键升级（只升级系统，不动配置与数据）" \
+                    "exec bash \"${INSTALL_DIR}/upgrade.sh\" \"\$@\"" > "$_b/$_c"
+                chmod 0755 "$_b/$_c" 2>/dev/null || true
+            done
+        done
+        UPGRADE_CMD="fus-upgrade"
+    else
+        UPGRADE_CMD="bash ${INSTALL_DIR}/upgrade.sh"
+    fi
+fi
+
 echo ""
 echo "======================================"
 echo "  FUS 安装完成"
@@ -400,6 +422,7 @@ echo ""
 echo "  首次使用：EMQX → 认证(Authentication) → HTTP 认证，URL 填"
 echo "            http://<本机IP>:$SUBSYS_PORT/auth （注意是「认证」不是「授权」）"
 echo "  APP 密钥 : $APPKEY_CMD   （查看: $APPKEY_CMD --show；只装公钥，私钥留在 APP 里）"
+echo "  系统升级 : $UPGRADE_CMD   （只升级系统，不动 config.json / 数据库 / 证书；可 --check 先看）"
 echo "  日志     : journalctl -u ${SVC:-fmo-subsystem} -f"
 echo "  再跑一次 : 可安全重跑（幂等）"
 echo "  卸载     : curl -fsSL $BASE_URL/bas-uninstall.sh | sudo bash"

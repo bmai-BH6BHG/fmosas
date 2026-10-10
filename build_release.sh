@@ -166,14 +166,14 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py bridge.py \
          config.default.json config.json requirements.txt start.sh \
-         fmo-subsystem.service install.sh uninstall.sh uploads/.gitkeep \
+         fmo-subsystem.service install.sh uninstall.sh upgrade.sh uploads/.gitkeep \
          CONTRACT.md dist/VERSION; do
     [ -e "$REPO/$F" ] || die "缺少必需文件: $F（契约第 5 节必须包含）"
 done
 [ -e "$REPO/admin/index.html" ] || die "缺少必需文件: admin/index.html"
 [ -e "$REPO/admin/portal.html" ] || die "缺少必需文件: admin/portal.html（FUS 门户）"
 [ -e "$REPO/admin/stations.html" ] || die "缺少必需文件: admin/stations.html（FMO 站点页）"
-for S in install.sh uninstall.sh build_release.sh; do
+for S in install.sh uninstall.sh upgrade.sh build_release.sh; do
     if ! bash -n "$REPO/$S"; then
         die "$S 语法检查未通过（bash -n）"
     fi
@@ -230,7 +230,7 @@ done
 copy_path tests 0
 copy_path admin 1
 for F in config.default.json config.json requirements.txt start.sh \
-         fmo-subsystem.service install.sh uninstall.sh uploads/.gitkeep; do
+         fmo-subsystem.service install.sh uninstall.sh upgrade.sh uploads/.gitkeep; do
     copy_path "$F" 1
 done
 # 文档（缺失只告警，不阻断打包；Lead 负责增补）
@@ -469,6 +469,14 @@ rm -rf -- "$UPLOAD"
 mkdir -p "$UPLOAD"
 cp -a "$STAGE/install.sh"              "$UPLOAD/install.sh"
 cp -a "$STAGE/uninstall.sh"            "$UPLOAD/uninstall.sh"
+# 升级脚本：单独放到上传根目录，发布工作流会压成扁平资产 fus-upgrade.sh / bas-upgrade.sh
+if [ -f "$STAGE/upgrade.sh" ]; then
+    cp -a "$STAGE/upgrade.sh"          "$UPLOAD/upgrade.sh"
+elif [ -f "$REPO/upgrade.sh" ]; then
+    cp -a "$REPO/upgrade.sh"           "$UPLOAD/upgrade.sh"
+else
+    die "缺少 upgrade.sh：无法发布一键升级脚本"
+fi
 cp -a "$OUT"                           "$UPLOAD/$TARNAME"
 cp -a "$DIST/$TARNAME.sha256"          "$UPLOAD/$TARNAME.sha256"
 cp -a "$OUT_FLAT"                      "$UPLOAD/fmo-subsystem.tar.gz"

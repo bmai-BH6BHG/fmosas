@@ -757,6 +757,32 @@ EOF
 install_appkey_cmd
 
 # ==========================================================================
+# 注册一键升级命令：fus-upgrade / bas-upgrade
+#   **只升级系统**，不动 config.json / *.db / ca/ 等用户数据。
+# ==========================================================================
+install_upgrade_cmd() {
+    [ -f "$DIR/upgrade.sh" ] || { warn "未找到 upgrade.sh，跳过注册 fus-upgrade"; return 0; }
+    if [ "$IS_ROOT" != 1 ]; then
+        say "非 root：跳过注册（可直接运行：bash $DIR/upgrade.sh）"
+        return 0
+    fi
+    for BINDIR in /usr/local/bin /usr/bin; do
+        [ -d "$BINDIR" ] || continue
+        for CMDNAME in fus-upgrade bas-upgrade; do
+            cat > "$BINDIR/$CMDNAME" <<EOF
+#!/bin/sh
+# FMO/FUS：一键升级（只升级系统，不动配置与数据）
+exec bash "${DIR}/upgrade.sh" "\$@"
+EOF
+            chmod 0755 "$BINDIR/$CMDNAME" 2>/dev/null || true
+        done
+    done
+    say "已注册命令：fus-upgrade（别名 bas-upgrade）→ bash $DIR/upgrade.sh"
+    return 0
+}
+install_upgrade_cmd
+
+# ==========================================================================
 # 8/8 注册开机自启 / 防火墙 / 自检
 # ==========================================================================
 step "8/8" "配置开机自启、防火墙与安装后自检"

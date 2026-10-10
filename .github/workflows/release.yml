@@ -128,6 +128,9 @@ jobs:
           # APP 密钥写入命令（单独下载即可用：装了系统但没部署 APP 密钥对的人）
           cp out/set_appkey.py         up/fus-set-appkey.py
           cp out/set_appkey.py         up/bas-set-appkey.py
+          # 一键升级脚本（只升级系统，不动配置与数据）
+          cp out/upgrade.sh            up/fus-upgrade.sh
+          cp out/upgrade.sh            up/bas-upgrade.sh
           # FUS 别名（系统已更名 FUS；bas-* 保留兼容，两个名字都能下载）
           cp out/bas/install-bas.sh    up/fus-install.sh
           cp out/bas/uninstall-bas.sh  up/fus-uninstall.sh
