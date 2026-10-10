@@ -374,7 +374,18 @@ class MqttMiniClient:
             raise MqttError("CONNACK 超时或非法")
         if len(resp[1]) < 2 or resp[1][1] != 0:
             rc = resp[1][1] if len(resp[1]) >= 2 else -1
-            raise MqttError("连接被拒绝 rc=%d（认证失败或 broker 策略）" % rc)
+            # 把 MQTT 的返回码翻译成"该去查什么"，别只丢一个数字让人猜。
+            hint = {
+                1: "协议版本不被接受",
+                2: "clientid 被对端拒绝",
+                3: "对端服务不可用",
+                4: "用户名或密码错误",
+                5: ("对端不认我方证书 —— 多半是它没把总系统下发的信任背书"
+                    "（trust_issued）落进自己的 sas.db.trust_chain："
+                    "确认它的同步在正常 pull；版本过旧（无 merge_trust_issued）"
+                    "或同步已停都会这样"),
+            }.get(rc, "")
+            raise MqttError("连接被拒绝 rc=%d%s" % (rc, ("（%s）" % hint) if hint else ""))
         self._last_io = time.time()
 
     def subscribe(self, topics, wait=False, timeout=8.0):
