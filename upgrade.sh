@@ -35,8 +35,10 @@
 # ==========================================================================
 set -euo pipefail
 
-# ↓↓↓ build_release.sh 用 sed 替换下面这一行的地址（与 install.sh 同一处约定）↓↓↓
-DEFAULT_BASE_URL="https://example.com/fmo-subsystem"
+# 分发地址 = 本项目的 Release 下载地址（发版工作流会把资产发布到这里）。
+# 它既是"上传地址"也是"下载地址"：releases/latest/download 永远指向最新一次 Release，
+# 所以发新版**不需要改这里**。
+DEFAULT_BASE_URL="https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
 DEFAULT_VERSION="1.0.0"
 
 SERVICE_NAME="fmo-subsystem"
@@ -160,6 +162,7 @@ DIR="$(find_dir || true)"
 [ -n "$DIR" ] || die "找不到安装目录（里面应有 api_server.py）。可用 --dir 指定，或先安装系统。"
 DIR="$(cd "$DIR" && pwd -P)"
 say "安装目录：$DIR"
+say "分发地址：$BASE_URL"
 
 SVC="${SERVICE_NAME}"
 if command -v systemctl >/dev/null 2>&1; then

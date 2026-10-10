@@ -135,6 +135,40 @@ class UpgradeScriptTests(unittest.TestCase):
         self.assertIn("这是降级，不是升级", self.src)
         self.assertIn("--force", self.src)
 
+    def test_real_download_url_is_hardcoded(self):
+        """
+        ★★ 真实事故回归：脚本内置的分发地址必须就是**本项目 Release 的下载地址**。
+
+        用户原话：「你的那个上传地址就是它的下载地址啊…你给我放进去，
+        谁让你加保底了，不要保底也不要这个什么 exam.com」
+
+        所以：三个脚本一律写死真实地址，不留占位符、不加运行期兜底。
+        """
+        REAL = "https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
+        for name in ("upgrade.sh", "install.sh", "install-bas.sh"):
+            src = read(name)
+            self.assertIn('DEFAULT_BASE_URL="%s"' % REAL, src,
+                          "%s 里必须是真实的下载地址" % name)
+            # 旧的分发占位地址必须彻底消失
+            self.assertNotIn("example.com/fmo-subsystem", src)
+            self.assertNotIn("example.com/fmo-bas", src)
+            # 且 DEFAULT_BASE_URL 赋值行绝不能再指向 example
+            for line in src.splitlines():
+                if line.strip().startswith("DEFAULT_BASE_URL="):
+                    self.assertNotIn("example.com", line,
+                                     "%s 的分发地址仍是示例地址：%s" % (name, line))
+        # upgrade.sh 里不许再有运行期"兜底"逻辑
+        self.assertNotIn("RELEASE_BASE_URL 兜底", self.src)
+        self.assertNotIn("*example.com*)", self.src)
+        self.assertNotIn("PLACEHOLDER_BASE", self.src)
+        self.assertNotIn("example.com", self.src)
+
+    def test_build_release_injects_into_all_scripts(self):
+        """构建脚本仍要把地址注入到所有带占位行的脚本，并复核结果。"""
+        b = read("build_release.sh")
+        self.assertIn("for SCRIPT in install.sh upgrade.sh", b)
+        self.assertIn("与目标地址不一致", b)
+
     def test_help_works(self):
         r = subprocess.run([BASH, os.path.join(ROOT, "upgrade.sh"), "--help"],
                            capture_output=True)

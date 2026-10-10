@@ -7,10 +7,9 @@
 #  也可：
 #      bash install.sh
 #
-#  ⚠ 重要：下面 DEFAULT_BASE_URL 由 build_release.sh 在打包时用真实分发地址
-#     注入（契约 §2/§5）。若它仍是 https://example.com/fmo-subsystem 占位符，
-#     说明还没有构建发布包——请手动改成真实分发地址，或在执行时用
-#     FMO_BASE_URL=<真实地址> 覆盖。
+#  分发地址（下面 DEFAULT_BASE_URL）默认就是本项目 Release 的下载地址，
+#  开箱即用。若要用镜像/自建分发站，在执行时用 FMO_BASE_URL=<地址> 覆盖，
+#  或构建时由 build_release.sh 注入。
 #
 #  可选环境变量（唯一调整手段，全部可省略，脚本自动推断）：
 #      FMO_BASE_URL    覆盖下载根地址
@@ -25,15 +24,16 @@
 # ==========================================================================
 set -euo pipefail
 
-# ↓↓↓ build_release.sh 用 sed 替换下面这一行的地址（契约 §5：只替换该行）↓↓↓
-DEFAULT_BASE_URL="https://example.com/fmo-subsystem"
+# ↓↓↓ 分发地址 = 本项目 Release 的下载地址（既是上传地址也是下载地址）。
+#      latest/download 永远指向最新一次 Release，因此发新版**不用改这里**。
+#      build_release.sh 若传了别的地址，会在打包时注入覆盖（不动仓库文件）。
+DEFAULT_BASE_URL="https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
 # ↓↓↓ 兜底版本号；若分发站根目录存在 VERSION 文件，则以该文件为准（契约 §2）↓↓↓
 DEFAULT_VERSION="1.0.0"
 
 SERVICE_NAME="fmo-subsystem"
 PKG_PREFIX="fmo-subsystem"
 DEFAULT_PORT=35928
-PLACEHOLDER_BASE="https://example.com/fmo-subsystem"
 
 # ---------------------------------------------------------------- 输出工具
 step() { printf '\n[%s] %s\n' "$1" "$2"; }
@@ -79,13 +79,8 @@ case "$OS_KIND" in
     MINGW*|MSYS*|CYGWIN*|Windows*|Windows_NT*) IS_WIN=1 ;;
 esac
 
-if [ "$BASE_URL" = "$PLACEHOLDER_BASE" ] && [ -z "${FMO_BASE_URL:-}" ]; then
-    err "脚本内的分发地址仍是占位符：$PLACEHOLDER_BASE"
-    err "说明：这份 install.sh 还没有被打包脚本注入真实地址。"
-    err "修复：1) 在仓库根目录执行 bash build_release.sh <你的分发地址> 重新生成安装包；"
-    err "      2) 或直接执行： curl -fsSL <真实分发地址>/install.sh | sudo bash"
-    err "      3) 临时验证可用： FMO_BASE_URL=<真实分发地址> bash install.sh"
-    exit 1
+if [ "$BASE_URL" != "$DEFAULT_BASE_URL" ]; then
+    say "已用 FMO_BASE_URL 覆盖分发地址：$BASE_URL"
 fi
 
 if [ "$IS_ROOT" != 1 ]; then
