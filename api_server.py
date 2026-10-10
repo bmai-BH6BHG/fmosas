@@ -384,6 +384,14 @@ def init_sync_service():
         if _SAS_CONFIG and _SAS_CONFIG.get('db_path'):
             sync_config['sas_db_path'] = _SAS_CONFIG['db_path']
         engine = SyncEngine(sync_config, DB_PATH, mode='subsystem', base_dir=BASE_DIR)
+        # ★ 让同步上报带上"我确认到的集群成员"（见 sync_engine.build_report_payload）：
+        #   有些节点有桥接功能、也确实在互通，但版本较早、没有"已加入"上报字段。
+        #   没有这条，总系统会一直显示 0 台，而且名册会变空、把正在工作的桥接全断掉。
+        try:
+            engine.member_source = lambda: (
+                _BRIDGE.member_ids() if _BRIDGE is not None else [])
+        except Exception:  # noqa: BLE001
+            pass
         engine.start()
         _SYNC_ENGINE = engine
         print("[SYNC] 同步引擎已启动: mode=subsystem, master_url=%s, peers=%s, sas_db=%s" % (
