@@ -815,6 +815,86 @@ class ClusterTests(BridgeTestCase):
         self.assertEqual("华东集群", (saved.get("bridge") or {}).get("cluster"),
                          "配置里必须保存 cluster")
 
+    def test_persist_updates_bridge_dict_in_place(self):
+        """
+        ★★ 真实事故：`_persist` 曾经把 `config["bridge"]` **整个替换成新字典**。
+
+        同步引擎在启动时拿到的是 `dict(CONFIG)`（浅拷贝），它手里的
+        `config["bridge"]` 指向当时那个字典对象；一旦被整体替换，引擎那份就成了
+        **僵尸字典**，于是：
+            "启动之后才点「加入集群」/「退出集群」的机器，上报里的
+             cluster_joined 永远是启动时的旧值"
+        → 总系统一直把它显示成"未加入"，用户看到的就是"我加入的服务器不见了"。
+
+        必须**原地 update**，任何持有同一个 bridge 字典的地方才能立刻看到变化。
+        """
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        holder = b.config["bridge"]              # 模拟"别人手里抓着这个字典"
+        saved = {}
+        b.save_fn = lambda cfg: saved.update(cfg)
+        b.set_config(enabled=True)
+        self.assertIs(holder, b.config["bridge"],
+                      "bridge 字典对象不能被整体替换（否则外部持有者会变僵尸）")
+        self.assertTrue(holder.get("enabled"), "原地更新后，持有者应看到新值")
+        self.assertTrue((saved.get("bridge") or {}).get("enabled"))
+        b.set_config(enabled=False)
+        self.assertFalse(holder.get("enabled"), "关掉也要原地反映")
+        self.assertIs(holder, b.config["bridge"])
+
+    def test_live_state_reflects_toggle(self):
+        """上报读的实时状态必须跟着开关走（不能是启动时的快照）。"""
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        b.set_config(enabled=False)          # 先明确置为关，不依赖用例夹具的初值
+        self.assertFalse(b.live_state()["enabled"])
+        b.set_config(enabled=True, cluster="华东集群")
+        st = b.live_state()
+        self.assertTrue(st["enabled"])
+        self.assertEqual("华东集群", st["cluster"])
+        b.set_config(enabled=False)
+        self.assertFalse(b.live_state()["enabled"])
+
+    def test_inbound_bridge_counts_as_member(self):
+        """
+        ★★ 真实事故：两台**已经加入**的机器，因为版本 bug 一直自报"未加入"，
+        总系统于是只显示 3 台；更糟的是**名册里没有它们**，我们就不去订阅它们的
+        语音主题 → **单向语音**（我们的话能过去，他们的话过不来）。
+
+        修法：对方桥接**主动连到我们 broker** 就是"它确实在集群里"的直接证据
+        （它桥接在跑才会连过来），比它自报的状态更可信。把它算作成员报给总系统。
+        """
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        b.set_config(enabled=True)
+        self.assertEqual([], b.member_ids())
+        b.note_inbound("sub-OTHER")
+        self.assertIn("sub-OTHER", b.member_ids(), "入向桥接连接要算作成员")
+        # 自己不算
+        b.note_inbound("sub-ME")
+        self.assertNotIn("sub-ME", b.member_ids())
+        # clientid 末尾可能带 '-'（FMO-BRIDGE-<id>-），要能归一
+        b.note_inbound("sub-OTHER2-")
+        self.assertIn("sub-OTHER2", b.member_ids())
+        # 退出集群后不再替别人背书
+        b.set_config(enabled=False)
+        self.assertEqual([], b.member_ids())
+
+    def test_auth_hook_notes_inbound_bridge(self):
+        """认证通过路径要把桥接客户端记成"入向连接"（否则整条链都拿不到这个证据）。"""
+        import io as _io
+
+        def rd(rel):
+            with _io.open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                return f.read()
+
+        api = rd("api_server.py")
+        self.assertIn("def _note_bridge_inbound", api)
+        self.assertIn("FMO-BRIDGE-", api)
+        self.assertIn("br.note_inbound(node_id)", api)
+        ms = rd(os.path.join(os.path.dirname(ROOT), "fmo-master-deploy",
+                             "master_server.py"))
+        # 他证要能盖过"自报未加入"
+        self.assertIn("他证可以盖过", ms)
+        self.assertIn('int(row["cluster_joined"] or 0)', ms)
+
     def test_member_ids_reports_confirmed_members(self):
         """
         ★ 本机要能报出"我确认到的集群成员"给总系统。
@@ -985,15 +1065,22 @@ class FUSClusterTests(unittest.TestCase):
         api = self._read("api_server.py")
         self.assertIn("engine.member_source", api)
 
-    def test_master_confirms_peers_and_keeps_selfreport_priority(self):
+    def test_master_confirms_peers_with_inbound_evidence(self):
         """
-        总系统侧：他证只在对方**从未自报**时采纳 —— 自己明确说没加入的，不能被别人算进来。
+        总系统侧：他证要能**盖过"自报未加入"**。
+
+        真实事故：两台**已经加入**的机器（桥接在跑、还主动连着我们）因为版本 bug
+        一直自报 cluster_joined=false，总系统于是只显示 3 台；更糟的是**名册里没有
+        它们 → 我们不订阅它们的语音主题 → 单向语音**。
+        他证来自"某成员亲眼看到并核验过对方的桥接连接"，比一个可能长期出错的状态位
+        更可信，所以允许覆盖。
         """
         ms = self._read_master("master_server.py")
         self.assertIn("def confirm_cluster_members", ms)
         self.assertIn("cluster_reported", ms)
-        # 自报优先：已自报的跳过
-        self.assertIn("已自报 → 以它自己的为准", ms)
+        self.assertIn("他证可以盖过", ms, "要写明这条规则的来由")
+        # 已经是"已加入"的才跳过；自报 false 的允许被覆盖
+        self.assertIn('int(row["cluster_joined"] or 0)', ms)
 
     @staticmethod
     def _read_master(rel):
@@ -1040,6 +1127,15 @@ class FUSClusterTests(unittest.TestCase):
         js = self._read("admin/bridge.js")
         self.assertIn("tried", js)
         self.assertIn("err.payload", js)
+
+    def test_report_prefers_live_state(self):
+        """同步上报要优先读实时状态（bridge_state_source），不是只读配置。"""
+        se = self._read("sync_engine.py")
+        self.assertIn("bridge_state_source", se)
+        self.assertIn("self.bridge_state_source()", se)
+        api = self._read("api_server.py")
+        self.assertIn("engine.bridge_state_source", api)
+        self.assertIn("_BRIDGE.live_state()", api)
 
     def test_ui_has_cluster_selector(self):
         html = self._read("admin/bridge.html")

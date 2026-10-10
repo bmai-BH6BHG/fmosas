@@ -196,6 +196,10 @@ class SyncEngine:
         #   也能被总系统认作集群成员 —— 否则总系统会一直显示 0 台，
         #   且名册会变空、把本来在互通的桥接全断掉（真实踩过）。
         self.member_source = None
+        # ★ 由外部注入：返回互联桥接的**实时**状态 {'enabled':..,'cluster':..}。
+        #   上报如果只读配置字典，一旦别处把 bridge 整个替换过，读到的就是启动时
+        #   的旧值 —— 表现为"界面上已加入、总系统一直显示未加入"（真实事故）。
+        self.bridge_state_source = None
         self.db_path = db_path
         self.mode = mode
         self.base_dir = base_dir or os.path.dirname(os.path.abspath(db_path))
@@ -826,10 +830,22 @@ class SyncEngine:
         #   同集群的成员 → 桥接自动只在同集群内互联。没选过就报「主集群」。
         bridge = (self.config.get('bridge') or {})
         cluster = str(bridge.get('cluster') or '').strip()
+        joined = bool(bridge.get('enabled'))
+        # ★ 优先读**实时状态**：配置字典可能被别处整体替换过，只读配置会出现
+        #   "界面已经加入、上报里还是旧值" → 总系统一直显示未加入（真实事故）。
+        try:
+            if self.bridge_state_source:
+                st = self.bridge_state_source() or {}
+                if st.get('cluster'):
+                    cluster = str(st.get('cluster')).strip()
+                if 'enabled' in st:
+                    joined = bool(st.get('enabled'))
+        except Exception:  # noqa: BLE001
+            pass
         payload['cluster'] = cluster or '主集群'
         # ★ 是否**已真正加入集群**（桥接开关已打开）：总系统的集群成员数只算已加入的
         #   —— 集群的意义是桥接互通，没加入桥接的台站不该显示成成员。
-        payload['cluster_joined'] = bool(bridge.get('enabled'))
+        payload['cluster_joined'] = joined
         # ★ 我确认到的集群成员：本机对每个成员都做过**名片 + 与总服务器名册的身份比对**。
         #   有些节点有桥接功能、也确实在互通，但版本较早、没有"已加入"上报字段；
         #   只等它们自己报的话，总系统会一直显示 0 台，而且名册会变空、
