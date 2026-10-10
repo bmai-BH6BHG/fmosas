@@ -32,6 +32,7 @@ from tests import ROOT
 sys.path.insert(0, ROOT)
 
 import bridge as B  # noqa: E402
+import monitor as Mb  # noqa: E402
 
 
 # ---------------------------------------------------------------- MQTT 报文工具
@@ -100,6 +101,7 @@ class FakeBroker(threading.Thread):
         self.clients = []
         self.subs = {}
         self.retained = {}
+        self.deny_sub = []          # 模拟对端 ACL：这些过滤器的订阅回 0x80
         self.connect_count = 0
         self._stop = False
         self._lock = threading.Lock()
@@ -148,12 +150,22 @@ class FakeBroker(threading.Thread):
                         conn.sendall(b"\x20\x02\x00\x00")
                     elif t == 8:
                         pid = struct.unpack_from(">H", pkt[1], 0)[0]
-                        conn.sendall(bytes([0x90, 0x03]) + struct.pack(">H", pid) + b"\x00")
                         body = pkt[1][2:]
+                        codes = bytearray()
+                        granted = []
                         while len(body) > 0:
                             tlen = struct.unpack_from(">H", body, 0)[0]
                             filt = body[2:2 + tlen].decode("utf-8", "replace")
                             body = body[2 + tlen + 1:]
+                            # 模拟对端 ACL 拒绝订阅：SUBACK 回 0x80
+                            denied = any(self._topic_matches(p, filt)
+                                         for p in self.deny_sub)
+                            codes.append(0x80 if denied else 0x00)
+                            if not denied:
+                                granted.append(filt)
+                        conn.sendall(bytes([0x90, len(codes) + 2])
+                                     + struct.pack(">H", pid) + bytes(codes))
+                        for filt in granted:
                             with self._lock:
                                 self.subs.setdefault(conn, []).append(filt)
                                 items = list(self.retained.items())
@@ -677,6 +689,91 @@ class ClusterTests(BridgeTestCase):
         self.assertTrue(link.peer.get("verified"), "应当标记为已核对")
         self.assertEqual("sub-X", link.peer.get("remote_id"))
         self.assertTrue(link.snapshot()["verified"])
+
+    def test_subscribe_reports_suback_codes(self):
+        """subscribe(wait=True) 必须返回 SUBACK 返回码 —— 否则订阅被拒时我们不知道。"""
+        bk = self.new_broker()
+        cli = Mb.MqttMiniClient("127.0.0.1", bk.port, "FMO-BRIDGE-t1",
+                                read_timeout=1.0)
+        cli.connect()
+        codes = cli.subscribe(["FMO/BRIDGE/ANNOUNCE"], wait=True, timeout=5)
+        self.assertEqual([0x00], codes, "允许订阅时应当返回 0x00")
+        try:
+            cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def test_denied_subscribe_is_reported_not_as_not_joined(self):
+        """
+        ★★ 对端 ACL 拒绝订阅时，报的必须是"订阅被拒"，**不能**报成"对方未加入集群"。
+
+        以前 subscribe() 不看 SUBACK、链路只会等到超时，于是把"我们没订上"
+        说成"对方没加入" —— 排查方向完全错（用户就是被这个误导的）。
+        """
+        bk = self.new_broker()
+        bk.deny_sub = ["FMO/BRIDGE/ANNOUNCE"]        # 对端 ACL 拒绝名片主题
+        b = self.new_bridge(bk, node_id="sub-ME",
+                            candidates=[self.cand(bk, "X", "sub-X")])
+        b._cfg["enabled"] = True
+        tgt = b._collect_targets()["127.0.0.1:%d" % bk.port]
+        link = B.BridgeLink(b, tgt)
+        link.start()
+        ok = wait_for(lambda: link.reject_reason != "", timeout=15)
+        self.assertTrue(ok, "订阅被拒后应当马上给出原因")
+        self.assertIn("ACL", link.reject_reason)
+        self.assertIn("SUBACK", link.reject_reason)
+        self.assertNotIn("未加入集群", link.reject_reason,
+                         "不能把订阅被拒说成对方未加入集群")
+        link.stop()
+
+    def test_confirm_window_exceeds_announce_interval(self):
+        """
+        ★ 等名片的时限必须大于名片周期：对方名片若是**非保留**的（旧版本/别家实现），
+        只有到下一次广播才收得到。以前 12 秒 < 60 秒周期 → 大多数情况误判成"未加入"。
+        """
+        self.assertGreater(B.MEMBER_CONFIRM_TIMEOUT, B.ANNOUNCE_INTERVAL,
+                           "确认窗口必须大于名片周期")
+        self.assertLessEqual(B.NON_MEMBER_RETRY, 300.0,
+                             "非成员重试间隔不能太长（以前 900 秒让界面长时间显示未加入）")
+
+    def test_thread_survives_main_loop_exception(self):
+        """
+        ★★ 真实故障回归（对端就是这个表现）：桥接线程绝不能因异常静默退出。
+
+        以前外层循环没有兜底、`_sync_links()` 又在 try 之外 —— 抛一次异常整个线程
+        就没了，但配置仍 enabled=true、界面照样显示"已加入集群"，
+        实际不再发名片、不再互联 → "看着加入了，语音一直不通"，且没有任何报错。
+        """
+        bk = self.new_broker()
+        b = self.new_bridge(bk, node_id="sub-ME")
+        b._cfg["enabled"] = True
+        calls = {"n": 0}
+        real = b._main_loop
+
+        def boom():
+            calls["n"] += 1
+            raise RuntimeError("模拟主循环崩溃")
+
+        b._main_loop = boom
+        b.start()
+        self.assertTrue(wait_for(lambda: calls["n"] >= 2, timeout=10),
+                        "主循环崩溃后应当被守护外壳重新拉起（而不是线程直接死掉）")
+        self.assertTrue(b.thread_alive(), "桥接线程必须还活着")
+        b._main_loop = real
+        b.stop()
+        self.assertTrue(wait_for(lambda: not b.thread_alive(), timeout=10))
+
+    def test_status_exposes_thread_alive(self):
+        """状态里要有 thread_alive，界面才能提示"已加入但其实没在工作"。"""
+        bk = self.new_broker()
+        b = self.new_bridge(bk, node_id="sub-ME")
+        st = b.status()
+        self.assertIn("thread_alive", st)
+        self.assertFalse(st["thread_alive"])      # 还没 start
+        b._cfg["enabled"] = True
+        b.start()
+        self.assertTrue(wait_for(lambda: b.status()["thread_alive"], timeout=10))
+        b.stop()
 
     def test_status_shape(self):
         local = self.new_broker()

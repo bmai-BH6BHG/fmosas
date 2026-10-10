@@ -93,8 +93,13 @@ LOCAL_BROKER = ("127.0.0.1", 1883)
 
 RECONNECT_MIN = 5.0                   # 对端重连退避初值（秒）
 RECONNECT_MAX = 120.0
-MEMBER_CONFIRM_TIMEOUT = 12.0         # 连上后等多久算"对方没加入集群"
-NON_MEMBER_RETRY = 900.0              # 非成员（或没开桥接的站）多久后再试一次
+MEMBER_CONFIRM_TIMEOUT = 90.0         # 连上后等多久算"对方没加入集群"
+# ★ 必须**大于名片周期**（ANNOUNCE_INTERVAL=60s）：对方名片是保留消息时一订阅就到，
+#   但万一是非保留的（旧版本/别家实现）就得等它下一次广播。以前只有 12 秒 ——
+#   那样大多数情况会误判成"对方未加入集群"（真实踩过）。
+NON_MEMBER_RETRY = 120.0              # 非成员（或没开桥接的站）多久后再试一次
+# ★ 以前是 900 秒：一次瞬时失败（TCP 抖动、对端刚重启还没发名片）就让界面连续
+#   15 分钟显示"未加入集群"，而对方其实早已加入 —— 用户报的就是这个现象。
 DEDUPE_TTL = 20.0                     # 同一帧在这段时间内只播一次
 DEDUPE_MAX = 4000
 # 中继语音会被我们重播回 FMO/RAW，而本机连接又订阅着 FMO/RAW —— 我们必然收到
@@ -303,8 +308,18 @@ class BridgeLink(threading.Thread):
         """成员确认后，补订阅它的语音主题（4 层：对方的源生语音）。"""
         cli = self._client
         if cli is None:
-            return
-        cli.subscribe([in_filter(ch) for ch in self.svc.channels])
+            return None
+        # 同样看返回码：语音主题被 ACL 拒了要能说出来（否则表现成"语音单向不通"）
+        codes = cli.subscribe([in_filter(ch) for ch in self.svc.channels],
+                              wait=True)
+        bad = [c for c in (codes or []) if c != 0]
+        if bad:
+            self.last_error = ("对端 ACL 拒绝订阅语音主题（SUBACK=%s）—— "
+                               "对方需要放行 FMO/BRIDGE/#"
+                               % ", ".join("0x%02x" % c for c in bad))
+            self.svc.log("[BRIDGE] %s：%s" % (self.peer.get("name") or self.key,
+                                              self.last_error))
+        return codes
 
     # ---- 连接生命周期 ----
     def run(self):
@@ -328,7 +343,15 @@ class BridgeLink(threading.Thread):
                 client.connect()
                 # 第一步**只订阅名片**：先确认对方是不是"已加入集群"的成员。
                 # 确认后才订阅语音主题 —— 免得对没加入集群的站白收一堆流量。
-                client.subscribe([ANNOUNCE_TOPIC])
+                # ★ 必须看 SUBACK 返回码：对端 broker 的 ACL 可能拒绝订阅，
+                #   那就不是"对方没加入"，而是"我们订不上"，二者排查方向完全不同。
+                codes = client.subscribe([ANNOUNCE_TOPIC], wait=True)
+                if codes and codes[0] != 0:
+                    self.reject_reason = ("对端 broker 的 ACL 拒绝订阅集群名片主题 "
+                                          "（SUBACK=0x%02x）—— 需要在对方 ACL 放行 "
+                                          "FMO/BRIDGE/#" % codes[0])
+                    self.not_member = True
+                    raise MqttError(self.reject_reason)
                 self.connected = True
                 self.state = "connected"
                 self.connected_at = time.time()
@@ -507,6 +530,33 @@ class VoiceBridge(object):
                 pass
 
     def _run(self):
+        """
+        守护外壳：桥接线程**绝不能因异常静默退出**。
+
+        ★ 真实故障（对端就是这么表现的）：以前外层循环没有兜底，而 `_sync_links()`
+          就在循环体第一行、还在 try 之外 —— 那里抛一次异常，整个桥接线程就没了，
+          但配置仍是 enabled=true、界面照样显示"已加入集群"，
+          实际却不再发集群名片、不再连任何对端 → 表现成"看着加入了，语音一直不通"，
+          而且**没有任何报错**，极难排查。
+        """
+        while not self._stop.is_set():
+            try:
+                self._main_loop()
+            except Exception as e:  # noqa: BLE001
+                self._local_ready = False
+                self._local_state = "error"
+                self._local_error = "桥接循环异常（已自动恢复）: %s" % e
+                if not self._stop.is_set():
+                    self.log("[BRIDGE] 桥接循环异常（已自动恢复，2 秒后继续）: %s" % e)
+                self._stop.wait(2.0)
+
+    def thread_alive(self):
+        """桥接线程是否还活着（供界面/看门狗判断，避免"看着已加入其实早死了"）。"""
+        with self._lock:
+            t = self._thread
+        return bool(t is not None and t.is_alive())
+
+    def _main_loop(self):
         """本机 broker 连接的主循环；同时负责按需启停各对端链路。"""
         backoff = RECONNECT_MIN
         while not self._stop.is_set():
@@ -1066,6 +1116,8 @@ class VoiceBridge(object):
             "topics": list(cfg["channels"]),
             "local_state": local_state,
             "local_error": local_error,
+            # 桥接线程是否存活：false = 界面显示"已加入"但实际早就不工作了
+            "thread_alive": self.thread_alive(),
             "local_connected": bool(local_ready),
             "peer_member_count": len(members),
             "member_count": count,

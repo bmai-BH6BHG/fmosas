@@ -306,6 +306,8 @@ class MqttMiniClient:
         self._last_io = 0.0
         self._last_send = 0.0        # 上次**发包**时间（keepalive 必须按它算，见 poll_once）
         self._pkt_id = 0
+        # 最近一次 SUBACK（包号, 返回码列表）。订阅是否被对端 ACL 允许看它。
+        self.last_suback = None
 
     # ---- 底层 ----
     def _recv_exact(self, n):
@@ -375,13 +377,33 @@ class MqttMiniClient:
             raise MqttError("连接被拒绝 rc=%d（认证失败或 broker 策略）" % rc)
         self._last_io = time.time()
 
-    def subscribe(self, topics):
+    def subscribe(self, topics, wait=False, timeout=8.0):
+        """
+        订阅主题。wait=True 时同步等 SUBACK 并**返回返回码列表**（0x00 允许、
+        0x80 被拒）；等不到返回 None。
+
+        ★ 为什么要看返回码：对端 broker 的 ACL 可能拒绝订阅。以前不看返回码，
+        订阅被拒时会一直干等，互联桥接就把它误报成"对方未加入集群（未收到集群名片）"
+        —— 把"我们没订上"说成了"对方没加入"，排查时完全指错方向。
+        """
         self._pkt_id = (self._pkt_id + 1) & 0xFFFF or 1
+        pid = self._pkt_id
         payload = b"".join(_mqtt_utf8(t) + b"\x00" for t in topics)
-        vh = struct.pack(">H", self._pkt_id)
+        vh = struct.pack(">H", pid)
         pkt = bytes([0x82]) + _mqtt_remaining_length(len(vh) + len(payload)) + vh + payload
         self._send(pkt)
-        # SUBACK 由 run_forever 循环自然读取（也可在此同步等待，从简）
+        if not wait:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            got = self.last_suback
+            if got is not None and got[0] == pid:
+                return list(got[1])
+            try:
+                self.poll_once()
+            except socket.timeout:
+                pass
+        return None
 
     def publish(self, topic, payload, qos=0, retain=False):
         """
@@ -461,7 +483,14 @@ class MqttMiniClient:
                     self.on_message(topic, payload)
                 except Exception as e:
                     log("MONITOR", "消息处理异常: %s" % e)
-        # PINGRESP/SUBACK 等其余包忽略
+        # PINGRESP/SUBACK 等其余包忽略；但 SUBACK 要记下来 —— 订阅是否被对端
+        # ACL 允许只有它知道（0x80 = 被拒）。以前直接忽略，导致"我们没订上"
+        # 被互联桥接误报成"对方没加入集群"。
+        if ptype == 9:  # SUBACK
+            body = pkt[1]
+            if len(body) >= 2:
+                sub_pid = struct.unpack_from(">H", body, 0)[0]
+                self.last_suback = (sub_pid, list(body[2:]))
         return True
 
 
