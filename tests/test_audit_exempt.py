@@ -90,6 +90,55 @@ class AuditExemptTests(unittest.TestCase):
         self.assertTrue(rows, "未豁免时应产生审计记录")
         self.assertEqual("forged", rows[0]["scene"])
 
+    # ---------------- 互联桥接：代码里直接豁免（不走配置名单）----------------
+    def test_bridge_publisher_detected_in_code(self):
+        import bas_audit as A
+        self.assertTrue(A.is_bridge_publisher("FMO-BRIDGE-sub-983bee49-LOCAL"))
+        self.assertTrue(A.is_bridge_publisher("FMO-BRIDGE-"))
+        self.assertFalse(A.is_bridge_publisher("FMO-BH6BHG-1-052C"))
+        self.assertFalse(A.is_bridge_publisher(None))
+
+    def test_bridge_exempt_without_any_policy_config(self):
+        """
+        ★ 互联桥接必须**不依赖任何配置**就被豁免。
+
+        桥接把远端电台的语音重播到本机 FMO/RAW（APP/FM 才听得到），
+        但它用的是本机服务证书：连接身份=SERVER、包内呼号=远端电台。
+        不豁免会被判「盗用呼号/伪造」，严重时把桥接自己封掉。
+        用户明确要求：不要走可配置的豁免名单，直接在代码里豁免。
+        """
+        self.assertFalse(self.svc._audit_ignored("FMO-BRIDGE-x", None),
+                         "不应依赖 audit_ignore_clientid_prefixes（默认名单里没有它）")
+        # 包内是远端的 BH6BHG，连接身份却是本机 SERVER → 直接豁免，不判伪造
+        root = {
+            "topic": "FMO/RAW", "username": "SERVER",
+            "clientid": "FMO-BRIDGE-sub-983bee49-LOCAL",
+            "client_attrs": {"callsign": "SERVER", "uid": "200000"},
+            "payload": base64.b64encode(_packet("BH6BHG", 1075)).decode(),
+        }
+        self.svc._handle_ingest(root)
+        rows = self.db.query_audit_packets()
+        scenes = [r["scene"] for r in rows]
+        self.assertTrue(rows, "桥接转发应留下可见的事件（不是静默丢弃）")
+        self.assertNotIn("forged", scenes, "桥接转发绝不能被判伪造")
+        self.assertIn("bridged", scenes, "应记成「互联集群转发」场景")
+        self.assertEqual("PASS", rows[0]["verdict"])
+
+    def test_bridge_frames_do_not_trigger_ban(self):
+        """桥接流量不得进入待审/封禁路径。"""
+        root = {
+            "topic": "FMO/RAW", "username": "SERVER",
+            "clientid": "FMO-BRIDGE-sub-983bee49-LOCAL",
+            "client_attrs": {"callsign": "SERVER", "uid": "200000"},
+            "payload": base64.b64encode(_packet("BG1XYZ", 42)).decode(),
+        }
+        for _ in range(5):
+            self.svc._handle_ingest(root)
+        self.assertEqual(0, len(self.svc.pending_actions()
+                                if hasattr(self.svc, "pending_actions") else []))
+        self.assertEqual(0, self.svc.stats().get("audit_kick", 0)
+                         if isinstance(self.svc.stats(), dict) else 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

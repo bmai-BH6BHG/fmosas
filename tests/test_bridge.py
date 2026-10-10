@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MQTT 互联桥接测试（集群模型）
@@ -284,23 +284,27 @@ class TopicTests(unittest.TestCase):
     def test_shapes(self):
         self.assertEqual("FMO/BRIDGE/sub-A/RAW", B.out_topic("sub-A", "RAW"))
         self.assertEqual("FMO/BRIDGE/+/RAW", B.in_filter("RAW"))
-        self.assertEqual("FMO/BRIDGE/local/sub-A/RAW",
-                         B.local_relay_topic("sub-A", "RAW"))
+        # ★ 中继语音重播到**原生主题**：APP / FM 网关 / 监控 只订阅这个
+        self.assertEqual("FMO/RAW", B.channel_topic("RAW"))
+        self.assertEqual("FMO/TELE", B.channel_topic("TELE"))
 
     def test_parse_member_voice(self):
         self.assertEqual(("sub-A", "RAW"), B.parse_in_topic("FMO/BRIDGE/sub-A/RAW"))
         self.assertEqual(("sub-A", "TELE"), B.parse_in_topic("FMO/BRIDGE/sub-A/TELE"))
 
-    def test_local_relay_not_inbound(self):
+    def test_relay_topic_is_the_native_voice_topic(self):
         """
-        ★ 防中转洪泛/回环的关键：本机重播主题是 5 层，
-        对端订阅的过滤器是 4 层，匹配不到 → 中继语音不会被再传出去。
+        ★ 真实故障回归：中继语音必须落在 APP / FM 网关**本来就在听**的主题上。
+
+        早先把中继语音重播到 FMO/BRIDGE/local/<源>/RAW（只有监控订阅），
+        结果就是"录音里有声音，APP 和 FM 一点声音都没有"。
         """
-        self.assertEqual(("", ""),
-                         B.parse_in_topic("FMO/BRIDGE/local/sub-A/RAW"))
-        self.assertFalse(BridgeTestCase.__dict__ and
-                         FakeBroker._topic_matches(B.in_filter("RAW"),
-                                                   B.local_relay_topic("sub-A", "RAW")))
+        for ch in ("RAW", "TELE"):
+            t = B.channel_topic(ch)
+            self.assertEqual("FMO/%s" % ch, t)
+            self.assertEqual(2, len(t.split("/")),
+                             "必须是原生两层主题，才和本机语音同一条路径")
+        self.assertNotIn("BRIDGE", B.channel_topic("RAW"))
 
     def test_non_bridge_topics_rejected(self):
         for t in ("FMO/RAW", "FMO/BRIDGE/ANNOUNCE",
@@ -446,14 +450,14 @@ class ClusterTests(BridgeTestCase):
 
         # A 站本地有人说话 → B 站应当能听到（重播到 B 的 broker）
         broker_a.push("FMO/RAW", b"voice-from-A")
-        want_a = B.local_relay_topic("sub-A", "RAW")
+        want_a = B.channel_topic("RAW")
         self.assertTrue(wait_for(lambda: broker_b.got(want_a), timeout=10),
                         "A 的声音应到 B，B实际=%s" % broker_b.topics())
         self.assertEqual(b"voice-from-A", broker_b.got(want_a)[-1])
 
         # 反向
         broker_b.push("FMO/RAW", b"voice-from-B")
-        want_b = B.local_relay_topic("sub-B", "RAW")
+        want_b = B.channel_topic("RAW")
         self.assertTrue(wait_for(lambda: broker_a.got(want_b), timeout=10),
                         "B 的声音应到 A")
 
@@ -473,9 +477,9 @@ class ClusterTests(BridgeTestCase):
                                      timeout=15),
                             "每个成员应自动互联其余两个")
         ba.push("FMO/RAW", b"from-A")
-        self.assertTrue(wait_for(lambda: bc.got(B.local_relay_topic("sub-A", "RAW")),
+        self.assertTrue(wait_for(lambda: bc.got(B.channel_topic("RAW")),
                                  timeout=10))
-        self.assertTrue(wait_for(lambda: bb.got(B.local_relay_topic("sub-A", "RAW")),
+        self.assertTrue(wait_for(lambda: bb.got(B.channel_topic("RAW")),
                                  timeout=10))
 
     def test_one_member_down_does_not_break_others(self):
@@ -499,7 +503,7 @@ class ClusterTests(BridgeTestCase):
         bb.stop()                       # B 挂了
         time.sleep(2.0)
         ba.push("FMO/RAW", b"after-B-down")
-        self.assertTrue(wait_for(lambda: bc.got(B.local_relay_topic("sub-A", "RAW")),
+        self.assertTrue(wait_for(lambda: bc.got(B.channel_topic("RAW")),
                                  timeout=12),
                         "B 挂掉后 A 与 C 仍必须互通")
         self.assertGreaterEqual(c.status()["peer_member_count"], 1,
@@ -536,7 +540,7 @@ class ClusterTests(BridgeTestCase):
         ba.push("FMO/RAW", b"should-not-leave")
         time.sleep(1.5)
         self.assertEqual([], b.status()["peers"][0].get("rx_frames")
-                         and bb.got(B.local_relay_topic("sub-A", "RAW")))
+                         and bb.got(B.channel_topic("RAW")))
         self.assertEqual(0, b.status()["local"]["rx_frames"])
 
     def test_dedupe_same_frame(self):
@@ -546,7 +550,7 @@ class ClusterTests(BridgeTestCase):
         a.start(); b.start()
         self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
         ba.push("FMO/RAW", b"dup")
-        want = B.local_relay_topic("sub-A", "RAW")
+        want = B.channel_topic("RAW")
         self.assertTrue(wait_for(lambda: bb.got(want)))
         ba.push("FMO/RAW", b"dup")
         ba.push("FMO/RAW", b"dup")
@@ -554,20 +558,54 @@ class ClusterTests(BridgeTestCase):
         self.assertEqual(1, len(bb.got(want)), "重复帧必须去重")
         self.assertGreaterEqual(b.status()["local"]["deduped"], 2)
 
-    def test_own_voice_does_not_loop_back(self):
-        """自己的语音绕回来必须丢弃（防回环）。"""
+    def test_relayed_voice_lands_on_native_topic(self):
+        """
+        ★★ 真实故障回归（用户报的"录音有、APP/FM 没声音"）：
+
+        APP 和 FM 网关只订阅原生主题 `FMO/RAW`，所以中继语音**必须重播到那里**；
+        早先放在 FMO/BRIDGE/local/<源>/RAW 上时，只有监控（录音）能看到，
+        APP 和 FM 一点声音都没有。
+        """
         ba, bb = self.new_broker(), self.new_broker()
         a = self.new_bridge(ba, node_id="sub-A", candidates=[self.cand(bb, "B")])
         b = self.new_bridge(bb, node_id="sub-B", candidates=[self.cand(ba, "A")])
         a.start(); b.start()
         self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
-        bb.push("FMO/BRIDGE/sub-A/RAW", b"echo")
-        time.sleep(1.0)
-        self.assertEqual([], ba.got(B.local_relay_topic("sub-A", "RAW")),
-                         "自己的声音不该被本机当成「互联进来的」再播一遍")
+        ba.push("FMO/RAW", b"voice-from-A")
+        self.assertTrue(wait_for(lambda: bb.got("FMO/RAW") == [b"voice-from-A"],
+                                 timeout=10),
+                        "中继语音没有出现在 FMO/RAW 上 → APP/FM 收不到")
+        # 也不能再落到那个"只有监控认识"的旧主题上
+        self.assertEqual([], [t for t in bb.topics()
+                              if t.startswith("FMO/BRIDGE/local/")],
+                         "又往旧主题发了一份（会导致录音重复）")
+
+    def test_injected_frame_is_not_re_forwarded(self):
+        """
+        ★★ 回环抑制：重播回本机 FMO/RAW 的帧，会被**我们自己**的订阅收回来。
+
+        MQTT 3.1.1 没有 no-local 标志，不识别它就会：
+          A 说话 → B 重播进 B 的 FMO/RAW → B 自己收到 → B 当成"本机语音"导出给 A
+          → A 重播进 A 的 FMO/RAW → … 无限乒乓。
+        """
+        ba, bb = self.new_broker(), self.new_broker()
+        a = self.new_bridge(ba, node_id="sub-A", candidates=[self.cand(bb, "B")])
+        b = self.new_bridge(bb, node_id="sub-B", candidates=[self.cand(ba, "A")])
+        a.start(); b.start()
+        self.assertTrue(wait_for(lambda: b.status()["peer_member_count"] == 1))
+        ba.push("FMO/RAW", b"one-shot")
+        self.assertTrue(wait_for(lambda: bb.got("FMO/RAW") == [b"one-shot"],
+                                 timeout=10))
+        time.sleep(2.5)
+        # B 不得把自己注入的帧再导出给对端
+        self.assertEqual([], bb.got("FMO/BRIDGE/sub-B/RAW"),
+                         "B 把注入的帧又转发出去 → 会无限乒乓")
+        # A 的 broker 上也不该出现"自己的声音绕回来"再被注入一次
+        self.assertEqual([], ba.got("FMO/RAW"),
+                         "自己的声音绕回来又被注入到本机 FMO/RAW")
 
     def test_relayed_voice_is_not_forwarded_to_other_members(self):
-        """中继语音只在本机重播，不再传给第三方（否则会中转洪泛/回环）。"""
+        """中继语音只在本机重播，不再中转给第三方（否则会中转洪泛）。"""
         ba, bb, bc = self.new_broker(), self.new_broker(), self.new_broker()
         a = self.new_bridge(ba, node_id="sub-A",
                             candidates=[self.cand(bb, "B")])
@@ -576,12 +614,69 @@ class ClusterTests(BridgeTestCase):
         b.start(); a.start()
         time.sleep(3.0)
         ba.push("FMO/RAW", b"from-A")
-        self.assertTrue(wait_for(lambda: bb.got(B.local_relay_topic("sub-A", "RAW")),
+        self.assertTrue(wait_for(lambda: bb.got("FMO/RAW") == [b"from-A"],
                                  timeout=10))
-        time.sleep(1.0)
-        # C 的 broker 上不该出现 A 的中继语音（本机重播主题是 5 层，B 不会转发）
-        self.assertEqual([], [t for t in bc.topics() if "sub-A" in t],
-                         "中继语音被再次转发会形成洪泛: %s" % bc.topics())
+        time.sleep(2.0)
+        self.assertEqual([], bc.got("FMO/RAW"),
+                         "A 的语音被 B 中转给了 C（洪泛）")
+        self.assertEqual([], bc.got("FMO/BRIDGE/sub-B/RAW"),
+                         "B 把自己注入的帧导出给了 C（洪泛）")
+
+    def test_update_peer_keeps_learned_identity(self):
+        """
+        ★ _sync_links() 每 5 秒就用名册重建的目标刷新一次链路，而名册里没有
+        remote_id/verified —— 不能用 dict(peer) 直接覆盖，否则刚验证到的对方身份
+        会被抹掉，界面永远显示不出"对方是谁"（真实 bug：member=True 但 remote_id 空）。
+        """
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        b._cfg["enabled"] = True
+        tgt = {"id": "127.0.0.1:1", "name": "X", "host": "127.0.0.1", "port": 1,
+               "expect_id": "sub-X", "manual": False}
+        link = B.BridgeLink(b, tgt)
+        link.peer["remote_id"] = "sub-X"
+        link.peer["verified"] = True
+        # 名册刷新：新目标里没有学到的字段
+        link.update_peer(dict(tgt))
+        self.assertEqual("sub-X", link.peer.get("remote_id"),
+                         "名册刷新把学到的 remote_id 抹掉了")
+        self.assertTrue(link.peer.get("verified"), "verified 被抹掉了")
+        self.assertEqual("sub-X", link.snapshot()["remote_id"])
+        self.assertTrue(link.snapshot()["verified"])
+
+    def test_announce_without_node_id_is_rejected(self):
+        """
+        ★ 相互验证的前提：名片必须带节点标识。
+
+        否则任何人往 FMO/BRIDGE/ANNOUNCE 发一句 {"cluster": true} 就能被算成
+        集群成员 —— 验证形同虚设。
+        """
+        bk = self.new_broker()
+        b = self.new_bridge(bk, node_id="sub-ME",
+                            candidates=[self.cand(bk, "X", "sub-X")])
+        b._cfg["enabled"] = True
+        link = B.BridgeLink(b, b._collect_targets()["127.0.0.1:%d" % bk.port])
+        b._links[link.key] = link
+        b.on_peer_announce(link.key,
+                           json.dumps({"cluster": True}).encode())
+        self.assertFalse(link.member, "没有 node_id 的名片不该被认成成员")
+        self.assertIn("缺少节点标识", link.reject_reason)
+
+    def test_verified_flag_reflects_roster_match(self):
+        """verified 只在"名册登记的 subsystem_id 与名片一致"时为真。"""
+        bk = self.new_broker()
+        b = self.new_bridge(bk, node_id="sub-ME",
+                            candidates=[self.cand(bk, "X", "sub-X")])
+        b._cfg["enabled"] = True
+        tgt = b._collect_targets()["127.0.0.1:%d" % bk.port]
+        link = B.BridgeLink(b, tgt)
+        b._links[link.key] = link
+        # 名册说这个地址是 sub-X，名片也说是 sub-X → 成员 + 已核对
+        b.on_peer_announce(link.key, json.dumps(
+            {"cluster": True, "node_id": "sub-X", "node_name": "X"}).encode())
+        self.assertTrue(link.member)
+        self.assertTrue(link.peer.get("verified"), "应当标记为已核对")
+        self.assertEqual("sub-X", link.peer.get("remote_id"))
+        self.assertTrue(link.snapshot()["verified"])
 
     def test_status_shape(self):
         local = self.new_broker()

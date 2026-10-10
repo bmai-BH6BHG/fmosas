@@ -18,29 +18,41 @@ bridge.py —— FUS 系统之间的 MQTT 语音互联（无主 / 可自选 / �
    A ──连B的broker──▶ B          A、B、C 两两直连，没有主节点；
    A ──连C的broker──▶ C          任意一条链路断了，其它链路照常工作（各自独立线程）。
 
-## 主题（关键设计，决定了可控性与"不会串台"）
-本机把某频道语音发给**某个指定对端**时，发布在**本机 broker** 上：
+## 主题（关键设计）
+本机把某频道语音发布在**本机 broker** 上（对端连过来拉）：
 
-    FMO/BRIDGE/<本机节点>/to/<对端节点>/RAW        （RAW/TELE 各一条）
+    FMO/BRIDGE/<本机节点>/RAW          （RAW / TELE 各一条）
 
-对端连到本机 broker 时，只订阅"发给自己的"：
+对端连到本机 broker 后，只订阅：
 
-    FMO/BRIDGE/+/to/<对端节点>/RAW
+    FMO/BRIDGE/+/RAW
 
-于是「我的语音给谁」是**逐对端可控**的 —— 这就是"自主选择加入或者不加入"。
+**集群成员判定**：连上之后先只订阅 `FMO/BRIDGE/ANNOUNCE`（保留消息），
+等到对方的名片且 `cluster=true` 才认它是集群成员；再与其在总服务器名册里登记的
+subsystem_id 比对（相互验证），不一致不认。语音订阅只在确认成员后才建立。
 
-收到对端语音后，在本机重播成（供本机监控/APP 消费）：
+收到对端语音后，在本机重播到**原生语音主题本身**（RAW → `FMO/RAW`）：
 
-    FMO/BRIDGE/<源节点>/RAW
+    FMO/RAW
 
-### 为什么这样就不会有回环 / 不会被审计误判
-* 桥接主题全在 `FMO/BRIDGE/` 下，而本机审计规则的过滤是 `FROM "FMO/RAW/#"`，
-  **不匹配** `FMO/BRIDGE/...` → 桥接语音不会被当成"本机报文"灌进身份审计。
-  （否则外站呼号 + 本机连接身份会被判成"伪造"，甚至误封 —— 这是必须避开的坑。）
-* 本机只订阅 `FMO/RAW`、`FMO/TELE` 这两个**源生**主题，从不再订阅/转发
-  `FMO/BRIDGE/...`，所以「收到的远端语音」永远不会被再次外发 → 结构上无环。
-* 再叠一层 (源节点, 频道, payload 摘要) 去重，即使配置出现环路也不会重复播放。
-* 收到 `源节点 == 自己` 直接丢弃（自己发出去又绕回来的包）。
+★ 为什么不重播到一个自己的命名空间（早先用过 `FMO/BRIDGE/local/<源>/RAW`）：
+  **APP 和 FM 网关只订阅原生主题 `FMO/RAW`**。中继语音放到别的主题上，
+  它们就完全听不到 —— 真实故障：录音界面里有互联语音（监控订阅了新主题），
+  但 APP 和 FM 一点声音都没有。重播回原生主题后，APP / FM 网关 / 监控
+  全都按"本机收到的语音"一视同仁，任何一端都不用改配置。
+
+### 回环与审计（两件必须自己处理的事）
+* **回环**：重播进本机 `FMO/RAW` 的帧，会被**我们自己**的订阅收回来
+  （MQTT 3.1.1 没有 no-local 标志）。不识别它就会：A→B 重播 → B 当成"本机语音"
+  导出给 A → A 再重播 → 无限乒乓。
+  做法：重播时登记 payload 摘要（`_injected`，`INJECT_TTL` 秒），
+  `_on_local_message` 命中摘要即丢弃 → 中继语音不再被外发，结构上无环。
+* **审计**：本机审计规则的过滤是 `FROM "FMO/RAW/#"`，重播回 `FMO/RAW` 后
+  **一定会被审计看到**。此时连接身份是本机服务证书（SERVER）、包内呼号是远端电台，
+  必然不同 → 会被判「盗用呼号/伪造」，甚至把桥接自己封掉。
+  做法：审计里按 clientid 前缀 `FMO-BRIDGE-` **直接在代码里豁免**
+  （见 bas_audit.is_bridge_publisher），记一条 `bridged` 场景留证但不参与身份判定。
+* 另叠一层 (源节点, 频道, payload 摘要) 去重；收到 `源节点 == 自己` 直接丢弃。
 
 ## 认证
 连对端 broker 用本机**监控证书**（本服务器 CA 签发）走标准 MQTT 认证
@@ -85,6 +97,10 @@ MEMBER_CONFIRM_TIMEOUT = 12.0         # 连上后等多久算"对方没加入集
 NON_MEMBER_RETRY = 900.0              # 非成员（或没开桥接的站）多久后再试一次
 DEDUPE_TTL = 20.0                     # 同一帧在这段时间内只播一次
 DEDUPE_MAX = 4000
+# 中继语音会被我们重播回 FMO/RAW，而本机连接又订阅着 FMO/RAW —— 我们必然收到
+# "自己刚发出去的那一帧"。MQTT 3.1.1 没有 no-local 标志，只能按内容摘要识别。
+INJECT_TTL = 30.0                     # 这段时间内识别为"本机注入的帧"
+INJECT_MAX = 4000
 CLIENTID_PREFIX = "FMO-BRIDGE-"
 
 DEFAULT_BRIDGE = {
@@ -125,15 +141,22 @@ def in_filter(channel):
     return "%s/+/%s" % (BRIDGE_ROOT, slot(channel))
 
 
-def local_relay_topic(origin_id, channel):
+def channel_topic(channel):
     """
-    把对端语音在本机重播给本地消费者（监控/APP）用（**5 层**）。
+    中继语音要重播到的主题 —— **就是原生语音主题本身**（FMO/RAW / FMO/TELE）。
 
-    ★ 故意与 4 层的入站主题区分开：对端订阅的是 FMO/BRIDGE/+/<频道>（4 层），
-      匹配不到这里的 5 层 → 中继进来的语音**不会再被传给别人**，
-      既不形成中转洪泛，也不可能回环。
+    ★ 为什么不另起命名空间（例如早先用过的 FMO/BRIDGE/local/<源>/RAW）：
+      APP 和 FM 网关只订阅原生主题 `FMO/RAW`，把中继语音放到别的主题上，
+      它们就**完全听不到** —— 真实故障：录音界面里有互联语音（监控订阅了新主题），
+      但 APP 和 FM 一点声音都没有。
+      重播回原生主题后，APP / FM 网关 / 监控 全都按"本机收到的语音"一视同仁地处理，
+      不需要任何一端改配置。
     """
-    return "%s/local/%s/%s" % (BRIDGE_ROOT, slot(origin_id), slot(channel))
+    return "FMO/%s" % slot(channel)
+
+
+def payload_digest(payload):
+    return hashlib.sha1(payload or b"").hexdigest()
 
 
 def parse_in_topic(topic):
@@ -268,6 +291,9 @@ class BridgeLink(threading.Thread):
             "alive": self._alive,
             # 从对端名片学到的节点标识（界面展示用）
             "remote_id": self.peer.get("remote_id") or "",
+            # 是否与总服务器名册登记的身份核对一致（相互验证）
+            "verified": bool(self.peer.get("verified")),
+            "expect_id": self.peer.get("expect_id") or "",
         }
 
     def stop(self):
@@ -357,8 +383,18 @@ class BridgeLink(threading.Thread):
         self.svc.on_remote_frame(self.peer, topic, payload)
 
     def update_peer(self, peer):
-        """配置变更：更新用于展示的字段（连接本身由服务决定是否重启）。"""
+        """
+        配置变更：更新用于展示的字段（连接本身由服务决定是否重启）。
+
+        ★ 必须**保留从对端名片学到的字段**（remote_id / verified）。
+        `_sync_links()` 每 5 秒就会用名册重建的目标来刷新一次，而名册里没有
+        remote_id —— 直接 `self.peer = dict(peer)` 会把刚验证到的对方身份抹掉，
+        界面上就永远显示不出"已核对到对方是谁"（真实 bug：成员已确认却 remote_id 空）。
+        """
+        learned = {k: self.peer.get(k) for k in ("remote_id", "verified", "reject_reason")
+                   if self.peer.get(k)}
         self.peer = dict(peer)
+        self.peer.update(learned)
 
 
 # ---------------------------------------------------------------- 桥接服务
@@ -400,6 +436,7 @@ class VoiceBridge(object):
         self._local_error = ""
         self._out_queue = queue.Queue(maxsize=2000)   # 跨线程发布队列
         self._dedupe = {}
+        self._injected = {}          # 本机重播出去的内容摘要（回环抑制）
         self._stats = {"published": 0, "rx_frames": 0, "deduped": 0}
         self._peer_tx = {}                    # peer_id -> 已发出的消息数
         self._unaddressed = {}                # 已提示过"还没拿到名片"的对端
@@ -569,7 +606,36 @@ class VoiceBridge(object):
         channel = parts[1].upper()
         if channel not in self.channels:
             return
+        # ★ 回环抑制：中继进来的语音会被我们自己重播回 FMO/RAW（为了 APP/FM 能听到），
+        #   本机连接又订阅着 FMO/RAW，于是会**收到自己刚发出去的那一帧**。
+        #   不拦住它就会被当成"本机语音"再转发给对端 → A→B→A 无限循环。
+        #   MQTT 3.1.1 没有 no-local 标志，只能在应用层按内容摘要识别自己注入的帧。
+        if self._is_injected(payload):
+            return
         self._forward(channel, payload)
+
+    def _is_injected(self, payload):
+        """这一帧是不是本机刚刚重播出去的（用于回环抑制）。"""
+        key = payload_digest(payload)
+        now = time.time()
+        with self._lock:
+            ts = self._injected.get(key)
+            if ts is None:
+                return False
+            if now - ts > INJECT_TTL:
+                self._injected.pop(key, None)
+                return False
+            return True
+
+    def _mark_injected(self, payload):
+        key = payload_digest(payload)
+        now = time.time()
+        with self._lock:
+            if len(self._injected) > INJECT_MAX:
+                for k in [k for k, t in self._injected.items()
+                          if now - t > INJECT_TTL]:
+                    self._injected.pop(k, None)
+            self._injected[key] = now
 
     def _publish_announce(self, client):
         """
@@ -606,7 +672,17 @@ class VoiceBridge(object):
             return
         rid = str(data.get("node_id") or "").strip()
         rname = str(data.get("node_name") or "").strip()
-        if rid and rid == self.node_id:
+        if not rid:
+            # ★ 名片里必须有节点标识：没有就无法与总服务器名册核对身份。
+            #   不拦的话，任何人往 FMO/BRIDGE/ANNOUNCE 发一句 {"cluster":true}
+            #   就能被算成集群成员（相互验证形同虚设）。
+            with self._lock:
+                link = self._links.get(key)
+                if link is not None and not link.reject_reason:
+                    link.reject_reason = "对端名片缺少节点标识，无法与总服务器名册核对"
+                    self.log("[BRIDGE] 拒绝 %s：%s" % (key, link.reject_reason))
+            return
+        if rid == self.node_id:
             return                      # 自己的名片（自测把本机当成员时会走到这里）
         with self._lock:
             link = self._links.get(key)
@@ -623,8 +699,14 @@ class VoiceBridge(object):
                     self.log("[BRIDGE] 拒绝 %s：%s" % (key, link.reject_reason))
                 return
             changed = False
-            if rid and link.peer.get("remote_id") != rid:
+            if link.peer.get("remote_id") != rid:
                 link.peer["remote_id"] = rid
+                changed = True
+            # 是否"已核对"：名册登记了这个地址对应的 subsystem_id，且与名片一致。
+            # 手动补充的站点名册里没有 → 认成员但标记为未核对（界面显示清楚）。
+            verified = bool(expect) and rid == expect
+            if link.peer.get("verified") != verified:
+                link.peer["verified"] = verified
                 changed = True
             if rname and not link.peer.get("manual") \
                     and link.peer.get("name") in (link.peer.get("host"), "", None):
@@ -700,8 +782,12 @@ class VoiceBridge(object):
             return
         with self._lock:
             self._stats["rx_frames"] += 1
+        # ★ 重播到**原生语音主题**（FMO/RAW / FMO/TELE），这样 APP、FM 网关、
+        #   监控全都按"本机收到的语音"处理 —— 不需要任何一端改配置。
+        #   同时登记内容摘要，供本机连接回环抑制（我们自己也会收到这一帧）。
+        self._mark_injected(payload)
         try:
-            self._out_queue.put_nowait((local_relay_topic(origin, channel), payload))
+            self._out_queue.put_nowait((channel_topic(channel), payload))
         except queue.Full:
             self.log("[BRIDGE] 重播队列已满，丢弃一帧（对端流量过载）")
 

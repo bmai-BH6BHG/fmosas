@@ -1,4 +1,4 @@
-﻿/* MQTT 互联集群管理页前端（零依赖）——数据来自 /api/bridge/*（管理口）
+/* MQTT 互联集群管理页前端（零依赖）——数据来自 /api/bridge/*（管理口）
  *
  * 模型（用户明确要求的那一个）：
  *   服务器级只有一个开关 —— 加入集群 / 退出集群。加入后，所有已加入集群的
@@ -226,7 +226,15 @@
       '<div class="br-badges">' + badges.join('') + '</div>' +
       '<div class="br-meta">' + meta.join('') + '</div>' +
       (p.remote_id
-        ? '<div class="br-note">对端节点标识 <b class="mono">' + esc(p.remote_id) + '</b></div>'
+        ? '<div class="br-note">对端节点标识 <b class="mono">' + esc(p.remote_id) + '</b>'
+          + (p.member
+              ? (p.verified
+                  ? ' <span class="br-ok">✓ 已与总服务器名册核对一致</span>'
+                  : ' <span class="br-warn">未核对'
+                    + (p.expect_id ? '（名册登记为 ' + esc(p.expect_id) + '）' : '（名册里没有此站点）')
+                    + '</span>')
+              : '')
+          + '</div>'
         : '') +
       (p.last_error ? '<div class="br-err">' + esc(p.last_error) + '</div>' : '') +
       '<details class="br-more"' + (openMore[id] ? ' open' : '') + '>' +

@@ -43,6 +43,18 @@ DUP_UID_ROUNDS = 3             # 同 uid 多连接连续确认轮数（对齐上
 # clientid 里带呼号的常见形态：FMO-BH8GDV-4-5817 / fmo_BH8GDV_xxx / BH8GDV-4-1234
 _CALLSIGN_IN_CID = re.compile(r"(?:^|[^A-Z0-9])([A-Z]{1,2}\d[A-Z]{1,4})(?![A-Z0-9])")
 
+# 互联桥接发布者的 clientid 前缀（与 bridge.py 的 CLIENTID_PREFIX 一致）。
+# 桥接把**远端节点**的语音重播到本机 FMO/RAW（APP 与 FM 网关只订阅这个主题），
+# 但它用的是本机服务证书 —— 连接身份=SERVER、包内呼号=远端电台，两者必然不同。
+# 因此这里**在代码里直接豁免**（不走可配置的 audit_ignore_clientid_prefixes 名单），
+# 否则互联语音会被判「盗用呼号/伪造」，严重时还会把桥接自己封掉。
+BRIDGE_CLIENTID_PREFIX = "FMO-BRIDGE-"
+
+
+def is_bridge_publisher(clientid):
+    """这条连接是不是本机/对端的互联桥接（其报文要按"集群转发"豁免身份审计）。"""
+    return str(clientid or "").startswith(BRIDGE_CLIENTID_PREFIX)
+
 
 def _callsign_from_clientid(clientid):
     """
@@ -472,6 +484,46 @@ class AuditService(object):
         self._bump("ingest_ok")
         return 200, {"ok": True}
 
+    def _record_bridged(self, topic, clientid, username, payload_b64):
+        """
+        记一条「互联集群转发」事件（不参与身份判定）。
+
+        与 PASS 事件一样按 clientid 限流，避免语音帧把审计库刷爆。
+        """
+        try:
+            pkt_cs = ""
+            n = 0
+            raw = None
+            if isinstance(payload_b64, str):
+                try:
+                    raw = base64.b64decode(payload_b64)
+                    n = len(raw)
+                except Exception:  # noqa: BLE001
+                    raw = None
+            if raw:
+                try:
+                    parsed = parser_mod.parse(raw)
+                    if parsed is not None and getattr(parsed, "ok", False):
+                        pkt_cs = parsed.callsign or ""
+                except Exception:  # noqa: BLE001
+                    pkt_cs = ""
+            reason = "互联集群转发（来自其他 FUS 节点）"
+            if pkt_cs:
+                reason += "，电台=%s" % pkt_cs
+            self.db.write_audit_packet({
+                "ts": now_text(True), "topic": topic, "clientid": clientid,
+                "ip": self._client_ip(clientid),
+                # 连接身份刻意留空：它不是"本机某个电台"，不该参与身份比对
+                "conn_callsign": "", "conn_uid": "",
+                "pkt_callsign": pkt_cs, "pkt_uid": "",
+                "verdict": PASS, "scene": "bridged", "reason": reason,
+                "confidence": 1.0, "len": n, "frame_num": 0,
+                "crc_ok": False, "smeter": 0, "srv_uid": "", "pkt_ts": "",
+                "stream_begin": "", "ban": False, "source": "bridge",
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
     def _audit_ignored(self, clientid, username):
         """
         该连接是否豁免"逐包身份审计"。
@@ -495,6 +547,17 @@ class AuditService(object):
         username = root.get("username")
         if username == "undefined":       # EMQX 的 Erlang undefined atom
             username = None
+        # ★ 互联桥接注入的语音：**代码里直接豁免**，不走可配置的豁免名单。
+        #   桥接把**远端电台**的语音重播到本机 FMO/RAW（这样 APP / FM 网关才听得到），
+        #   用的却是本机服务证书：连接身份=SERVER、包内呼号=远端电台 —— 两者必然不同，
+        #   不豁免就会被判「盗用呼号/伪造」，甚至把桥接自己封掉。
+        #   这类流量记一条 bridged 事件留证（看得见），但不参与身份判定、不进待审队列。
+        if is_bridge_publisher(clientid):
+            if self.policy.cfg.get("audit_pass_log", True) and self._pass_log_ok(clientid):
+                self._record_bridged(topic, clientid, username, root.get("payload"))
+            self._bump("audit_bridged")
+            return
+
         # 审计豁免（回响节点等）：直接跳过，避免把回声判成伪造
         if self._audit_ignored(clientid, username):
             self._bump("audit_ignored")

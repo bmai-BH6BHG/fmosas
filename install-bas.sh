@@ -30,7 +30,7 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.9"
+BAS_VERSION="1.8.10"
 DEFAULT_BASE_URL="https://example.com/fmo-bas"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
