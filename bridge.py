@@ -100,6 +100,10 @@ MEMBER_CONFIRM_TIMEOUT = 90.0         # 连上后等多久算"对方没加入集
 #   看起来像"一直连不上"（用户真实反馈过）。
 AUTH_FAIL_RETRY = 3600.0              # 认证被拒：1 小时后再试（期间不刷日志）
 FAIL_LOG_INTERVAL = 600.0             # 同一对端同类失败日志的最小间隔（秒）
+# 对端主动连到我们本机 broker 的记录保留多久。
+# 这是"它确实在集群里"的**直接证据**（对方桥接正在跑才会连过来），
+# 比对方自报的状态更可信 —— 自报可能因为版本 bug 长期是错的。
+INBOUND_TTL = 900.0
 
 
 def _is_auth_reject(msg):
@@ -529,6 +533,8 @@ class VoiceBridge(object):
         self._peer_tx = {}                    # peer_id -> 已发出的消息数
         self._unaddressed = {}                # 已提示过"还没拿到名片"的对端
         self._backoff_until = {}              # target key -> 非成员下次可试时间
+        # 主动连到我们 broker 的桥接节点 → 最后见到的时间（见 note_inbound）
+        self._inbound = {}
         self._last_announce = 0.0
         self._cert_cache = None
         self._thread = None
@@ -1024,9 +1030,23 @@ class VoiceBridge(object):
 
     # ---------------- 配置读写 ----------------
     def _persist(self):
-        """把当前配置写回 config.json（由 api_server 注入的 save_fn 落盘）。"""
+        """
+        把当前配置写回 config.json（由 api_server 注入的 save_fn 落盘）。
+
+        ★ 必须**原地更新** self.config["bridge"]，不能整个替换成新字典。
+          真实事故：同步引擎在启动时拿到的是 `dict(CONFIG)`（浅拷贝），
+          它手里的 `config["bridge"]` 指向当时那个字典对象；这里一旦整个替换，
+          引擎手里那份就成了**僵尸字典**，于是
+            "启动之后才点「加入集群」的机器，上报里永远带 cluster_joined=false"
+          → 总系统一直把它显示成"未加入"，看起来就是"我加入的服务器不见了"。
+          原地 update 之后，任何持有同一个 bridge 字典的地方都能立刻看到变化。
+        """
         with self._lock:
-            self.config["bridge"] = {
+            b = self.config.get("bridge")
+            if not isinstance(b, dict):
+                b = {}
+                self.config["bridge"] = b
+            b.update({
                 "enabled": bool(self._cfg.get("enabled")),
                 "node_id": self._cfg.get("node_id") or "",
                 "node_name": self._cfg.get("node_name") or "",
@@ -1039,8 +1059,8 @@ class VoiceBridge(object):
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
                 "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg.get("peers") or []],
-            }
-            snapshot = json.loads(json.dumps(self.config["bridge"]))
+            })
+            snapshot = json.loads(json.dumps(b))
         if self.save_fn:
             try:
                 self.save_fn(self.config)
@@ -1127,6 +1147,20 @@ class VoiceBridge(object):
             self._sync_links()
         return removed > 0
 
+    def live_state(self):
+        """
+        轻量取"当前实时状态"：给同步上报用（不要去调 status()，那个很重）。
+
+        ★ 为什么要有它：上报如果只读配置字典，一旦别处把 bridge 整个替换过，
+          读到的就是**启动时的旧值** —— 表现为"界面上已加入、总系统却说未加入"
+          （真实事故）。读实时状态就没有这个坑。
+        """
+        with self._lock:
+            return {"enabled": bool(self._cfg.get("enabled")),
+                    "cluster": self.cluster,
+                    "node_id": self._cfg.get("node_id") or self.node_id,
+                    "node_name": self._cfg.get("node_name") or self.node_name}
+
     def member_ids(self):
         """
         已被确认身份、**真正在集群里**的对端节点 id 列表。
@@ -1143,14 +1177,36 @@ class VoiceBridge(object):
             if not self._cfg.get("enabled"):
                 return []          # 退出集群后就不再替别人背书
             out = set(str(x) for x in (self._cfg.get("member_ids") or []) if x)
+            now = time.time()
             with self._lock:
                 links = list(self._links.values())
+                # ★ 主动连到我们 broker 的对端：它们桥接在跑 = 确实在集群里。
+                #   这条很重要：真实事故里两台已加入的机器因为版本 bug 一直自报
+                #   "未加入"，总系统于是认为集群只有 3 台；而**名册里没有它们**
+                #   更导致我们不去订阅它们的语音主题 → **单向语音**（只听得到我们、
+                #   听不到它们）。有了这条，即使对方版本有 bug 也能被正确识别。
+                for k, t in self._inbound.items():
+                    if now - t < INBOUND_TTL:
+                        out.add(str(k))
             for link in links:
                 if link.member and link.peer.get("remote_id"):
                     out.add(str(link.peer["remote_id"]))
         except Exception:  # noqa: BLE001
             pass
         return sorted(out)
+
+    def note_inbound(self, node_id):
+        """
+        记录"某节点正主动连到我们本机 broker"（由 MQTT 认证通过时调用）。
+
+        对方桥接在跑才会连过来 —— 这是它确实在集群里的直接证据，
+        比它自报的状态更可信（自报可能因版本 bug 长期错误）。
+        """
+        nid = str(node_id or "").strip().rstrip("-")
+        if not nid or nid == str(self.node_id or "").strip():
+            return
+        with self._lock:
+            self._inbound[nid] = time.time()
 
     def _remember_member(self, remote_id):
         """把"确认过的成员"记进配置（变更才落盘，避免频繁写文件）。"""

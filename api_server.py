@@ -384,12 +384,24 @@ def init_sync_service():
         if _SAS_CONFIG and _SAS_CONFIG.get('db_path'):
             sync_config['sas_db_path'] = _SAS_CONFIG['db_path']
         engine = SyncEngine(sync_config, DB_PATH, mode='subsystem', base_dir=BASE_DIR)
+        # ★ 让引擎与 CONFIG **共用同一个 bridge 字典对象**。
+        #   引擎拿的是 dict(CONFIG)（浅拷贝），若 bridge 那个字典被整体替换
+        #   （历史写法），引擎手里就成了僵尸字典 → 上报里的 cluster/cluster_joined
+        #   永远是启动时的旧值 → "启动之后才加入集群的机器，总系统一直显示未加入"
+        #   （真实事故）。这里显式绑成同一个对象，双保险。
+        try:
+            engine.config['bridge'] = CONFIG.setdefault('bridge', {})
+        except Exception:  # noqa: BLE001
+            pass
         # ★ 让同步上报带上"我确认到的集群成员"（见 sync_engine.build_report_payload）：
         #   有些节点有桥接功能、也确实在互通，但版本较早、没有"已加入"上报字段。
         #   没有这条，总系统会一直显示 0 台，而且名册会变空、把正在工作的桥接全断掉。
         try:
             engine.member_source = lambda: (
                 _BRIDGE.member_ids() if _BRIDGE is not None else [])
+            # 上报里的 cluster / cluster_joined 直接读**实时状态**，不与配置字典绑定
+            engine.bridge_state_source = lambda: (
+                _BRIDGE.live_state() if _BRIDGE is not None else {})
         except Exception:  # noqa: BLE001
             pass
         engine.start()
@@ -918,6 +930,66 @@ def _bridge_roster_source():
         return [dict(x) for x in _ROSTER_CACHE["data"]]
 
 
+def _inbound_bridge_probe_once():
+    """
+    从 EMQX 查当前**在线客户端**，把 FMO-BRIDGE-<节点> 记成"入向桥接连接"。
+
+    ★ 为什么不能只靠认证回调：对方的桥接只在**连上的那一刻**做认证；
+      我们一重启（升级）就丢了这份记忆，而对方可能几十分钟才重连一次，
+      于是总系统会一直少算成员、名册里也没有它们 → **单向语音**
+      （真实事故）。定期问 EMQX"现在谁连着"才是可靠的实时来源。
+    """
+    try:
+        svc = getattr(ApiHandler, 'bas_service', None)
+        cli = getattr(svc, 'emqx', None) if svc is not None else None
+        if cli is None:
+            # 审计子系统没起来时退化到配置里的 EMQX 地址（有些部署只在配置里填）
+            cfg = {'url': (CONFIG.get('audit') or {}).get('emqx_url') or '',
+                   'key': (CONFIG.get('audit') or {}).get('emqx_api_key') or '',
+                   'secret': (CONFIG.get('audit') or {}).get('emqx_api_secret') or ''}
+            if not cfg['url']:
+                return 0
+            from bas_emqx import EmqxClient  # 局部导入：没装审计子系统也能跑
+            cli = EmqxClient(cfg['url'], cfg['key'], cfg['secret'], timeout=6)
+        n = 0
+        for c in cli.list_clients(limit=2000) or []:
+            cid = str((c or {}).get('clientid') or '')
+            if cid.startswith('FMO-BRIDGE-'):
+                _note_bridge_inbound(cid[len('FMO-BRIDGE-'):])
+                n += 1
+        return n
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def start_inbound_probe(stop_event):
+    """后台线程：每 60 秒问一次 EMQX"哪些桥接正连着"，供识别集群成员。"""
+
+    def _loop():
+        while not stop_event.is_set():
+            try:
+                _inbound_bridge_probe_once()
+            except Exception:  # noqa: BLE001
+                pass
+            if stop_event.wait(60.0):
+                break
+
+    t = threading.Thread(target=_loop, name="bridge-inbound", daemon=True)
+    t.start()
+    return t
+
+
+def _note_bridge_inbound(node_id):
+    """桥接客户端认证通过 → 告诉桥接模块"这个节点正主动连着我们"。"""
+    br = _BRIDGE
+    if br is None:
+        return
+    try:
+        br.note_inbound(node_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _report_cluster_now(name):
     """
     换了集群以后，立刻上报一次让总系统马上记下归属（不用等下一个上报周期）。
@@ -935,7 +1007,14 @@ def _report_cluster_now(name):
             pass
         if eng is None:
             return False
-        eng.config.setdefault('bridge', {})['cluster'] = str(name)
+        try:
+            eng.config.setdefault('bridge', {})['cluster'] = str(name)
+            # ★ 连"是否已加入"一起同步过去：引擎若握着另一个 bridge 字典
+            #   （历史写法整个替换过），只写 cluster 不够，上报里的 enabled 还是旧值。
+            eng.config['bridge']['enabled'] = bool(
+                (CONFIG.get('bridge') or {}).get('enabled'))
+        except Exception:  # noqa: BLE001
+            pass
         return bool(eng.report_to_master(full=False))
     except Exception as e:  # noqa: BLE001
         print("[BRIDGE] 上报集群归属失败（下个周期会自动补上）: %s" % e)
@@ -2626,6 +2705,15 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
 
             if result.get('result') == 'allow':
                 attrs = result.get('client_attrs', {})
+                # ★ 桥接客户端认证通过 = 对方的桥接正在跑，而且还主动连到了我们。
+                #   记下来当作"它确实在集群里"的证据（比它自报的状态更可信，
+                #   自报可能因版本 bug 长期错误 → 总系统少算成员、且我们不去订阅
+                #   它的语音主题 → 单向语音）。
+                try:
+                    if clientid and str(clientid).startswith('FMO-BRIDGE-'):
+                        _note_bridge_inbound(str(clientid)[len('FMO-BRIDGE-'):])
+                except Exception:  # noqa: BLE001
+                    pass
                 print("[AUTH] 通过: callsign=%s uid=%s app_verified=%s(%s) clientid=%s" % (
                     attrs.get('callsign'), attrs.get('uid'),
                     attrs.get('app_verified'), attrs.get('app_sig'), clientid or '-'))
@@ -3646,6 +3734,12 @@ def main():
 
     # 上报后台线程已由 sync_engine 接管（init_sync_service 内部启动），
     # 不再单独启动旧 report_loop，避免双通道重复上报。
+
+    # 定期问 EMQX"哪些桥接正连着"→ 作为"对方确实在集群里"的证据（见 _inbound_bridge_probe_once）
+    try:
+        _INBOUND_THREAD = start_inbound_probe(threading.Event())
+    except Exception as e:  # noqa: BLE001
+        print("[BRIDGE] 入向桥接探测线程启动失败: %s" % e)
 
     # 启动 HTTP 服务器（双端口：公网 API 口 + 内网管理口，管理口写死 = API 口 + 1）
     admin_port = port + 1
