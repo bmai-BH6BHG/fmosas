@@ -1017,6 +1017,30 @@ class FUSClusterTests(unittest.TestCase):
         br = self._read("bridge.py")
         self.assertIn("_log_fail", br, "失败日志要走限流函数")
 
+    def test_cluster_list_falls_back_to_roster_channel(self):
+        """
+        ★ 集群列表必须能从**名册通道**兜底拿到。
+
+        真实场景：有些现场的网络/反代/防火墙只放行了旧路径（/api/server/list 和几个
+        POST），新加的 /api/clusters 被挡 → 分系统界面上就是"集群列表获取失败"。
+        名册这条通道本来就是通的，总系统把集群列表塞进名册响应里，
+        分系统据此兜底，用户不用去改现场网络策略。
+        """
+        api = self._read("api_server.py")
+        self.assertIn("_ROSTER_CLUSTERS", api, "要有名册通道带回来的集群列表缓存")
+        self.assertIn("payload.get('clusters')", api, "名册响应里要读集群列表")
+        self.assertIn("cached = list(_ROSTER_CLUSTERS or [])", api, "直接读失败要回落到缓存")
+        # 失败必须带上"每个地址各自的失败原因"，否则现场没法排查
+        self.assertIn("'tried': tried", api)
+        self.assertIn("def _fetch_master_clusters()", api)
+        # 总系统侧：名册响应要带集群列表
+        ms = self._read_master("master_server.py")
+        self.assertIn('body["clusters"] =', ms)
+        # 界面要把失败原因显示出来
+        js = self._read("admin/bridge.js")
+        self.assertIn("tried", js)
+        self.assertIn("err.payload", js)
+
     def test_ui_has_cluster_selector(self):
         html = self._read("admin/bridge.html")
         js = self._read("admin/bridge.js")

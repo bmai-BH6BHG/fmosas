@@ -895,6 +895,8 @@ def _ensure_keepalive(path):
 # 接口/桥接只读缓存立刻返回。总服务器忙起来单次响应可能要几十秒（实测 50~77s），
 # 若在请求路径里同步拉，会把桥接循环和接口一起拖死。
 _ROSTER_CACHE = {"at": 0.0, "failed": True, "data": []}
+# 名册响应里带回来的集群列表 → 给"直接读 /api/clusters 被挡"的现场兜底
+_ROSTER_CLUSTERS = []
 _ROSTER_LOCK = threading.Lock()
 _ROSTER_THREAD = None
 _ROSTER_REFRESH_SEC = 300.0     # 后台刷新间隔（正常 5 分钟一次）
@@ -946,11 +948,20 @@ def _fetch_master_clusters():
 
     与名册拉取同样的地址策略：优先本机 127.0.0.1，其次本机 IP，最后配置地址 ——
     总服务器常与分系统同机，走公网域名要绕 NAT 环回，不稳。
-    返回 (clusters, err)。
+
+    返回 (clusters, err, tried)：
+      tried 是每个候选地址各自的失败原因。**必须带上** —— 否则现场只能看到
+      "集群列表获取失败"一句，根本没法判断是网络不通、被防火墙挡了路径、
+      还是总系统没起来（真实被问过）。
+
+    兜底：直接读不到时，改用**名册通道**带回来的集群列表（总系统已把集群列表
+    塞进 /api/server/list 的响应里）。有些现场只放行了旧路径（名册那几个），
+    新加的 /api/clusters 被挡；这条兜底能让它照常选集群，不用去改现场网络策略。
     """
+    global _ROSTER_CLUSTERS
     master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
     if not master:
-        return [], "未配置 master_url"
+        return [], "未配置 master_url", []
     bases = []
     try:
         mp = urlparse(master)
@@ -966,13 +977,16 @@ def _fetch_master_clusters():
     except Exception:  # noqa: BLE001
         pass
     bases.append(master)
-    last_err = "未知错误"
+    tried = []
     for base in bases:
         url = base + '/api/clusters'
+        if url in [t['url'] for t in tried]:
+            continue
         try:
             req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                payload = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode('utf-8', 'replace')
+            payload = json.loads(raw or '{}')
             out = []
             for c in payload.get('clusters') or []:
                 out.append({
@@ -982,11 +996,17 @@ def _fetch_master_clusters():
                     'member_count': int(c.get('member_count') or 0),
                     'online_count': int(c.get('online_count') or 0),
                 })
-            return out, None
+            return out, None, tried
+        except urllib.error.HTTPError as e:
+            # 403/404 基本就是"路径没被放行"或"总系统版本旧"
+            tried.append({'url': url, 'error': 'HTTP %s %s' % (e.code, e.reason or '')})
         except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-            continue
-    return [], last_err
+            tried.append({'url': url, 'error': str(e)})
+    # 兜底：用名册通道带回来的集群列表
+    cached = list(_ROSTER_CLUSTERS or [])
+    if cached:
+        return cached, None, tried
+    return [], '；'.join('%s → %s' % (t['url'], t['error']) for t in tried[-2:]), tried
 
 
 def _roster_fetch():
@@ -1023,6 +1043,14 @@ def _roster_fetch():
             req = urllib.request.Request(url, headers={'Accept': 'application/json'})
             with urllib.request.urlopen(req, timeout=_ROSTER_TIMEOUT) as resp:
                 payload = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+            # 名册响应里顺带带着集群列表（总系统塞进来的）→ 留给 _fetch_master_clusters
+            # 兜底用：有些现场只放行了名册这个路径，新加的 /api/clusters 被挡。
+            try:
+                cl = payload.get('clusters')
+                if cl:
+                    _ROSTER_CLUSTERS[:] = list(cl)
+            except Exception:  # noqa: BLE001
+                pass
             for s in payload.get('servers') or []:
                 addr = str(s.get('address') or '').strip()
                 if not addr:
@@ -2279,10 +2307,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             # ---- 集群（互联分组）----
             # 集群在总系统上创建；这里列出可选集群，并把本机的选择报给总系统。
             if method == 'GET' and path == '/api/bridge/clusters':
-                clusters, err = _fetch_master_clusters()
+                clusters, err, tried = _fetch_master_clusters()
                 self.send_json({
                     'ok': err is None,
                     'error': err,
+                    'tried': tried,
                     'current': svc.cluster,
                     'default': '主集群',
                     'clusters': clusters or [],
@@ -2297,9 +2326,9 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                     self.send_json({'ok': False, 'error': '缺少集群名'}, 400)
                     return True
                 # 只允许加入总系统上**已存在**的集群（集群由总系统创建）
-                clusters, err = _fetch_master_clusters()
+                clusters, err, tried = _fetch_master_clusters()
                 if err is not None:
-                    self.send_json({'ok': False,
+                    self.send_json({'ok': False, 'tried': tried,
                                     'error': '读不到总系统的集群列表：%s' % err}, 502)
                     return True
                 names = [str(c.get('name')) for c in (clusters or [])]
