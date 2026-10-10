@@ -291,33 +291,47 @@ if [ "$FILECOUNT" -eq 0 ]; then
 fi
 echo "      待打包文件: $FILECOUNT 个"
 
-# ------------------------------ [5/8] 注入分发地址（仅改包内 install.sh）-----
-echo "[5/8] 注入 DEFAULT_BASE_URL（只替换 install.sh 的该行，不动仓库文件）..."
+# ------------------------------ [5/8] 注入分发地址 ----------------------------
+# ★ 必须把地址注入到**所有**带 DEFAULT_BASE_URL 占位行的脚本里。
+#   真实事故：只注入了 install.sh，漏了 upgrade.sh → 发出去的 fus-upgrade.sh
+#   里还是 example.com，用户执行 `fus-upgrade` 会去 example.com 下载（必然失败）。
+echo "[5/8] 注入 DEFAULT_BASE_URL（替换包内各脚本的该行，不动仓库文件）..."
 INJECTED="no"
 if [ -n "$BASE_URL" ]; then
-    if grep -qE '^[[:space:]]*DEFAULT_BASE_URL=' "$STAGE/install.sh"; then
-        cp -a "$STAGE/install.sh" "$WORK/install.sh.before"
-        ESC="$(printf '%s' "$BASE_URL" | sed 's/[&|\\]/\\&/g')"
-        sed "s|^[[:space:]]*DEFAULT_BASE_URL=.*|DEFAULT_BASE_URL=\"$ESC\"|" \
-            "$WORK/install.sh.before" > "$WORK/install.sh.after"
-        cat "$WORK/install.sh.after" > "$STAGE/install.sh"
-        BEFORE_LINES="$(wc -l < "$WORK/install.sh.before" | tr -d '[:space:]')"
-        AFTER_LINES="$(wc -l < "$STAGE/install.sh" | tr -d '[:space:]')"
-        if grep -qF "DEFAULT_BASE_URL=\"$BASE_URL\"" "$STAGE/install.sh" && \
-           [ "$BEFORE_LINES" = "$AFTER_LINES" ]; then
-            INJECTED="yes"
-            echo "      已注入: DEFAULT_BASE_URL=\"$BASE_URL\"（行数未变: $AFTER_LINES 行）"
+    for SCRIPT in install.sh upgrade.sh; do
+        [ -f "$STAGE/$SCRIPT" ] || continue
+        if grep -qE '^[[:space:]]*DEFAULT_BASE_URL=' "$STAGE/$SCRIPT"; then
+            cp -a "$STAGE/$SCRIPT" "$WORK/$SCRIPT.before"
+            ESC="$(printf '%s' "$BASE_URL" | sed 's/[&|\\]/\\&/g')"
+            sed "s|^[[:space:]]*DEFAULT_BASE_URL=.*|DEFAULT_BASE_URL=\"$ESC\"|" \
+                "$WORK/$SCRIPT.before" > "$WORK/$SCRIPT.after"
+            cat "$WORK/$SCRIPT.after" > "$STAGE/$SCRIPT"
+            BEFORE_LINES="$(wc -l < "$WORK/$SCRIPT.before" | tr -d '[:space:]')"
+            AFTER_LINES="$(wc -l < "$STAGE/$SCRIPT" | tr -d '[:space:]')"
+            if grep -qF "DEFAULT_BASE_URL=\"$BASE_URL\"" "$STAGE/$SCRIPT" && \
+               [ "$BEFORE_LINES" = "$AFTER_LINES" ]; then
+                INJECTED="yes"
+                echo "      已注入 $SCRIPT: DEFAULT_BASE_URL=\"$BASE_URL\"（行数未变: $AFTER_LINES 行）"
+            else
+                warn "注入后校验未通过（$SCRIPT 行数前 $BEFORE_LINES / 后 $AFTER_LINES），请人工检查"
+                INJECTED="unverified"
+            fi
         else
-            warn "注入后校验未通过（行数前 $BEFORE_LINES / 后 $AFTER_LINES），请人工检查包内 install.sh"
+            warn "包内 $SCRIPT 未找到 DEFAULT_BASE_URL=\"...\" 占位行，已跳过地址注入；"
+            warn "分发包将沿用该脚本内既有地址，可能导致客户端下载不到发布包。"
+            INJECTED="skipped"
+        fi
+    done
+    # 复核：包内每个带 DEFAULT_BASE_URL 的脚本，其赋值行都必须等于目标地址
+    for SCRIPT in install.sh upgrade.sh; do
+        [ -f "$STAGE/$SCRIPT" ] || continue
+        if ! grep -qF "DEFAULT_BASE_URL=\"$BASE_URL\"" "$STAGE/$SCRIPT"; then
+            warn "包内 $SCRIPT 的 DEFAULT_BASE_URL 与目标地址不一致，请人工检查"
             INJECTED="unverified"
         fi
-    else
-        warn "包内 install.sh 未找到 DEFAULT_BASE_URL=\"...\" 占位行，已跳过地址注入；"
-        warn "分发包将沿用 install.sh 内既有地址，可能导致客户端下载不到发布包。"
-        INJECTED="skipped"
-    fi
+    done
 else
-    echo "      未提供 RELEASE_BASE_URL：保留 install.sh 内的占位地址"
+    echo "      未提供 RELEASE_BASE_URL：保留包内脚本的占位地址"
 fi
 
 # ---- 版本号同步（仅改包内 install.sh 的 DEFAULT_VERSION，避免与 dist/VERSION 漂移）----

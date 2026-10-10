@@ -30,8 +30,8 @@
 # ============================================================
 set -euo pipefail
 
-BAS_VERSION="1.8.8"
-DEFAULT_BASE_URL="https://example.com/fmo-bas"
+BAS_VERSION="1.8.11"
+DEFAULT_BASE_URL="https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
 BASE_URL="${FMO_BASE_URL:-$DEFAULT_BASE_URL}"
 
 SCAN_ONLY="${BAS_SCAN_ONLY:-0}"
