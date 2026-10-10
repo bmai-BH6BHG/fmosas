@@ -1,4 +1,4 @@
-name: release
+﻿name: release
 
 # 触发方式（任选其一）：
 #   1) 打标签自动发版：git tag v1.0.0 && git push origin v1.0.0
@@ -131,6 +131,8 @@ jobs:
           # 一键升级脚本（只升级系统，不动配置与数据）
           cp out/upgrade.sh            up/fus-upgrade.sh
           cp out/upgrade.sh            up/bas-upgrade.sh
+          # 桥接 ACL 修复（单向语音：对方 EMQX 没放行 FMO/BRIDGE/#）
+          cp out/fix_bridge_acl.sh     up/fus-fix-acl.sh
           # FUS 别名（系统已更名 FUS；bas-* 保留兼容，两个名字都能下载）
           cp out/bas/install-bas.sh    up/fus-install.sh
           cp out/bas/uninstall-bas.sh  up/fus-uninstall.sh

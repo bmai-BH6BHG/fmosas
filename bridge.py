@@ -1195,6 +1195,16 @@ class VoiceBridge(object):
             pass
         return sorted(out)
 
+    def inbound_members(self):
+        """当前"主动连到我们 broker"的桥接节点（未过期）—— 排障用。"""
+        now = time.time()
+        try:
+            with self._lock:
+                return sorted(k for k, t in self._inbound.items()
+                              if now - t < INBOUND_TTL)
+        except Exception:  # noqa: BLE001
+            return []
+
     def note_inbound(self, node_id):
         """
         记录"某节点正主动连到我们本机 broker"（由 MQTT 认证通过时调用）。
@@ -1299,6 +1309,8 @@ class VoiceBridge(object):
             "local_error": local_error,
             # 桥接线程是否存活：false = 界面显示"已加入"但实际早就不工作了
             "thread_alive": self.thread_alive(),
+            # 主动连到我们 broker 的桥接节点（"它确实在集群里"的直接证据；排障用）
+            "inbound_members": self.inbound_members(),
             "local_connected": bool(local_ready),
             "peer_member_count": len(members),
             "member_count": count,
