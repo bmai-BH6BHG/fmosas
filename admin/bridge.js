@@ -78,7 +78,13 @@
       return r.text().then(function (t) {
         var j;
         try { j = JSON.parse(t); } catch (e) { throw new Error('服务端返回的不是 JSON'); }
-        if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+        if (!j.ok) {
+          // ★ 把整个失败响应挂在错误上：否则调用方只拿到一句 error 文本，
+          //   像 tried（每个地址各自的失败原因）这种排查信息就丢了。
+          var err = new Error(j.error || ('HTTP ' + r.status));
+          err.payload = j;
+          throw err;
+        }
         return j;
       });
     });
@@ -425,9 +431,17 @@
       var list = d.clusters || [];
       var cur = d.current || d.default || '主集群';
       if (msg) {
+        var why = d.error || '未知';
+        if (d.tried && d.tried.length) {
+          // 把每个候选地址各自失败的原因列出来 —— 否则现场只能看到一句
+          // "获取失败"，根本没法判断是网络不通、路径被挡、还是总系统没起来。
+          why += '（依次尝试：' + d.tried.map(function (t) {
+            return t.url + ' → ' + t.error;
+          }).join('；') + '）';
+        }
         msg.textContent = d.ok
           ? '总系统上有 ' + list.length + ' 个集群可选。'
-          : ('读不到总系统的集群列表：' + (d.error || '未知') +
+          : ('读不到总系统的集群列表：' + why +
              '（不影响互联，仅无法在此切换）');
       }
       var html = '';
@@ -450,7 +464,13 @@
       sel.innerHTML = html || '<option value="">（总系统上还没有集群）</option>';
       if ($('br-cluster-cur')) $('br-cluster-cur').textContent = cur;
     }).catch(function (e) {
-      if (msg) msg.textContent = '读取集群列表失败：' + (e && e.message ? e.message : e);
+      var p = e && e.payload;
+      if (msg && p && p.tried && p.tried.length) {
+        msg.textContent = '读取集群列表失败：' + (e.message || e) + '（依次尝试：'
+          + p.tried.map(function (t) { return t.url + ' → ' + t.error; }).join('；') + '）';
+      } else if (msg) {
+        msg.textContent = '读取集群列表失败：' + (e && e.message ? e.message : e);
+      }
     });
   }
 
