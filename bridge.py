@@ -107,11 +107,18 @@ DEDUPE_MAX = 4000
 INJECT_TTL = 30.0                     # 这段时间内识别为"本机注入的帧"
 INJECT_MAX = 4000
 CLIENTID_PREFIX = "FMO-BRIDGE-"
+# 默认集群名（与总系统保持一致）：未选择时就是它 = 原有的全局互联
+DEFAULT_CLUSTER_NAME = "主集群"
 
 DEFAULT_BRIDGE = {
     "enabled": False,                 # 总开关。默认关：要不要互联由部署者自己决定
     "node_id": "",                    # 默认取 subsystem_id
     "node_name": "",
+    # ★ 所属集群（在总系统上创建，分系统自己选）。
+    #   互联桥接**只在同集群**的分系统之间建立：拉名册时带上自己的集群，
+    #   总系统只返回同集群的成员。默认「主集群」= 原有的全局互联，
+    #   所以升级后不选任何东西，行为与以前完全一致。
+    "cluster": DEFAULT_CLUSTER_NAME,
     "channels": ["RAW", "TELE"],
     # 是否把本机语音放到桥接主题上供**别人拉取**（关掉 = 完全不给别人听）。
     # 注意这是**全局**的：拉取模型下"听谁的"由听的人决定，所以发送方无法逐对端挑选听众。
@@ -239,6 +246,9 @@ def load_bridge_config(config):
         peers.append(np)
     cfg["peers"] = peers
     cfg["enabled"] = bool(cfg.get("enabled"))
+    # 集群名清洗（总系统用它决定"我能跟谁互联"）
+    cfg["cluster"] = str(cfg.get("cluster") or DEFAULT_CLUSTER_NAME).strip() \
+        or DEFAULT_CLUSTER_NAME
     return cfg
 
 
@@ -445,6 +455,8 @@ class VoiceBridge(object):
         self.node_name = (str(self._cfg.get("node_name") or "").strip()
                           or self.node_id)
         self.channels = list(self._cfg.get("channels") or ["RAW"])
+        # 所属集群：桥接只在同集群内互联（名册按它过滤）
+        self.cluster = str(self._cfg.get("cluster") or DEFAULT_CLUSTER_NAME)
         b = broker or LOCAL_BROKER
         mon = self.config.get("monitor") or {}
         if broker is None and mon.get("mqtt_host"):
@@ -959,6 +971,10 @@ class VoiceBridge(object):
                 "enabled": bool(self._cfg.get("enabled")),
                 "node_id": self._cfg.get("node_id") or "",
                 "node_name": self._cfg.get("node_name") or "",
+                # ★ 必须落盘：同步上报要从配置里读它告诉总系统"我属于哪个集群"，
+                #   漏了就会出现"选了集群、界面上也变了，但总系统永远收不到归属"
+                #   （真实踩过），且重启后选择还会丢。
+                "cluster": self.cluster,
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
                 "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg.get("peers") or []],
@@ -973,7 +989,7 @@ class VoiceBridge(object):
         return True
 
     def set_config(self, enabled=None, node_name=None, channels=None,
-                   node_id=None, publish_local=None):
+                   node_id=None, publish_local=None, cluster=None):
         with self._lock:
             if enabled is not None:
                 was = bool(self._cfg.get("enabled"))
@@ -997,6 +1013,13 @@ class VoiceBridge(object):
                 self.channels = list(chans)
             if publish_local is not None:
                 self._cfg["publish_local"] = bool(publish_local)
+            if cluster is not None and str(cluster).strip():
+                # 换集群＝换"能跟谁互联"：清掉退避记录，让链路立刻按新名册重建
+                newc = str(cluster).strip()
+                if newc != self._cfg.get("cluster"):
+                    self._cfg["cluster"] = newc
+                    self.cluster = newc
+                    self._backoff_until = {}
         self._persist()
         self._sync_links()
         return self.public_config()
@@ -1049,6 +1072,7 @@ class VoiceBridge(object):
                 "enabled": bool(self._cfg.get("enabled")),
                 "node_id": self.node_id,
                 "node_name": self.node_name,
+                "cluster": self.cluster,
                 "channels": list(self.channels),
                 "publish_local": bool(self._cfg.get("publish_local", True)),
                 "peers": [dict(p) for p in self._cfg["peers"]],
@@ -1111,6 +1135,8 @@ class VoiceBridge(object):
             "self_joined": bool(cfg["enabled"]),
             "node_id": cfg["node_id"],
             "node_name": cfg["node_name"],
+            "cluster": self.cluster,
+            "default_cluster": DEFAULT_CLUSTER_NAME,
             "publish_local": cfg.get("publish_local", True),
             "broker": "%s:%d" % (self.broker_host, self.broker_port),
             "topics": list(cfg["channels"]),

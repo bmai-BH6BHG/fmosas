@@ -128,6 +128,10 @@
     $('br-local').innerHTML = '本机 broker 连接：<b>' + esc(ls) + '</b>'
       + (j.local_connected ? '（本机语音可收发）' : '');
 
+    // 所属集群（互联分组）：只有同集群的服务器之间才会互通
+    var cur = j.cluster || j.default_cluster || '主集群';
+    if ($('br-cluster-cur')) $('br-cluster-cur').textContent = cur;
+
     var le = $('br-local-err');
     if (j.local_error) {
       le.textContent = '本机 broker：' + j.local_error;
@@ -406,7 +410,80 @@
       });
   }
 
+  /* ---------------- 所属集群（互联分组） ----------------
+   * 集群在**总系统**上创建（总系统 → 集群管理）；这里只能从已有集群里选一个。
+   * 选择会写入本机配置，并立刻上报总系统 —— 总系统的名册按集群过滤，
+   * 于是互联自动被限定在同集群内。原本那套全局互联保留为「主集群」。
+   */
+  var clusterBusy = false;
+
+  function loadClusters() {
+    var sel = $('br-cluster-sel');
+    var msg = $('br-cluster-msg');
+    if (!sel) return;
+    return req('/api/bridge/clusters').then(function (d) {
+      var list = d.clusters || [];
+      var cur = d.current || d.default || '主集群';
+      if (msg) {
+        msg.textContent = d.ok
+          ? '总系统上有 ' + list.length + ' 个集群可选。'
+          : ('读不到总系统的集群列表：' + (d.error || '未知') +
+             '（不影响互联，仅无法在此切换）');
+      }
+      var html = '';
+      var hasCur = false;
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i];
+        if (String(c.name) === String(cur)) hasCur = true;
+        html += '<option value="' + esc(c.name) + '"'
+          + (String(c.name) === String(cur) ? ' selected' : '') + '>'
+          + esc(c.name)
+          + (c.is_default ? '（默认）' : '')
+          + ' · ' + num(c.member_count) + ' 台'
+          + '</option>';
+      }
+      if (!hasCur) {
+        // 当前集群不在列表里（总系统还没记下本机的选择，或集群被删了）
+        html = '<option value="' + esc(cur) + '" selected>' + esc(cur)
+          + '（当前，总系统暂未收录）</option>' + html;
+      }
+      sel.innerHTML = html || '<option value="">（总系统上还没有集群）</option>';
+      if ($('br-cluster-cur')) $('br-cluster-cur').textContent = cur;
+    }).catch(function (e) {
+      if (msg) msg.textContent = '读取集群列表失败：' + (e && e.message ? e.message : e);
+    });
+  }
+
+  function applyCluster(btn) {
+    var sel = $('br-cluster-sel');
+    var msg = $('br-cluster-msg');
+    if (!sel || clusterBusy) return;
+    var name = sel.value;
+    if (!name) return;
+    clusterBusy = true;
+    if (btn) { btn.disabled = true; btn.textContent = '切换中…'; }
+    post('/api/bridge/cluster', { cluster: name }).then(function (d) {
+      if (msg) {
+        msg.textContent = '已切换到「' + (d.cluster || name) + '」'
+          + (d.reported ? '，已上报总系统' : '（总系统会在下个上报周期记下）');
+      }
+      return load();
+    }).then(loadClusters).catch(function (e) {
+      if (msg) msg.textContent = '切换失败：' + (e && e.message ? e.message : e);
+    }).then(function () {
+      clusterBusy = false;
+      if (btn) { btn.disabled = false; btn.textContent = '切换到该集群'; }
+    });
+  }
+
   /* ---------------- 事件绑定 ---------------- */
+  if ($('br-cluster-apply')) {
+    $('br-cluster-apply').addEventListener('click', function () { applyCluster(this); });
+  }
+  if ($('br-cluster-refresh')) {
+    $('br-cluster-refresh').addEventListener('click', function () { loadClusters(); });
+  }
+
   $('br-join').addEventListener('click', function () {
     // 按最近一次服务端确认的状态取反，不做界面文案推断
     setEnabled(!curEnabled, this);
@@ -459,7 +536,9 @@
 
   load();
   loadCands();
+  loadClusters();               // 所属集群（可选列表来自总系统）
   setInterval(load, STATUS_MS);
+  setInterval(loadClusters, CAND_MS);
   setInterval(function () {
     // 正在填「手动补充」表单时不要动预览区，免得把光标下的内容换掉
     var a = document.activeElement;

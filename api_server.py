@@ -908,11 +908,88 @@ def _bridge_roster_source():
         return [dict(x) for x in _ROSTER_CACHE["data"]]
 
 
+def _report_cluster_now(name):
+    """
+    换了集群以后，立刻上报一次让总系统马上记下归属（不用等下一个上报周期）。
+
+    总系统的名册是按集群过滤的，若不同步这一步，界面会有一小段时间仍显示旧集群
+    的成员，容易让人以为"选了没生效"。上报失败不影响本地选择（下个周期会补上）。
+    """
+    try:
+        eng = _SYNC_ENGINE
+        # 两处都写：CONFIG（落盘的那份）与同步引擎自己的 config。
+        # 引擎的 config 可能是 CONFIG 的副本，只写一处会出现"上报里没带集群名"。
+        try:
+            CONFIG.setdefault('bridge', {})['cluster'] = str(name)
+        except Exception:  # noqa: BLE001
+            pass
+        if eng is None:
+            return False
+        eng.config.setdefault('bridge', {})['cluster'] = str(name)
+        return bool(eng.report_to_master(full=False))
+    except Exception as e:  # noqa: BLE001
+        print("[BRIDGE] 上报集群归属失败（下个周期会自动补上）: %s" % e)
+        return False
+
+
+def _fetch_master_clusters():
+    """
+    读总系统的集群列表（总系统上创建，分系统只能从中选）。
+
+    与名册拉取同样的地址策略：优先本机 127.0.0.1，其次本机 IP，最后配置地址 ——
+    总服务器常与分系统同机，走公网域名要绕 NAT 环回，不稳。
+    返回 (clusters, err)。
+    """
+    master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
+    if not master:
+        return [], "未配置 master_url"
+    bases = []
+    try:
+        mp = urlparse(master)
+        mport = mp.port or (443 if mp.scheme == 'https' else 80)
+        if mp.scheme and mport:
+            bases.append('%s://127.0.0.1:%d' % (mp.scheme, mport))
+            try:
+                lip = socket.gethostbyname(socket.gethostname())
+                if lip and lip != '127.0.0.1':
+                    bases.append('%s://%s:%d' % (mp.scheme, lip, mport))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    bases.append(master)
+    last_err = "未知错误"
+    for base in bases:
+        url = base + '/api/clusters'
+        try:
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                payload = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+            out = []
+            for c in payload.get('clusters') or []:
+                out.append({
+                    'id': c.get('id'),
+                    'name': str(c.get('name') or ''),
+                    'is_default': bool(c.get('is_default')),
+                    'member_count': int(c.get('member_count') or 0),
+                    'online_count': int(c.get('online_count') or 0),
+                })
+            return out, None
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+            continue
+    return [], last_err
+
+
 def _roster_fetch():
     """真正去总服务器拉一次（只在后台线程里调用）。返回 (ok, data)。"""
     master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
     if not master:
         return False, []
+    # ★ 带上自己的集群：总系统只返回**同集群**的其他分系统，
+    #   于是互联桥接自动被限定在自己选的集群里（默认「主集群」= 原有全局互联）。
+    me = str((CONFIG or {}).get('subsystem_id') or '').strip()
+    q = ('?subsystem_id=' + quote(me)) if me else ''
     # 优先本机地址：总服务器常与分系统同机，而 master_url 配的是公网域名 ——
     # 从自己访问自己的公网地址要走 NAT 环回，很不稳定。
     bases = []
@@ -933,7 +1010,7 @@ def _roster_fetch():
 
     out, last_err = [], ''
     for base in bases:
-        url = base + '/api/server/list'
+        url = base + '/api/server/list' + q
         try:
             req = urllib.request.Request(url, headers={'Accept': 'application/json'})
             with urllib.request.urlopen(req, timeout=_ROSTER_TIMEOUT) as resp:
@@ -2190,6 +2267,51 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'GET' and path == '/api/bridge/candidates':
                 self.send_json(self._bridge_candidates(svc))
                 return True
+
+            # ---- 集群（互联分组）----
+            # 集群在总系统上创建；这里列出可选集群，并把本机的选择报给总系统。
+            if method == 'GET' and path == '/api/bridge/clusters':
+                clusters, err = _fetch_master_clusters()
+                self.send_json({
+                    'ok': err is None,
+                    'error': err,
+                    'current': svc.cluster,
+                    'default': '主集群',
+                    'clusters': clusters or [],
+                })
+                return True
+            if method == 'POST' and path == '/api/bridge/cluster':
+                body = self._read_json_body()
+                if body is None:
+                    return True
+                name = str(body.get('cluster') or '').strip()
+                if not name:
+                    self.send_json({'ok': False, 'error': '缺少集群名'}, 400)
+                    return True
+                # 只允许加入总系统上**已存在**的集群（集群由总系统创建）
+                clusters, err = _fetch_master_clusters()
+                if err is not None:
+                    self.send_json({'ok': False,
+                                    'error': '读不到总系统的集群列表：%s' % err}, 502)
+                    return True
+                names = [str(c.get('name')) for c in (clusters or [])]
+                if name not in names:
+                    self.send_json({'ok': False,
+                                    'error': '总系统上没有名为「%s」的集群' % name,
+                                    'clusters': clusters}, 400)
+                    return True
+                svc.set_config(cluster=name)
+                # 立刻上报归属 + 立刻按新集群重拉名册，界面马上能看到变化
+                reported = _report_cluster_now(name)
+                try:
+                    _roster_refresh_once()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.send_json({'ok': True, 'cluster': svc.cluster,
+                                'reported': reported,
+                                'clusters': clusters})
+                return True
+
             if method == 'POST' and path == '/api/bridge/peers':
                 body = self._read_json_body()
                 if body is None:
@@ -2231,6 +2353,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                                      publish_local=body.get('publish_local'))
                 if cfg.get('enabled'):
                     svc.start()      # 之前可能处于禁用状态，这里把连接线程拉起来
+                # 加入/退出集群要**立刻**让总系统知道：总系统的集群成员数只统计已加入的，
+                # 不上报的话界面会一直显示旧台数（用户会说"我点了加入怎么还是 0"）。
+                if body.get('enabled') is not None:
+                    _report_cluster_now(svc.cluster)
                 self.send_json({'ok': True, 'config': cfg})
                 return True
             self.send_json({'ok': False, 'error': '未知的桥接接口: %s' % path}, 404)
