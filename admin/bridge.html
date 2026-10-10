@@ -102,6 +102,19 @@
   .br-meta b { color: var(--text); font-weight: 600; }
   .br-note { font-size: 12px; color: var(--muted); word-break: break-word; }
   .br-note b { color: var(--text); }
+  /* 所属集群（互联分组） */
+  .br-cluster {
+    margin: 14px 0 0; padding: 12px 14px; border: 1px solid var(--line);
+    border-radius: 10px; background: var(--card, transparent);
+  }
+  .br-cluster-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px;
+  }
+  .br-cluster-sel {
+    min-width: 180px; padding: 6px 8px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg, transparent);
+    color: var(--text); font-size: 13px;
+  }
   /* 相互验证结果：已与总服务器名册核对一致 / 未核对 */
   .br-ok   { color: var(--ok, #22c55e); font-weight: 600; }
   .br-warn { color: var(--warn, #f59e0b); font-weight: 600; }
@@ -210,6 +223,25 @@
       <div class="muted small" style="max-width:300px;line-height:1.7;">
         关掉后别人听不到本机语音，但本机仍能听别人。
       </div>
+    </div>
+  </div>
+
+  <!-- 集群（互联分组）：集群在总系统上像"建群组"一样创建；这里选本机加入哪一个。
+       只有**同一个集群**里的服务器之间才会互联。 -->
+  <div class="br-cluster" id="br-cluster-box">
+    <div class="br-cluster-main">
+      <div class="muted small" style="margin-bottom:4px;">
+        所属集群 —— <b>只有同一个集群里的服务器之间才会语音互通</b>。
+        集群由总系统创建（总系统 → 集群管理）；原本那套全局互联保留为「主集群」。
+      </div>
+      <div class="br-cluster-row">
+        <span class="muted small">当前：</span>
+        <b id="br-cluster-cur">主集群</b>
+        <select id="br-cluster-sel" class="br-cluster-sel"></select>
+        <button class="btn" id="br-cluster-apply">切换到该集群</button>
+        <button class="btn" id="br-cluster-refresh" title="从总系统重新读取集群列表">刷新列表</button>
+      </div>
+      <div class="muted small" id="br-cluster-msg"></div>
     </div>
   </div>
 

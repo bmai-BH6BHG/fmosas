@@ -16,6 +16,7 @@ MQTT 互联桥接测试（集群模型）
 用**假 broker**（真 socket、真 MQTT 报文、含订阅路由与保留消息）做集成验证。
 """
 
+import io
 import json
 import os
 import shutil
@@ -775,6 +776,45 @@ class ClusterTests(BridgeTestCase):
         self.assertTrue(wait_for(lambda: b.status()["thread_alive"], timeout=10))
         b.stop()
 
+    def test_cluster_defaults_to_main(self):
+        """没选过集群 → 默认「主集群」= 原有的全局互联（升级后行为不变）。"""
+        cfg = B.load_bridge_config({})
+        self.assertEqual(B.DEFAULT_CLUSTER_NAME, cfg["cluster"])
+        self.assertEqual("主集群", B.DEFAULT_CLUSTER_NAME)
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        self.assertEqual(B.DEFAULT_CLUSTER_NAME, b.cluster)
+
+    def test_set_config_cluster(self):
+        """切换集群要能生效、能持久化、并清掉退避（立刻按新名册重建链路）。"""
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        b._cfg["enabled"] = True
+        b._backoff_until["x:1883"] = time.time() + 999
+        cfg = b.set_config(cluster="华东集群")
+        self.assertEqual("华东集群", b.cluster)
+        self.assertEqual("华东集群", cfg["cluster"])
+        self.assertEqual({}, b._backoff_until, "换集群后应清掉退避，立即重连")
+        self.assertEqual("华东集群", b.public_config()["cluster"])
+
+    def test_status_exposes_cluster(self):
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        st = b.status()
+        self.assertIn("cluster", st)
+        self.assertIn("default_cluster", st)
+        self.assertEqual(B.DEFAULT_CLUSTER_NAME, st["cluster"])
+        self.assertEqual(B.DEFAULT_CLUSTER_NAME, st["default_cluster"])
+
+    def test_config_persists_cluster(self):
+        """
+        ★ bridge.cluster 必须落盘：同步上报从配置里读它告诉总系统"我属于哪个集群"，
+        漏了就会出现"界面上切换了、配置里却没有"→ 总系统永远收不到归属（真实踩过）。
+        """
+        b = self.new_bridge(self.new_broker(), node_id="sub-ME")
+        saved = {}
+        b.save_fn = lambda cfg: saved.update(cfg)
+        b.set_config(cluster="华东集群")
+        self.assertEqual("华东集群", (saved.get("bridge") or {}).get("cluster"),
+                         "配置里必须保存 cluster")
+
     def test_status_shape(self):
         local = self.new_broker()
         a = self.new_bridge(local, node_id="sub-A",
@@ -869,6 +909,59 @@ class ApiAndPackagingTests(unittest.TestCase):
         import api_server
         sig = inspect.signature(api_server.save_config)
         self.assertGreaterEqual(len(sig.parameters), 1)
+
+
+class FUSClusterTests(unittest.TestCase):
+    """分系统侧的"选集群"接线：名册必须按自己的集群去拉。"""
+
+    @staticmethod
+    def _read(rel):
+        with io.open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+            return f.read()
+
+    def test_roster_request_carries_subsystem_id(self):
+        """
+        ★ 桥接拉名册时必须带上自己的 subsystem_id —— 总系统据此只返回**同集群**的
+        成员，互联才会被限定在自己选的集群里（默认主集群）。
+        """
+        api = self._read("api_server.py")
+        self.assertIn("?subsystem_id=", api)
+        self.assertIn("_bridge_roster_source", api)
+        # 集群列表来自总系统
+        self.assertIn("def _fetch_master_clusters", api)
+        self.assertIn("/api/clusters", api)
+
+    def test_cluster_routes_exist_and_are_admin_only(self):
+        api = self._read("api_server.py")
+        self.assertIn("'/api/bridge/clusters'", api)
+        self.assertIn("'/api/bridge/cluster'", api)
+        # 公网口白名单里不能出现它们
+        pub = api.split("PUBLIC_GET_PATHS", 1)
+        self.assertGreater(len(pub), 1)
+        self.assertNotIn("/api/bridge/clusters", pub[1].split("PUBLIC_POST_PATHS")[0])
+
+    def test_cannot_join_nonexistent_cluster(self):
+        """只允许加入总系统上已存在的集群（集群由总系统创建）。"""
+        api = self._read("api_server.py")
+        self.assertIn("总系统上没有名为", api)
+
+    def test_report_carries_cluster(self):
+        """同步上报要带 cluster + cluster_joined，总系统才能记下归属与"是否已加入"。"""
+        se = self._read("sync_engine.py")
+        self.assertIn("payload['cluster']", se)
+        self.assertIn("payload['cluster_joined']", se)
+        self.assertIn("'主集群'", se)
+        # 加入/退出集群时必须立刻上报（否则总系统的成员数一直显示旧值）
+        api = self._read("api_server.py")
+        self.assertIn("_report_cluster_now(svc.cluster)", api)
+
+    def test_ui_has_cluster_selector(self):
+        html = self._read("admin/bridge.html")
+        js = self._read("admin/bridge.js")
+        for token in ("br-cluster-sel", "br-cluster-apply", "br-cluster-cur"):
+            self.assertIn(token, html, "界面缺少 %s" % token)
+        self.assertIn("/api/bridge/clusters", js)
+        self.assertIn("/api/bridge/cluster", js)
 
 
 if __name__ == "__main__":

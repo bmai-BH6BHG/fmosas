@@ -116,6 +116,8 @@ class EmqxHandler(BaseHTTPRequestHandler):
 
 
 class AuditServiceE2ETests(unittest.TestCase):
+    _db_seq = 0        # ★ 单调递增的库序号，见 setUp 里的说明
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="bas-e2e-")
@@ -131,7 +133,12 @@ class AuditServiceE2ETests(unittest.TestCase):
 
     def setUp(self):
         STUB.clients = []; STUB.bans = []; STUB.kicks = []; STUB.requests = []
-        self.db = AuditDB(os.path.join(self.tmp, "e2e-%d.db" % len(os.listdir(self.tmp))))
+        # ★ 不要用 len(os.listdir(tmp)) 当序号：WAL 模式下 -wal / -shm 文件会时有时无，
+        #   目录项数会**回退**，于是两个测试会复用同一个库文件，上一个测试留下的行被
+        #   算进本次 —— 表现为"只应有 1 条却看到 2 条"，且**只在全量跑时复现**、单跑正常
+        #   （真实踩过，排查了很久）。用单调计数器就不会撞。
+        type(self)._db_seq += 1
+        self.db = AuditDB(os.path.join(self.tmp, "e2e-%d.db" % type(self)._db_seq))
         self.db.set_setting("emqx_url", "127.0.0.1:%d" % self.port)
         self.db.set_setting("emqx_api_key", "key")
         self.db.set_setting("emqx_api_secret", "secret")

@@ -816,6 +816,15 @@ class SyncEngine:
             'data': data,
             'counts': {k: len(v) for k, v in data.items()}
         }
+        # ★ 集群归属：本机在管理页选的"想加入哪个集群"，随上报带给总系统。
+        #   总系统据此把我们归到那个集群，之后名册（/api/server/list）只返回
+        #   同集群的成员 → 桥接自动只在同集群内互联。没选过就报「主集群」。
+        bridge = (self.config.get('bridge') or {})
+        cluster = str(bridge.get('cluster') or '').strip()
+        payload['cluster'] = cluster or '主集群'
+        # ★ 是否**已真正加入集群**（桥接开关已打开）：总系统的集群成员数只算已加入的
+        #   —— 集群的意义是桥接互通，没加入桥接的台站不该显示成成员。
+        payload['cluster_joined'] = bool(bridge.get('enabled'))
         if self.sync_token:
             payload['sync_token'] = self.sync_token
         return payload
