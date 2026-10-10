@@ -166,7 +166,8 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py bridge.py \
          config.default.json config.json requirements.txt start.sh \
-         fmo-subsystem.service install.sh uninstall.sh upgrade.sh uploads/.gitkeep \
+         fmo-subsystem.service install.sh uninstall.sh upgrade.sh fix_bridge_acl.sh \
+         uploads/.gitkeep \
          CONTRACT.md dist/VERSION; do
     [ -e "$REPO/$F" ] || die "缺少必需文件: $F（契约第 5 节必须包含）"
 done
@@ -219,7 +220,7 @@ copy_path() {
 # 代码（契约必须包含）
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
-         fmo_stations.py fmo_aprs.py bridge.py; do
+         fmo_stations.py fmo_aprs.py bridge.py fix_bridge_acl.sh; do
     copy_path "$F" 1
 done
 # BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）
