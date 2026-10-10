@@ -494,6 +494,15 @@ else
 fi
 cp -a "$OUT"                           "$UPLOAD/$TARNAME"
 cp -a "$DIST/$TARNAME.sha256"          "$UPLOAD/$TARNAME.sha256"
+# 桥接 ACL 修复脚本：单独放到上传根目录 → 发布工作流压成扁平资产 fus-fix-acl.sh
+# （现场"单向语音"：对端 EMQX 的 ACL 没放行 FMO/BRIDGE/#，升级 FUS 补不上，必须单独跑它）
+if [ -f "$STAGE/fix_bridge_acl.sh" ]; then
+    cp -a "$STAGE/fix_bridge_acl.sh"   "$UPLOAD/fix_bridge_acl.sh"
+elif [ -f "$REPO/fix_bridge_acl.sh" ]; then
+    cp -a "$REPO/fix_bridge_acl.sh"    "$UPLOAD/fix_bridge_acl.sh"
+else
+    die "缺少 fix_bridge_acl.sh：无法发布桥接 ACL 修复脚本"
+fi
 cp -a "$OUT_FLAT"                      "$UPLOAD/fmo-subsystem.tar.gz"
 cp -a "$DIST/fmo-subsystem.tar.gz.sha256" "$UPLOAD/fmo-subsystem.tar.gz.sha256"
 cp -a "$REPO/dist/VERSION"             "$UPLOAD/VERSION"
