@@ -145,6 +145,11 @@ DEFAULT_BRIDGE = {
     #   总系统只返回同集群的成员。默认「主集群」= 原有的全局互联，
     #   所以升级后不选任何东西，行为与以前完全一致。
     "cluster": DEFAULT_CLUSTER_NAME,
+    # ★ 桥接自己的 broker 地址（留空 = 用管理页「MQTT 地址」那一栏，
+    #   也就是 monitor.mqtt_host / SAS 接入的地址）。
+    #   "不是所有机子的 broker 都在同一个地方"，所以要能单独指定。
+    "broker": "",
+    "broker_port": 0,
     # 已确认过的集群成员节点 id（向总系统汇报"谁在集群里"用；写进配置防链路抖动死锁）
     "member_ids": [],
     "channels": ["RAW", "TELE"],
@@ -514,11 +519,14 @@ class VoiceBridge(object):
         self.channels = list(self._cfg.get("channels") or ["RAW"])
         # 所属集群：桥接只在同集群内互联（名册按它过滤）
         self.cluster = str(self._cfg.get("cluster") or DEFAULT_CLUSTER_NAME)
-        b = broker or LOCAL_BROKER
-        mon = self.config.get("monitor") or {}
-        if broker is None and mon.get("mqtt_host"):
-            b = (str(mon.get("mqtt_host")), int(mon.get("mqtt_port") or DEFAULT_PORT))
-        self.broker_host, self.broker_port = b[0], int(b[1])
+        # 调用方显式传入的 broker（测试/嵌入部署用）：优先级最高，且不再被配置覆盖
+        self._explicit_broker = None
+        if broker:
+            try:
+                self._explicit_broker = (str(broker[0]), int(broker[1]))
+            except (TypeError, ValueError, IndexError):
+                self._explicit_broker = None
+        self._resolve_broker(initial=True)
 
         self._stop = threading.Event()
         self._links = {}                      # peer_id -> BridgeLink
@@ -535,6 +543,8 @@ class VoiceBridge(object):
         self._backoff_until = {}              # target key -> 非成员下次可试时间
         # 主动连到我们 broker 的桥接节点 → 最后见到的时间（见 note_inbound）
         self._inbound = {}
+        # broker 地址被改过 → 本机连接需要重建（见 set_broker / refresh_broker）
+        self._local_restart = False
         self._last_announce = 0.0
         self._cert_cache = None
         self._thread = None
@@ -546,6 +556,80 @@ class VoiceBridge(object):
                 self._log_fn(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _resolve_broker(self, initial=False):
+        """
+        算本机 broker 地址（每次现算，不用启动时抓死的值）。
+
+        优先级：
+          1. **桥接自己的设置** `bridge.broker` / `bridge.broker_port`
+             —— "不是所有机子的 broker 都在同一个地方"，所以要能单独填；
+          2. 否则用 **SAS/门户里配的 MQTT 地址**（`monitor.mqtt_host/mqtt_port`，
+             就是管理页「APP 登录与 MQTT 地址配置」那一栏；SAS 也是按这个地址接入的）；
+          3. 再兜底 `127.0.0.1:1883`。
+
+        ★ 为什么必须现算：原实现是在 `__init__` 里取一次就固定。真实问题：
+          进程启动时 MQTT 地址还没配好（或后来在配置页改了），桥接却一直用
+          启动那一刻的旧值（默认 127.0.0.1:1883）→ 界面显示的 broker 与实际不符，
+          也就连不上真正的 broker。
+
+        返回 (host, port, 来源说明, 是否变化)。
+        """
+        host, port, src = None, None, ""
+        if getattr(self, "_explicit_broker", None):
+            # 调用方显式指定（测试/嵌入部署）→ 以它为准，不受配置影响
+            host, port, src = (self._explicit_broker[0],
+                               int(self._explicit_broker[1]), "调用方指定")
+        with self._lock:
+            bh = str(self._cfg.get("broker") or "").strip()
+            bp = self._cfg.get("broker_port")
+        if not host and bh:
+            host, port, src = bh, int(bp or DEFAULT_PORT), "桥接设置"
+        else:
+            mon = self.config.get("monitor") or {}
+            mh = str(mon.get("mqtt_host") or "").strip()
+            if not host and mh:
+                host = mh
+                try:
+                    port = int(mon.get("mqtt_port") or DEFAULT_PORT)
+                except (TypeError, ValueError):
+                    port = DEFAULT_PORT
+                src = "SAS/MQTT 地址设置"
+        if not host:
+            host, port, src = LOCAL_BROKER[0], LOCAL_BROKER[1], "默认值"
+        port = int(port or DEFAULT_PORT)
+        old = (getattr(self, "broker_host", None), getattr(self, "broker_port", None))
+        self.broker_host, self.broker_port = host, port
+        self.broker_source = src
+        return host, port, src, (old != (host, port))
+
+    def refresh_broker(self):
+        """重新解析 broker；地址变了返回 True（调用方据此重建本机 broker 连接）。"""
+        try:
+            _h, _p, _s, changed = self._resolve_broker()
+            return bool(changed)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def set_broker(self, host, port=None):
+        """
+        指定桥接自己的 broker 地址（**留空 = 回到"SAS/MQTT 地址设置"**）。
+
+        "不是所有机子的 broker 都在同一个地方" —— 所以这里要能单独指定。
+        """
+        host = str(host or "").strip()
+        with self._lock:
+            if host:
+                self._cfg["broker"] = host
+                try:
+                    self._cfg["broker_port"] = int(port or DEFAULT_PORT)
+                except (TypeError, ValueError):
+                    self._cfg["broker_port"] = DEFAULT_PORT
+            else:
+                self._cfg.pop("broker", None)
+                self._cfg.pop("broker_port", None)
+        self._local_restart = True          # 地址变了 → 本机 broker 连接必须重建
+        return self._persist()
 
     def client_suffix(self):
         """clientid 后缀：必须以 FMO- 开头（EMQX ACL 只放行 FMO-* 的 connect）。"""
@@ -638,6 +722,17 @@ class VoiceBridge(object):
                 self._local_ready = False
                 self._stop.wait(2.0)
                 continue
+            # ★ 每次进外层循环都重新解析 broker 地址：
+            #   现场"不是所有机子的 broker 都在同一个地方"，而且地址可能在
+            #   管理页里被改过（改了 MQTT 地址 / 改了桥接自己的 broker）；
+            #   起进程时抓死的旧值正是"界面 broker 与实际不符、连不上"的原因。
+            if self.refresh_broker():
+                self.log("[BRIDGE] 本机 broker 地址已变更为 %s:%d（来源：%s），将重建连接"
+                         % (self.broker_host, self.broker_port, self.broker_source))
+            if self._local_restart:
+                self._local_restart = False
+                self.log("[BRIDGE] 按新设置重建本机 broker 连接：%s:%d"
+                         % (self.broker_host, self.broker_port))
             client = None
             try:
                 self._local_state = "connecting"
@@ -684,6 +779,14 @@ class VoiceBridge(object):
                     if time.time() - last_sync >= 5.0:
                         last_sync = time.time()
                         self._sync_links()
+                        # ★ 连着的时候地址也可能被改（管理页改了 MQTT 地址、
+                        #   或改了桥接自己的 broker）→ 立刻断开重连到新地址
+                        if self.refresh_broker():
+                            self.log("[BRIDGE] 本机 broker 地址已变更为 %s:%d"
+                                     "（来源：%s），重连" % (self.broker_host,
+                                                          self.broker_port,
+                                                          self.broker_source))
+                            break
                     if time.time() - self._last_announce > ANNOUNCE_INTERVAL:
                         self._last_announce = time.time()
                         self._publish_announce(client)
@@ -1054,6 +1157,10 @@ class VoiceBridge(object):
                 #   漏了就会出现"选了集群、界面上也变了，但总系统永远收不到归属"
                 #   （真实踩过），且重启后选择还会丢。
                 "cluster": self.cluster,
+                # ★ 桥接自己的 broker 地址（可留空 = 用 SAS/MQTT 地址设置）。
+                #   "不是所有机子的 broker 都在同一个地方"，所以要能单独指定并落盘。
+                "broker": str(self._cfg.get("broker") or ""),
+                "broker_port": int(self._cfg.get("broker_port") or 0),
                 # 已确认过的集群成员节点 id（链路断了也能继续向总系统汇报，防死锁）
                 "member_ids": list(self._cfg.get("member_ids") or []),
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
@@ -1070,7 +1177,8 @@ class VoiceBridge(object):
         return True
 
     def set_config(self, enabled=None, node_name=None, channels=None,
-                   node_id=None, publish_local=None, cluster=None):
+                   node_id=None, publish_local=None, cluster=None,
+                   broker="__keep__", broker_port=None):
         with self._lock:
             if enabled is not None:
                 was = bool(self._cfg.get("enabled"))
@@ -1101,6 +1209,21 @@ class VoiceBridge(object):
                     self._cfg["cluster"] = newc
                     self.cluster = newc
                     self._backoff_until = {}
+            # ★ broker 地址：可选。传空串 = 清掉桥接自己的设置、回到
+            #   "SAS/MQTT 地址设置"；传具体的 host = 单独指定。
+            #   "不是所有机子的 broker 都在同一个地方"，现场需要能单独填。
+            if broker != "__keep__":
+                bh = str(broker or "").strip()
+                if bh:
+                    self._cfg["broker"] = bh
+                    try:
+                        self._cfg["broker_port"] = int(broker_port or DEFAULT_PORT)
+                    except (TypeError, ValueError):
+                        self._cfg["broker_port"] = DEFAULT_PORT
+                else:
+                    self._cfg.pop("broker", None)
+                    self._cfg.pop("broker_port", None)
+                self._local_restart = True
         self._persist()
         self._sync_links()
         return self.public_config()
@@ -1248,6 +1371,11 @@ class VoiceBridge(object):
 
     # ---------------- 状态 ----------------
     def status(self):
+        # ★ 先现算一次 broker：界面显示的地址要与实际用的一致（改了配置马上反映）
+        try:
+            self.refresh_broker()
+        except Exception:  # noqa: BLE001
+            pass
         with self._lock:
             cfg = self.public_config()
             enabled = cfg["enabled"]
@@ -1304,6 +1432,11 @@ class VoiceBridge(object):
             "default_cluster": DEFAULT_CLUSTER_NAME,
             "publish_local": cfg.get("publish_local", True),
             "broker": "%s:%d" % (self.broker_host, self.broker_port),
+            # broker 地址是从哪来的："桥接设置" / "SAS/MQTT 地址设置" / "默认值"
+            # —— 现场"不是所有机子的 broker 都在同一个地方"，界面要能说清它是怎么来的
+            "broker_host": self.broker_host,
+            "broker_port": self.broker_port,
+            "broker_source": getattr(self, "broker_source", ""),
             "topics": list(cfg["channels"]),
             "local_state": local_state,
             "local_error": local_error,
