@@ -90,13 +90,19 @@ fmo-subsystem-deploy/
 │   └── release-upload/      #   ★★ 要上传到对象存储的全部文件（7 个，整个传上去）
 ├── api_server.py            # 后端 API 服务（主程序）
 ├── sas_server.py            # SAS 认证服务模块（被 api_server 导入）
-├── sync_engine.py           # 分布式同步引擎模块（被 api_server 导入）
+├── sync_engine.py           # 分布式同步引擎模块（含 UDAC 排行上报 / 事件下发）
 ├── monitor.py               # 语音/信标监控线程（MQTT）
+├── bridge.py                # ★ 互联桥接（集群内自动互通、成员互相校验、防回环）
+├── udac.py                  # ★ UDAC 中心（信任评分 + 策略引擎 PDP + 执行点 PEP + 决策审计）
 ├── cert_gen.py              # Ed25519 证书生成工具
 ├── gen_app_key.py           # 生成 APP 签名密钥对
 ├── diagnose.py              # CA 上报链路诊断脚本
+├── fix_bridge_acl.sh        # ★ 桥接 ACL 修复（单向语音时在对端那台跑）
 ├── admin/
-│   └── index.html           # 前端管理页面（内网用，不暴露公网）
+│   ├── index.html           # 管理后台（SAS / FAS / 语音监控 / 上报地址；内网用）
+│   ├── bridge.html|.js      # ★ 互联桥接页（加入集群 / broker 地址 / 链路状态）
+│   └── udac.html|.js        # ★ UDAC 页（概览 / 排行 / 决策 / 策略 / 事件）
+├── udac.db                  # UDAC 决策/事件/策略/排行快照（运行时数据，不随包发布）
 ├── config.json              # 配置文件（分系统ID/名称/域名/总系统地址等）
 ├── config.default.json      # 配置模板（一键安装时作为新配置的起点）
 ├── start.sh                 # Linux 启动脚本
@@ -233,26 +239,20 @@ fmo-subsystem-deploy/
 
 七、管理后台使用
 ------------------------------------------------------------
-admin/index.html 是独立 HTML 文件，不通过 API 服务暴露。
+管理页由管理端口（公网口 + 1，默认 35929）直接提供，**只在内网访问，不要映射公网**：
 
-使用方式（任选其一）：
+  http://<内网IP>:35929/admin          FUS 门户（SAS / FAS 入口）
+  http://<内网IP>:35929/admin/sas      SAS 配置（认证服务）
+  http://<内网IP>:35929/admin/fus      FAS（认证审计）
+  http://<内网IP>:35929/admin/bridge   互联桥接（加入集群 / 本机 broker 地址 / 链路状态）
+  http://<内网IP>:35929/admin/udac     UDAC（信任评分 / 动态授权 / 策略 / 决策审计）
+  http://<内网IP>:35929/admin/index.html  总管理页（SAS 配置 / 语音监控 / 上报地址）
 
-  方式 A：浏览器直接打开本地文件
-    双击 admin/index.html 用浏览器打开
-    在页面顶部"后端 API 地址"输入框填入 API 地址
-    例如: http://127.0.0.1:35928 或 https://register.example.com:35928
-    点击"保存并刷新"
-
-  方式 B：通过 URL 参数自动填充 API 地址
-    file:///.../admin/index.html?api=http://127.0.0.1:35928
-    或
-    http://内网IP/admin/index.html?api=http://127.0.0.1:35928
-
-  方式 C：内网用另一个 HTTP 服务托管 admin 目录
-    例如: python3 -m http.server 8080 --directory admin
-    然后浏览器访问 http://内网IP:8080/?api=http://127.0.0.1:35928
-
-API 地址会保存在浏览器 localStorage，下次打开自动恢复。
+注意（这一版的变化）：
+  * 「注册系统」页与 APP 登录地址配置**已从分系统移除** —— 用户注册/管理统一在**总系统**做；
+  * MQTT 地址配置入口挪到「语音监控」页（生效位置不变，SAS/监控仍按它接入）；
+  * FMO 台站扫描页（/admin/stations）**已移除**，扫描与汇总在总系统做；
+  * 页面由服务直接提供，不需要像早期那样手动打开本地 HTML 文件。
 
 
 八、依赖说明
@@ -351,7 +351,113 @@ API 地址会保存在浏览器 localStorage，下次打开自动恢复。
       改了地址，桥接都还按旧值走 —— 界面显示的 broker 与实际不符，也就连不上。）
 
 
-十二、一键升级（只升级系统，不动配置与数据）
+十二、UDAC：统一动态授权与信任控制中心（★ 新增）
+------------------------------------------------------------
+SAS 判完"身份可信"就结束了；但身份可信不等于"现在这一刻还能继续信"：
+证书可能刚被吊销、这台机器凌晨三点突然狂发消息、跟它之间的桥接丢包 30%……
+UDAC 就是管这一段的：只读消费 SAS 的身份/证书状态与桥接健康度、音质，
+输出 0-100 信任分与动态授权决策。
+
+页面：http://<内网IP>:35929/admin/udac（只在内网，勿映射公网）
+
+三个部分：
+  * 信任评分 udac-trust-score
+      0-100 多维加权：身份 30% / 行为 25% / 桥接健康 15% / 音质 10% / 上下文 / 数据。
+      含 7 天冷启动观察期与历史信任衰减（半衰期 24h）。
+  * 策略引擎 udac-policy（PDP）
+      版本化"策略即代码"（JSON 结构化条件：trust_min / hour_from / hour_to / scope，
+      **不 eval 任意表达式**）；支持灰度发布 / 提升 / 回滚 / 仿真试运行。
+  * 执行点 udac-pep（PEP）
+      挂在 /auth 认证路径：SAS 放行 → 信任评分 → 策略评估 → 与信任分阈值表取更严者 → 审计。
+
+动作从宽到严：
+  allow → rate_limit → degrade → step_up → disconnect → quarantine → deny
+      deny / disconnect / quarantine = 直接拒绝新接入；
+      其余通过 client_attrs（udac_action / udac_score）交给 EMQX 限权；
+      **已建立的会话不会被中断**（不给现网通话"突然掉线"）；
+      决策与事件只追加落库（udac.db），可回放追溯；原始认证审计仍归 FAS。
+
+【直通】这些接入不评分、直接通过（★ 重点）
+  有几类接入已经在别处验证过了，再拿"证书记录/吊销/冷启动/时段"去给它们扣分降权只会
+  帮倒忙 —— 实测给 APP 账号算成 48-52 分判 step_up、给桥接判 rate_limit（桥接还因此
+  连不上）。现在它们直接放行、不参与评分，决策里带「直通」标记：
+
+    直通类型            判据                                     为什么
+    APP 接入            app_verified=1（APP 私钥签名校验通过）    已过 SAS 身份 + APP 签名两道
+    APP 接入（第二次）  clientid 形如 FMO-<呼号>-<uid>-<随机>      同一个 APP 会接入两次
+                        且 SAS 身份已通过                        （先 user、再 super），其中
+                                                                 super 那次**不带签名**，
+                                                                 只凭签名认不出来
+    内部客户端          app_exempt=1（面板/服务账号豁免签名）     属信任豁免的内部客户端
+    MQTT 互联桥接       clientid FMO-BRIDGE-* 或呼号 SERVER       FUS 内部组件之间的语音互通，
+                                                                 身份已由证书链 + 集群名片
+                                                                 双重校验；一旦被 fail-closed
+                                                                 拒掉，表现就是"桥接连不上"
+
+  普通用户仍然照常评分与策略门控（没有被顺手放过）：例如没有证书记录的呼号会拿到
+  rate_limit，策略命中该拒的照拒。
+
+【性能】别让"风控"变成"卡顿"（★ 都是踩过坑之后加的）
+  * udac.db 用 WAL（journal_mode=WAL + busy_timeout + synchronous=NORMAL）：
+    认证路径每次连接都要写决策/事件，回滚日志模式下"写"会锁整库、所有读被堵住 ——
+    实测 UDAC 接口 2 秒、排行 60 秒超时、管理页整片卡死、数据加载不出来。
+  * 排行读快照：ranking() 默认不重算，只读 trust_snapshot；快照由后台线程每 5 分钟刷新
+    （以前页面每几秒请求一次就把几百个呼号全量重算一遍）。
+  * 认证路径给 UDAC 加硬超时（0.45 秒）：UDAC 卡住时按"本次未参与"继续，绝不拖住 /auth
+    —— 否则 EMQX 等不到认证响应会判连接失败，现象是桥接 CONNACK 超时、老是连不上。
+
+  修复前后实测（同一台 NAS）：
+    /api/udac/ranking              60 秒超时  →  2 ms
+    /api/udac/status                  2041 ms  →  2.5 ms
+    /api/udac/decisions               2682 ms  →  3.6 ms
+    UDAC 页一次完整刷新（5 个接口）  >60 秒     →  24.5 ms
+    本机 broker 连接        反复 CONNACK 超时  →  connected
+
+接口：
+  GET  /api/udac/status              概览（决策数 / P99 / 等级分布 / 桥接与音质输入）
+  GET  /api/udac/ranking?limit=      台站信任排行（读快照，毫秒级）
+  GET  /api/udac/decisions?limit=    决策审计（exempt=1 即「直通」）
+  GET  /api/udac/events?limit=       只追加事件流
+  GET  /api/udac/policy              当前策略 + 所有版本
+  POST /api/udac/policy              发布策略版本（可指定灰度百分比）
+  POST /api/udac/policy/promote      灰度提升
+  POST /api/udac/policy/rollback     回滚
+  POST /api/udac/simulate            策略试运行（不写审计）
+
+本机排行还会随同步上报给总系统，汇总成全局台站信任排行；总系统下发的全量扫描事件
+也会喂给本机 UDAC 中心。
+
+排障：
+  现象                                   原因 / 处理
+  UDAC 页卡、数据加载不出来              多半是 udac.db 落回回滚日志模式、或排行在全量
+                                          重算。确认 /opt/fmo-subsystem/udac.db-wal 存在，
+                                          PRAGMA journal_mode 应为 wal
+  桥接 CONNACK 超时 / 连不上             UDAC 拖住了 /auth。看日志有无"UDAC 决策超时"；
+                                          新版有 0.45 秒硬超时兜底，桥接本身也走直通
+  APP 账号被 step_up、只有 50 分左右     该账号被当普通用户评分了。升级到含「直通」的版本
+  "无该呼号证书记录" 导致 rate_limit     若是 APP/服务账号，本应走直通；若是普通用户，
+                                          说明它的证书确实不在 SAS 里
+
+
+十三、上报地址自动化（APP 该连哪台，机器自己知道）（★ 新增）
+------------------------------------------------------------
+以前要在管理页手填"上报地址"、点保存、还得记得上传总系统；填错或忘改，APP 与对端就
+连到错的地方（本机 127.0.0.1 这种内网地址尤其致命）。现在全自动：
+
+  * 分系统向总系统问一句"你看到的我是什么 IP"（GET /api/myip），以它为准 ——
+    不需要任何第三方服务，也不受本机多网卡/内网地址干扰；
+  * 拿到之后直接写进配置并立即上报总系统，没有"填 → 保存 → 上传"三步；
+  * 后台线程每 10 分钟自动扫一次，而且地址真的变了才写盘/上报（幂等，不折腾）；
+  * 只有公网 IP 会被采用：两端都校验，内网/回环地址一律不采信
+    （踩过：走 127.0.0.1 去问，总系统看到的当然是 127.0.0.1，写进上报地址就把 APP
+     和对端全带偏了）；
+  * 总系统这条路不通时，才退回外部回显服务。
+
+「语音监控」页有「上报地址（自动）」面板：显示当前地址、可一键重扫；
+也可直接调 POST /api/config/auto-address。
+
+
+十四、一键升级（只升级系统，不动配置与数据）
 ------------------------------------------------------------
   curl -fsSL https://github.com/bmai-BH6BHG/fmosas/releases/latest/download/fus-upgrade.sh -o fus-upgrade.sh
   sudo bash fus-upgrade.sh
@@ -362,7 +468,7 @@ API 地址会保存在浏览器 localStorage，下次打开自动恢复。
   * 子命令：--check 只检查、--rollback 回滚、--list-backups 看备份。
 
 
-十三、单向语音排障（我这边过得去、对面的声音过不来）
+十五、单向语音排障（我这边过得去、对面的声音过不来）
 ------------------------------------------------------------
 最常见原因：对端 EMQX 的 ACL 没放行桥接主题 FMO/BRIDGE/#
 
@@ -392,7 +498,7 @@ API 地址会保存在浏览器 localStorage，下次打开自动恢复。
         它加入 / 恢复上报后会自己回来。
 
 
-十四、安全注意事项
+十六、安全注意事项
 ------------------------------------------------------------
 1. API 服务默认监听 0.0.0.0，请确保只在需要时映射公网端口
 2. admin/index.html 不要映射公网，仅内网管理使用

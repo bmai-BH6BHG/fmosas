@@ -251,7 +251,7 @@
     <div class="br-cluster-main">
       <div class="muted small" style="margin-bottom:4px;">
         本机 broker 地址 —— 桥接要把本机语音放到这个 broker 上、并对端连它来拉。
-        <b>留空就自动用</b>管理页「APP 登录与 MQTT 地址配置」里那个地址（SAS 也按它接入）。
+        <b>留空就自动用</b>管理页「MQTT 地址配置」里那个地址（SAS 也按它接入）。
         只有本机 broker 不在那个地址时才需要在这里单独填。
       </div>
       <div class="br-cluster-row">
@@ -265,6 +265,31 @@
         <button class="btn" id="br-broker-save">保存 broker</button>
       </div>
       <div class="muted small" id="br-broker-msg"></div>
+    </div>
+  </div>
+
+  <!-- 对外公布的本机 broker 地址（可选）：别人该用哪个地址来连我的 broker。
+       与上面的「本机 broker 地址」是两件事：那个是"我怎么连我的 broker"，
+       这个是"别人怎么连我的 broker"（常常不一样，例如本机走 127.0.0.1，
+       对外却是一个域名或隧道端口）。 -->
+  <div class="br-cluster" id="br-adv-box">
+    <div class="br-cluster-main">
+      <div class="muted small" style="margin-bottom:4px;">
+        <b>对外公布的本机 broker 地址</b>（别人连我用这个）—— <b>一般不用填</b>：
+        留空时别人按名册里的地址（本机域名 + 1883）来连，绝大多数情况就够。
+        只有本机 broker 对外<b>不是</b>这个地址时才需要填，例如挂在公网隧道后面
+        （HTTP 与 MQTT 各走一个端口），或 MQTT 用了非默认端口。
+      </div>
+      <div class="br-cluster-row">
+        <span class="muted small">当前：</span>
+        <b id="br-adv-cur">（未公布，对端按名册地址连）</b>
+        <input type="text" id="br-adv-host" class="br-cluster-sel"
+               placeholder="对外 host（留空=不公布）" style="min-width:200px;">
+        <input type="text" id="br-adv-port" class="br-cluster-sel"
+               placeholder="1883" style="min-width:80px;">
+        <button class="btn" id="br-adv-save">保存对外地址</button>
+      </div>
+      <div class="muted small" id="br-adv-msg"></div>
     </div>
   </div>
 

@@ -67,10 +67,13 @@
     return [p && p.state ? String(p.state) : '未知', 'off'];
   }
 
-  /* 本机 broker 连接状态：它坏了的话「已加入集群」只是名义上的 */
+  /* 本机 broker 连接状态：它坏了的话「已加入集群」只是名义上的。
+     ★ "disabled" 只表示**桥接总开关关着**（真的没加入）；总开关开着却还没连上时
+       后端会报 connecting/error，别混成"未加入"，否则顶上写"已加入"、这行写
+       "未加入"，自相矛盾（真实反馈）。 */
   var LOCAL = {
     connected: '已连接', connecting: '连接中',
-    disabled: '未加入集群', error: '连接失败', stopped: '已断开'
+    disabled: '未加入（桥接总开关已关闭）', error: '连接失败', stopped: '已断开'
   };
 
   function req(path, opts) {
@@ -149,6 +152,17 @@
       if (bp && document.activeElement !== bp) bp.value = j.broker_port || '';
     }
 
+    // 对外公布的本机 broker 地址（别人连我用这个；留空 = 对端按名册地址连）
+    if ($('br-adv-cur')) {
+      var ab = j.advertise_broker || '';
+      $('br-adv-cur').textContent = ab
+        ? (ab + ':' + (j.advertise_broker_port || 1883))
+        : '（未公布，对端按名册地址连）';
+      var ah = $('br-adv-host'), ap = $('br-adv-port');
+      if (ah && document.activeElement !== ah) ah.value = ab;
+      if (ap && document.activeElement !== ap) ap.value = j.advertise_broker_port || '';
+    }
+
     var le = $('br-local-err');
     if (j.local_error) {
       le.textContent = '本机 broker：' + j.local_error;
@@ -179,15 +193,24 @@
   }
   function renderStats(j) {
     var l = j.local || {};
+    var h = j.health || {};
+    var a = j.audio || {};
+    var mos = a.mos_estimate;
+    var mosCls = '';
+    if (typeof mos === 'number') mosCls = (mos >= 3.5 ? 'ok' : (mos >= 3 ? '' : 'warn'));
     $('br-stats').innerHTML =
       card('已加入状态', j.enabled ? '已加入' : '未加入', j.enabled ? 'ok' : '') +
       card('集群成员数', num(j.member_count)) +
-      card('本机已发出', num(l.published)) +
-      card('已接收（互联）', num(l.rx_frames)) +
-      card('去重丢弃', num(l.deduped));
-    $('br-stats-src').textContent = '已加入状态 = 本机有没有加入集群；集群成员数 = 已确认加入集群的服务器数；'
-      + '本机已发出 = 本机放到桥接主题上供成员拉取的帧数；已接收（互联）= 从集群成员收到的帧数；'
-      + '去重丢弃 = 重复到达、已丢弃的帧数。';
+      card('本机 broker 延迟', h.local_rtt_ms != null ? num(h.local_rtt_ms) + ' ms' : '—') +
+      card('链路抖动', h.jitter_ms != null ? num(h.jitter_ms) + ' ms' : '—',
+           (typeof h.jitter_ms === 'number' && h.jitter_ms < 30) ? 'ok' : '') +
+      card('疑似丢包', h.packet_loss_rate != null ? (num(h.packet_loss_rate * 100) + '%') : '—') +
+      card('音质 MOS', (typeof mos === 'number' ? num(mos) : '—'), mosCls) +
+      card('重连次数', num(h.reconnects_total || 0)) +
+      card('抖动缓冲', a.jitter_buffer_ms != null ? num(a.jitter_buffer_ms) + ' ms' : '—');
+    $('br-stats-src').textContent = '已加入状态 = 本机有没有加入集群；broker 延迟 = PING 往返；'
+      + '抖动 = 链路帧到达间隔波动（<30ms 为佳）；疑似丢包 = 帧间隔骤增判定的丢失比例；'
+      + 'MOS = 音质估算（≥3.5 良好，来自最差一条成员链路）；抖动缓冲可吸收到达抖动，设置里可调。';
   }
 
   /* ---------------- 成员列表（只读为主） ---------------- */
@@ -233,6 +256,18 @@
     more.push('<span>重连 <b>' + num(p.reconnects) + '</b> 次</span>');
     if (p.connected && p.uptime) {
       more.push('<span>本次连接已持续 <b>' + esc(dur(p.uptime)) + '</b></span>');
+    }
+    var hp = p.health || {};
+    if (p.connected && hp.rtt_ms != null) {
+      more.push('<span>往返 <b>' + num(hp.rtt_ms) + '</b> ms</span>');
+    }
+    var ap = p.audio || {};
+    if (ap.frames) {
+      more.push('<span>抖动 <b>' + num(ap.jitter_ms) + '</b> ms</span>');
+      if (ap.loss_suspect) more.push('<span>疑似丢帧 <b>' + num(ap.loss_suspect) + '</b></span>');
+      if (typeof ap.mos_estimate === 'number') {
+        more.push('<span>MOS <b>' + num(ap.mos_estimate) + '</b></span>');
+      }
     }
     if (!p.member && p.state === 'not_member') {
       more.push('<span class="muted">对方没加入集群，稍后会自动重试</span>');
@@ -508,7 +543,7 @@
   }
 
   /* ---------------- 本机 broker 地址（可选） ----------------
-   * 默认用管理页「APP 登录与 MQTT 地址配置」里的地址（SAS 也按它接入）。
+   * 默认用管理页「MQTT 地址配置」里的地址（SAS 也按它接入）。
    * 现场"不是所有机子的 broker 都在同一个地方"，所以允许在这里单独指定；
    * 留空即回到那个全局设置。
    */
@@ -535,7 +570,34 @@
     });
   }
 
+  /* 对外公布的本机 broker 地址（别人连我用这个；留空 = 对端按名册地址连） */
+  function saveAdvertise(btn) {
+    var host = ($('br-adv-host').value || '').trim();
+    var port = ($('br-adv-port').value || '').trim();
+    var msg = $('br-adv-msg');
+    if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+    post('/api/bridge/config', {
+      advertise_broker: host,                       // 空串 = 不公布
+      advertise_broker_port: port ? Number(port) : null
+    }).then(function (d) {
+      var c = d.config || {};
+      if (msg) {
+        msg.textContent = host
+          ? ('已公布：别人将用 ' + host + ':' + (c.advertise_broker_port || 1883) + ' 连本机 broker')
+          : '已取消公布（对方按名册地址连）';
+      }
+      return load();
+    }).catch(function (e) {
+      if (msg) msg.textContent = '保存失败：' + (e && e.message ? e.message : e);
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = '保存对外地址'; }
+    });
+  }
+
   /* ---------------- 事件绑定 ---------------- */
+  if ($('br-adv-save')) {
+    $('br-adv-save').addEventListener('click', function () { saveAdvertise(this); });
+  }
   if ($('br-broker-save')) {
     $('br-broker-save').addEventListener('click', function () { saveBroker(this); });
   }

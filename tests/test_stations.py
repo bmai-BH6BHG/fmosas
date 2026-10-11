@@ -305,33 +305,16 @@ class StationScanTests(unittest.TestCase):
         self.assertEqual([], kept)
         self.assertEqual(0, summary["total"])
 
-    def test_scan_route_registered_and_admin_only(self):
+    def test_scan_moved_to_master(self):
+        """需求4：FMO 台站扫描功能上移总系统 —— 分系统不再有扫描 API，
+        fmo_aprs 模块保留（桥接的 MQTT 探测凭证工具仍从它导入）。"""
         src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
-        self.assertIn("'/api/fus/stations/scan'", src)
-        self.assertIn("_handle_fmo_stations_scan", src)
-        block = src.split("PUBLIC_GET_PATHS", 1)[1].split(")", 1)[0]
-        self.assertNotIn("stations/scan", block)
-
-    def test_scan_api_used_by_page(self):
-        js = open(os.path.join(ROOT, "admin", "stations.js"),
-                  encoding="utf-8").read()
-        self.assertIn("/api/fus/stations/scan", js)
-        self.assertIn("continuous", js)      # 不限时持续扫描
-
-    def test_page_has_scan_button(self):
-        html = open(os.path.join(ROOT, "admin", "stations.html"),
-                    encoding="utf-8").read()
-        self.assertIn("st-scan", html)
-        self.assertIn("持续扫描", html)
-
-    def test_page_hides_unreachable_stations(self):
-        """用户要求：进不去的不显示。"""
-        html = open(os.path.join(ROOT, "admin", "stations.html"),
-                    encoding="utf-8").read()
-        self.assertIn("不显示", html)
-        js = open(os.path.join(ROOT, "admin", "stations.js"),
-                  encoding="utf-8").read()
-        self.assertIn("进不去的已隐藏", js)
+        self.assertNotIn("/api/fus/stations/scan", src)
+        self.assertNotIn("_handle_fmo_stations_scan", src)
+        # 模块能力仍在（master 也用同一套实现）
+        src = open(os.path.join(ROOT, "fmo_aprs.py"), encoding="utf-8").read()
+        self.assertIn("scan_now", src)
+        self.assertIn("probe_station_login", src)
 
     def test_aprs_module_discovers_stations(self):
         """台站来自 APRS 扫描，不是数据库。"""
@@ -439,46 +422,35 @@ class StationScanTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-class StationPageTests(unittest.TestCase):
-    def test_page_and_assets_exist(self):
+class StationPageRemovedTests(unittest.TestCase):
+    """需求4：分系统的台站页/入口/API 全部移除（功能上移总系统）。"""
+
+    def test_page_and_assets_removed(self):
         for f in ("stations.html", "stations.js"):
             p = os.path.join(ROOT, "admin", f)
-            self.assertTrue(os.path.exists(p), "缺少 %s" % f)
+            self.assertFalse(os.path.exists(p), "%s 应已删除（功能上移总系统）" % f)
 
-    def test_page_is_self_contained(self):
-        html = open(os.path.join(ROOT, "admin", "stations.html"),
-                    encoding="utf-8").read()
-        self.assertNotIn("https://", html)
-        self.assertIn("/admin/bas.css", html)
-        self.assertIn("/admin/stations.js", html)
-
-    def test_portal_links_to_stations(self):
+    def test_portal_no_longer_links_stations(self):
         html = open(os.path.join(ROOT, "admin", "portal.html"),
                     encoding="utf-8").read()
-        self.assertIn('href="/admin/stations"', html)
-        self.assertIn("FMO 台站", html)
+        self.assertNotIn('href="/admin/stations"', html)
 
-    def test_route_registered(self):
+    def test_route_and_api_removed(self):
         src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
-        self.assertIn("'/admin/stations'", src)
-        self.assertIn("/api/fus/stations", src)
-        self.assertIn("_handle_fmo_stations", src)
+        self.assertNotIn("'/admin/stations'", src)
+        self.assertNotIn("/api/fus/stations", src)
+        self.assertNotIn("_handle_fmo_stations", src)
+        self.assertNotIn("aprs_store", src)
+        self.assertNotIn("aprs_collector", src)
 
-    def test_api_not_exposed_on_public_port(self):
-        """站点目录含全网拓扑与用户数，只在管理口。"""
-        src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
-        block = src.split("PUBLIC_GET_PATHS", 1)[1].split(")", 1)[0]
-        self.assertNotIn("/api/fus/stations", block)
-        self.assertNotIn("/admin/stations", block)
-
-    def test_shipped_by_build_script(self):
-        """新模块不进打包清单 → 出的包里缺文件，站点页会 503。"""
+    def test_build_script_no_longer_requires_station_page(self):
         src = open(os.path.join(ROOT, "build_release.sh"), encoding="utf-8").read()
-        self.assertIn("fmo_stations.py", src)
-        self.assertIn("admin/stations.html", src)
+        self.assertNotIn('admin/stations.html"', src)
+        # fmo_aprs.py 仍要随包发布（桥接依赖它的探测凭证工具）
+        self.assertIn("fmo_aprs.py", src)
 
     def test_static_asset_route_guards_traversal(self):
-        """站点页要能取到 stations.js，但静态资源路由必须挡住目录穿越。"""
+        """站点页要能取到 admin 静态资源，但静态资源路由必须挡住目录穿越。"""
         src = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
         self.assertIn("_serve_admin_asset", src)
         handler = src.split("def _serve_admin_asset", 1)[1].split("    def ", 1)[0]

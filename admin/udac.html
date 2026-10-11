@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UDAC · 统一动态授权与信任控制中心</title>
+<link rel="stylesheet" href="/admin/bas.css">
+<style>
+  /* UDAC 主色用暖沙色（区别于 SAS 青色 / FAS 橙色 / 桥接琥珀，且不刺眼） */
+  :root { --udac: #c2a878; }
+  main { max-width: 1280px; margin: 0 auto; }
+  .ud-sec {
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--udac);
+    border-radius: 10px; padding: 14px 16px; margin: 12px 0;
+  }
+  .ud-sec h2 {
+    margin: 0 0 10px; font-size: 15px; font-weight: 700;
+    color: var(--text); display: flex; align-items: center; gap: 8px;
+  }
+  .ud-sec h2 .muted { font-size: 12px; font-weight: 400; }
+
+  /* 概览卡片 */
+  .ud-stats {
+    display: grid; gap: 12px; margin: 12px 0;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  }
+  .ud-stat {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px; position: relative; overflow: hidden;
+  }
+  .ud-stat::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+    background: linear-gradient(90deg, transparent, var(--tint, var(--udac)), transparent);
+  }
+  .ud-stat .k { font-size: 12px; color: var(--muted); }
+  .ud-stat .v { font-size: 22px; font-weight: 800; color: var(--text); margin-top: 2px; }
+  .ud-stat .s { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  /* 信任分布四色条 */
+  .ud-dist { display: flex; height: 14px; border-radius: 7px; overflow: hidden; margin: 8px 0 4px; background: var(--panel2); }
+  .ud-dist i { display: block; height: 100%; transition: width .4s ease; }
+  .ud-dist-leg { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .ud-dist-leg b { color: var(--text); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: baseline; }
+  .dot.normal  { background: var(--ok); }
+  .dot.watch   { background: var(--warn); }
+  .dot.alert   { background: #f97316; }
+  .dot.danger  { background: var(--danger); }
+
+  /* 表格 */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+  td.mono, .mono { font-family: ui-monospace, Consolas, monospace; color: var(--accent); }
+  tr:hover td { background: rgba(194, 168, 120, .05); }
+
+  /* 徽章 */
+  .pill {
+    display: inline-block; font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .pill.allow      { color: var(--ok); border-color: var(--ok); background: rgba(34,197,94,.10); font-weight: 600; }
+  .pill.rate_limit { color: var(--warn); border-color: rgba(245,158,11,.6); }
+  .pill.degrade, .pill.step_up { color: #f97316; border-color: #f97316; }
+  .pill.deny, .pill.disconnect, .pill.quarantine { color: var(--danger); border-color: var(--danger); background: rgba(239,68,68,.10); font-weight: 600; }
+  .pill.normal { color: var(--ok); border-color: var(--ok); }
+  .pill.watch  { color: var(--warn); border-color: rgba(245,158,11,.6); }
+  .pill.alert  { color: #f97316; border-color: #f97316; }
+  .pill.danger { color: var(--danger); border-color: var(--danger); }
+  .pill.active    { color: var(--ok); border-color: var(--ok); }
+  .pill.grayscale { color: var(--warn); border-color: rgba(245,158,11,.6); }
+  .pill.deprecated{ color: var(--muted); }
+
+  /* 健康度 kv */
+  .ud-kv { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+  .ud-kv > span { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+  .ud-kv b { color: var(--text); font-weight: 600; }
+  .ud-kv .mono { color: var(--accent); }
+
+  /* 表单 */
+  .ud-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .ud-form label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+  .ud-form input, .ud-form select, .ud-form textarea {
+    padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--text); font-size: 13px;
+  }
+  .ud-form textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12px; min-height: 130px; resize: vertical; }
+  .ud-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .ud-actions .btn { font-size: 12.5px; }
+  .btn.udac { background: var(--udac); border-color: var(--udac); color: #1a1408; font-weight: 700; }
+  .btn.udac:hover { filter: brightness(1.1); }
+
+  pre.ud-json {
+    margin: 8px 0 0; padding: 10px 12px; border-radius: 8px;
+    background: var(--panel2); border: 1px solid var(--line);
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    color: var(--accent); overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .ud-note { font-size: 12px; color: var(--muted); line-height: 1.8; margin: 6px 0 0; }
+  .ud-note b { color: var(--text); }
+
+  .empty { padding: 18px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; font-size: 12.5px; line-height: 2; }
+  .ev-type { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--udac); }
+  .ev-scan { color: var(--warn); font-weight: 700; }
+
+  @media (max-width: 640px) {
+    .ud-stats { grid-template-columns: 1fr 1fr; }
+    th, td { padding: 6px 7px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">UDAC <span class="muted">统一动态授权与信任控制中心 · 已认证实体现在能做什么、还能不能继续信</span></div>
+  <div class="top-right">
+    <span class="badge" id="ud-p99">P99 —</span>
+    <span class="badge" id="ud-ver">策略 v—</span>
+    <button class="btn ghost" id="ud-reload">刷新</button>
+    <a class="btn ghost" href="/admin">← 返回门户</a>
+  </div>
+</header>
+
+<main>
+  <p class="muted small" style="margin:6px 0 0;">
+    SAS 判「身份是否可信」，FAS 判「认证与审计」，桥接管「互通」——<b>UDAC 判「继续信任与否」</b>。
+    只读消费 SAS 证书状态与桥接健康度/音质，输出 0-100 信任分与动态授权决策；
+    新建接入 fail-closed，已建立会话不中断。
+  </p>
+
+  <!-- 概览 -->
+  <div class="ud-stats">
+    <div class="ud-stat" style="--tint: var(--ok)">
+      <div class="k">信任分布 · 正常 (80-100)</div>
+      <div class="v" id="ud-n-normal">—</div>
+      <div class="s">允许全部授权操作</div>
+    </div>
+    <div class="ud-stat" style="--tint: var(--warn)">
+      <div class="k">信任分布 · 观察 (60-79)</div>
+      <div class="v" id="ud-n-watch">—</div>
+      <div class="s">限流监控</div>
+    </div>
+    <div class="ud-stat" style="--tint: #f97316">
+      <div class="k">信任分布 · 警戒 (40-59)</div>
+      <div class="v" id="ud-n-alert">—</div>
+      <div class="s">二次认证 / 降权</div>
+    </div>
+    <div class="ud-stat" style="--tint: var(--danger)">
+      <div class="k">信任分布 · 危险 (0-39)</div>
+      <div class="v" id="ud-n-danger">—</div>
+      <div class="s">拒绝 / 断连 / 隔离</div>
+    </div>
+  </div>
+  <div class="ud-sec">
+    <h2>信任分布 <span class="muted">trust_snapshot 快照</span></h2>
+    <div class="ud-dist">
+      <i id="ud-bar-normal"  style="background: var(--ok)"></i>
+      <i id="ud-bar-watch"   style="background: var(--warn)"></i>
+      <i id="ud-bar-alert"   style="background: #f97316"></i>
+      <i id="ud-bar-danger"  style="background: var(--danger)"></i>
+    </div>
+    <div class="ud-dist-leg" id="ud-dist-leg">—</div>
+  </div>
+
+  <!-- 桥接健康与音质（信任评分的环境输入） -->
+  <div class="ud-sec">
+    <h2>桥接健康度与音质 <span class="muted">信任评分的环境维度输入（MOS≥3.5 · 抖动&lt;30ms）</span></h2>
+    <div class="ud-kv" id="ud-bridge">—</div>
+  </div>
+
+  <!-- 信任排行 -->
+  <div class="ud-sec">
+    <h2>台站信任排行
+      <span class="muted">本地视角 · 随同步上报汇总到总系统形成全局排行</span>
+      <span style="flex:1"></span>
+      <button class="btn udac" id="ud-rescan">重算全量</button>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>呼号</th><th>信任分</th><th>等级</th><th>更新时间</th></tr></thead>
+        <tbody id="ud-rank"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 最近决策 -->
+  <div class="ud-sec">
+    <h2>最近决策 <span class="muted">只记 UDAC 决策与风控特征，原始审计归 FAS</span></h2>
+    <div class="muted small" style="margin:6px 0 10px;">
+      <span style="font-size:11px;padding:1px 6px;border-radius:6px;background:rgba(16,185,129,.15);color:#10b981;">直通</span>
+      = MQTT 互联桥接流量：<b>不评分、不受策略门控与 fail-closed 影响，直接通过</b>
+      （桥接是 FUS 内部组件之间的语音互通，身份已由证书链 + 集群名片双重校验）。
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>呼号</th><th>动作</th><th>信任分</th><th>延迟</th><th>策略版本</th><th>原因</th></tr></thead>
+        <tbody id="ud-dec"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 策略管理 -->
+  <div class="ud-sec">
+    <h2>策略管理 <span class="muted">策略即代码 · 版本化 / 灰度 / 回滚 / 仿真 · PDP fail-closed</span></h2>
+    <div class="ud-note">
+      当前生效：<b id="ud-cur-desc">—</b>
+      <pre class="ud-json" id="ud-cur-def">加载中…</pre>
+    </div>
+    <div class="ud-note" style="margin-top:12px;"><b>发布新策略版本</b>（先灰度 → 观察决策 → 转正；出问题一键回滚）</div>
+    <div class="ud-form" style="margin-top:8px;">
+      <label style="grid-column: 1 / -1;">策略定义（JSON：name / subject{callsign_prefix} / action / scope / conditions{trust_min, mos_min, jitter_max, hour_from, hour_to} / effect）
+        <textarea id="ud-p-def" spellcheck="false">{
+  "name": "low-trust-step-up",
+  "description": "信任分低于 60 的连接要求二次认证",
+  "subject": {},
+  "action": "*",
+  "scope": "local",
+  "conditions": { "trust_min": 0 },
+  "effect": "by_trust_score",
+  "priority": 100
+}</textarea>
+      </label>
+      <label>灰度百分比（0-100，按呼号稳定哈希分流）<input type="number" id="ud-p-gray" value="0" min="0" max="100"></label>
+      <label>备注<input type="text" id="ud-p-note" placeholder="为什么改策略（留痕）"></label>
+    </div>
+    <div class="ud-actions">
+      <button class="btn udac" id="ud-p-publish">发布新版本</button>
+      <button class="btn ghost" id="ud-p-simulate">仿真试运行</button>
+    </div>
+    <div class="ud-note" style="margin-top:10px;"><b>版本历史</b></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>版本</th><th>状态</th><th>灰度</th><th>发布人</th><th>时间</th><th>备注</th><th>操作</th></tr></thead>
+        <tbody id="ud-p-vers"><tr><td colspan="7" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
+    <div class="ud-note" style="margin-top:10px;"><b>策略仿真</b>（不写审计；给一组上下文看决策结果）</div>
+    <div class="ud-form" style="margin-top:8px;">
+      <label>呼号<input type="text" id="ud-s-cs" placeholder="BG5ESN"></label>
+      <label>模拟信任分<input type="number" id="ud-s-score" value="55" min="0" max="100"></label>
+      <label>指定版本（留空=当前）<input type="number" id="ud-s-ver" placeholder="如 3"></label>
+    </div>
+    <div class="ud-actions"><button class="btn ghost" id="ud-s-run">运行仿真</button></div>
+    <pre class="ud-json" id="ud-s-out" style="display:none;"></pre>
+  </div>
+
+  <!-- 事件日志 -->
+  <div class="ud-sec">
+    <h2>事件日志 <span class="muted">只追加 · udac.*（含总系统全量扫描触发联动）</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>内容</th></tr></thead>
+        <tbody id="ud-ev"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script src="/admin/udac.js"></script>
+</body>
+</html>

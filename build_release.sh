@@ -173,7 +173,10 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
 done
 [ -e "$REPO/admin/index.html" ] || die "缺少必需文件: admin/index.html"
 [ -e "$REPO/admin/portal.html" ] || die "缺少必需文件: admin/portal.html（FUS 门户）"
-[ -e "$REPO/admin/stations.html" ] || die "缺少必需文件: admin/stations.html（FMO 站点页）"
+[ -e "$REPO/admin/udac.html" ] || die "缺少必需文件: admin/udac.html（UDAC 管理页）"
+[ -e "$REPO/admin/udac.js" ] || die "缺少必需文件: admin/udac.js"
+[ -e "$REPO/udac.py" ] || die "缺少必需文件: udac.py（UDAC 中心，FUS 第四组件）"
+# 需求4：admin/stations.html 已删除 —— FMO 台站扫描上移总系统，分系统不再有此页
 for S in install.sh uninstall.sh upgrade.sh build_release.sh; do
     if ! bash -n "$REPO/$S"; then
         die "$S 语法检查未通过（bash -n）"
@@ -220,7 +223,7 @@ copy_path() {
 # 代码（契约必须包含）
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
-         fmo_stations.py fmo_aprs.py bridge.py fix_bridge_acl.sh; do
+         fmo_stations.py fmo_aprs.py bridge.py udac.py fix_bridge_acl.sh; do
     copy_path "$F" 1
 done
 # BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）

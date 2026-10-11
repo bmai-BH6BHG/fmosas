@@ -723,91 +723,13 @@
 
 <!-- ============ 顶部导航栏 ============ -->
 <div class="nav-bar">
-    <div class="nav-tab active" data-page="register">注册系统</div>
-    <div class="nav-tab" data-page="sas">SAS 配置</div>
+    <div class="nav-tab active" data-page="sas">SAS 配置</div>
     <div class="nav-tab" data-page="monitor">语音监控</div>
     <a class="nav-tab nav-back" href="/admin" title="返回 FUS 门户（SAS / FAS 入口）" style="text-decoration:none;color:inherit;">← 返回门户</a>
 </div>
 
-<!-- ============ 页面：注册系统（现有内容） ============ -->
-<div id="page-register" class="page">
-<div class="container">
-    <!-- APP 登录地址配置 -->
-    <div class="reg-form-wrap">
-        <h2>📱 APP 登录与 MQTT 地址配置</h2>
-        <div class="reg-row">
-            <label style="min-width:100px;color:#6c7a96;">登录域名</label>
-            <input type="text" id="cfg-app-domain" placeholder="例如 register.example.com">
-        </div>
-        <div class="reg-row">
-            <label style="min-width:100px;color:#6c7a96;">端口</label>
-            <input type="text" id="cfg-app-port" placeholder="例如 35928" style="flex:0.3;min-width:80px;">
-            <label style="color:#6c7a96;display:flex;align-items:center;gap:6px;">
-                <input type="checkbox" id="cfg-use-port" checked> 地址中包含端口
-            </label>
-            <button id="cfg-save-btn">保存配置</button>
-        </div>
-        <div class="reg-row">
-            <label style="min-width:100px;color:#6c7a96;">APP 登录地址</label>
-            <span id="cfg-preview" style="color:#00e5ff;font-size:16px;font-weight:bold;">未配置</span>
-        </div>
-        <div class="reg-row">
-            <label style="min-width:100px;color:#6c7a96;">MQTT 地址</label>
-            <input type="text" id="cfg-mqtt-host" placeholder="例如 127.0.0.1 或 broker.example.com">
-            <input type="text" id="cfg-mqtt-port" placeholder="1883" style="flex:0.3;min-width:80px;">
-        </div>
-        <div class="reg-row">
-            <span style="color:#5a6a86;font-size:12px;">保存后此地址自动上报总系统，作为总系统分系统卡片与 APP 服务器列表中本机的地址，无需手改 config.json。MQTT 为语音/信标抄收连接地址，保存后立即重连生效。</span>
-        </div>
-        <div id="cfg-result"></div>
-    </div>
-
-    <!-- 手动注册表单 -->
-    <div class="reg-form-wrap">
-        <h2>手动添加用户</h2>
-        <form id="reg-form" enctype="multipart/form-data">
-            <div class="reg-row">
-                <input type="text" id="reg-name" name="name" placeholder="姓名" required>
-                <input type="text" id="reg-callsign" name="callsign" placeholder="呼号" required>
-                <input type="text" id="reg-phone" name="phone" placeholder="手机号" required>
-                <input type="password" id="reg-password" name="password" placeholder="密码" required>
-            </div>
-            <div class="reg-row">
-                <label class="file-label">操作证书 <input type="file" name="cert_photo" accept="image/*"></label>
-                <label class="file-label">设备证书 <input type="file" name="device_cert" accept="image/*"></label>
-                <button type="submit" id="reg-btn">添加用户</button>
-            </div>
-        </form>
-        <div id="reg-result"></div>
-    </div>
-
-    <div class="table-wrap">
-        <table>
-            <thead>
-                <tr>
-                    <th style="width:50px;">ID</th>
-                    <th>姓名</th>
-                    <th>呼号</th>
-                    <th>手机号</th>
-                    <th>注册时间</th>
-                    <th>最后心跳</th>
-                    <th>状态</th>
-                    <th>证书</th>
-                    <th>操作</th>
-                    <th>操作证书</th>
-                    <th>设备证书</th>
-                </tr>
-            </thead>
-            <tbody id="user-tbody">
-                <tr><td colspan="11" class="empty">加载中...</td></tr>
-            </tbody>
-        </table>
-    </div>
-</div>
-</div>
-
 <!-- ============ 页面：SAS 配置 ============ -->
-<div id="page-sas" class="page" style="display:none;">
+<div id="page-sas" class="page">
 <div class="container">
 
     <!-- 模块A：CA 管理 -->
@@ -954,6 +876,42 @@
             <div id="mon-beacons" class="mon-beacons"><span style="color:#6c7a96;">暂无信标</span></div>
         </div>
     </div>
+
+    <!-- MQTT 地址配置（需求1：从原「APP 登录」流程迁到这里；不再有 APP 登录入口） -->
+    <div class="reg-form-wrap" style="margin-top:22px;">
+        <h2>📡 MQTT 地址配置</h2>
+        <div class="reg-row">
+            <label style="min-width:110px;color:#6c7a96;">MQTT 地址</label>
+            <input type="text" id="mon-mqtt-host" placeholder="例如 127.0.0.1 或 broker.example.com">
+            <input type="text" id="mon-mqtt-port" placeholder="1883" style="flex:0.3;min-width:80px;">
+            <button id="mon-mqtt-save">保存并重连</button>
+        </div>
+        <div class="reg-row">
+            <span style="color:#5a6a86;font-size:12px;">
+                语音/信标抄收与互联桥接都按这个地址连本机 broker；保存后立即重连生效。
+            </span>
+        </div>
+        <div id="mon-mqtt-result"></div>
+    </div>
+
+    <!-- 上报地址（自动）：需求1 —— 本机扫描公网 IP 后直接上报，不用手填、不用点保存 -->
+    <div class="reg-form-wrap">
+        <h2>🌐 上报地址（自动）
+            <span style="font-size:12px;color:#6c7a96;">总系统看到的我 = 下面这个地址</span>
+        </h2>
+        <div class="reg-row">
+            <label style="min-width:110px;color:#6c7a96;">当前地址</label>
+            <span id="mon-addr-cur" style="color:#00e5ff;font-size:16px;font-weight:bold;">扫描中…</span>
+            <button class="sas-btn ghost" id="mon-addr-scan">重新扫描并上报</button>
+        </div>
+        <div class="reg-row">
+            <span style="color:#5a6a86;font-size:12px;">
+                打开本页会自动扫描本机公网 IP 并直接上报总系统（无需填写、无需保存）。
+                扫描以"总系统实际看到的来源 IP"为准，最准。
+            </span>
+        </div>
+        <div id="mon-addr-result"></div>
+    </div>
 </div>
 </div>
 
@@ -1009,6 +967,12 @@ function loadData() {
             var users = data.users || [];
             var onlineCount = 0;
             var tbody = document.getElementById('user-tbody');
+            // ★ 注册系统页已上移总系统：这里只更新头部统计，别再碰用户表
+            if (!tbody) {
+                document.getElementById('stat-total').textContent = users.length;
+                document.getElementById('stat-online').textContent = onlineCount;
+                return;
+            }
             if (users.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无注册用户</td></tr>';
             } else {
@@ -1047,7 +1011,8 @@ function loadData() {
             document.getElementById('stat-online').textContent = onlineCount;
         })
         .catch(err => {
-            document.getElementById('user-tbody').innerHTML = '<tr><td colspan="11" class="empty">加载失败: ' + esc(err) + '</tr>';
+            var tb = document.getElementById('user-tbody');
+            if (tb) tb.innerHTML = '<tr><td colspan="11" class="empty">加载失败: ' + esc(err) + '</tr>';
         });
 }
 
@@ -1094,89 +1059,95 @@ async function downloadCertBundle(callsign) {
     }
 }
 
-// ==================== APP 登录地址配置 ====================
-function updateConfigPreview() {
-    var domain = document.getElementById('cfg-app-domain').value.trim();
-    var port = document.getElementById('cfg-app-port').value.trim();
-    var usePort = document.getElementById('cfg-use-port').checked;
-    var preview = document.getElementById('cfg-preview');
-    if (!domain) {
-        preview.textContent = '未配置';
-        preview.style.color = '#ff4d6d';
-        return;
-    }
-    var url = domain;
-    if (usePort && port) {
-        url = domain + ':' + port;
-    }
-    preview.textContent = url;
-    preview.style.color = '#00e5ff';
-}
-
-function loadConfig() {
+// ==================== MQTT 地址配置（原 APP 登录流程 → 迁到语音监控） ====================
+function loadMonitorCfg() {
     fetch('/api/config')
         .then(r => r.json())
         .then(data => {
             if (!data.ok) return;
             var cfg = data.config || {};
-            document.getElementById('cfg-app-domain').value = cfg.app_domain || '';
-            document.getElementById('cfg-app-port').value = cfg.app_port || '';
-            document.getElementById('cfg-use-port').checked = cfg.app_use_port !== false;
-            document.getElementById('cfg-mqtt-host').value = cfg.mqtt_host || '';
-            document.getElementById('cfg-mqtt-port').value = cfg.mqtt_port || '';
-            updateConfigPreview();
+            var h = document.getElementById('mon-mqtt-host');
+            var p = document.getElementById('mon-mqtt-port');
+            if (h) h.value = cfg.mqtt_host || '';
+            if (p) p.value = cfg.mqtt_port || '';
         })
         .catch(err => console.log('加载配置失败:', err));
 }
 
-document.getElementById('cfg-save-btn').addEventListener('click', async () => {
-    var btn = document.getElementById('cfg-save-btn');
-    var result = document.getElementById('cfg-result');
-    var data = {
-        app_domain: document.getElementById('cfg-app-domain').value.trim(),
-        app_port: parseInt(document.getElementById('cfg-app-port').value.trim()) || null,
-        app_use_port: document.getElementById('cfg-use-port').checked,
-        mqtt_host: document.getElementById('cfg-mqtt-host').value.trim(),
-        mqtt_port: parseInt(document.getElementById('cfg-mqtt-port').value.trim()) || null
-    };
-    btn.disabled = true;
-    btn.textContent = '保存中...';
+(function () {
+    var btn = document.getElementById('mon-mqtt-save');
+    if (!btn) return;
+    btn.addEventListener('click', async function () {
+        var result = document.getElementById('mon-mqtt-result');
+        btn.disabled = true;
+        btn.textContent = '保存中...';
+        try {
+            var resp = await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    mqtt_host: document.getElementById('mon-mqtt-host').value.trim(),
+                    mqtt_port: parseInt(document.getElementById('mon-mqtt-port').value.trim()) || null
+                })
+            });
+            var res = await resp.json();
+            result.className = res.ok ? 'ok' : 'err';
+            result.textContent = res.ok ? '已保存，正在重连 broker' : (res.error || '保存失败');
+        } catch (err) {
+            result.className = 'err';
+            result.textContent = '请求失败: ' + err.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '保存并重连';
+        }
+    });
+})();
+
+// ==================== 上报地址（自动扫描 + 直接上报） ====================
+// 需求1：取消"填写上报地址 → 保存 → 再上传"，改成扫到就直接报，后台也定时自动跑。
+async function scanAddress(manual) {
+    var cur = document.getElementById('mon-addr-cur');
+    var result = document.getElementById('mon-addr-result');
+    var btn = document.getElementById('mon-addr-scan');
+    if (btn) { btn.disabled = true; btn.textContent = '扫描中…'; }
     try {
-        var resp = await fetch('/api/config', {
+        var resp = await fetch('/api/config/auto-address', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data)
+            body: JSON.stringify({})
         });
         var res = await resp.json();
         if (res.ok) {
-            result.className = 'ok';
-            result.textContent = '配置已保存';
-            updateConfigPreview();
+            if (cur) cur.textContent = res.address || '未识别';
+            if (result) {
+                result.className = 'ok';
+                result.textContent = '已自动上报：' + (res.address || '')
+                    + (res.source ? '（来源：' + res.source + '）' : '');
+            }
         } else {
-            result.className = 'err';
-            result.textContent = res.error || '保存失败';
+            if (cur) cur.textContent = '未识别';
+            if (result) {
+                result.className = 'err';
+                result.textContent = res.error || '扫描失败';
+            }
         }
-    } catch (err) {
-        result.className = 'err';
-        result.textContent = '请求失败: ' + err.message;
+    } catch (e) {
+        if (result) { result.className = 'err'; result.textContent = '扫描失败: ' + e.message; }
     } finally {
-        btn.disabled = false;
-        btn.textContent = '保存配置';
+        if (btn) { btn.disabled = false; btn.textContent = '重新扫描并上报'; }
     }
-});
-
-// 配置输入变化时实时更新预览
-['cfg-app-domain', 'cfg-app-port', 'cfg-use-port'].forEach(id => {
-    var el = document.getElementById(id);
-    el.addEventListener('input', updateConfigPreview);
-    el.addEventListener('change', updateConfigPreview);
-});
+}
+(function () {
+    var btn = document.getElementById('mon-addr-scan');
+    if (btn) btn.addEventListener('click', function () { scanAddress(true); });
+})();
 
 // ==================== 初始化 ====================
 
 // 初始加载
 loadData();
-loadConfig();
+loadMonitorCfg();
+scanAddress(false);        // 打开页面即自动扫描公网 IP 并直接上报（需求1）
 // 每 5 秒刷新
 setInterval(loadData, 5000);
 

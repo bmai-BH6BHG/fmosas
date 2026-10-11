@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MQTT 互联桥接测试（集群模型）
@@ -1214,6 +1214,28 @@ class FUSClusterTests(unittest.TestCase):
         api = self._read("api_server.py")
         self.assertIn("engine.bridge_state_source", api)
         self.assertIn("_BRIDGE.live_state()", api)
+
+    def test_rc5_hint_depends_on_direction(self):
+        """
+        ★★ rc=5 的提示必须分方向。
+
+        现场：桥接页「本机 broker 连接：连接失败」下面却写着
+        "对端不认我方证书 —— 让它把总系统下发的信任背书落进 trust_chain" ——
+        那是**对端**场景的文案。本机 broker 被拒完全是另一回事：
+        broker 多半不在这个地址上（配置页那个 MQTT 地址是给外部/APP 用的，
+        走公网或隧道时客户端证书会被丢掉）→ 应当建议填 127.0.0.1:1883。
+        文案说错方向会把人带偏，所以这里钉住。
+        """
+        import inspect
+        src = inspect.getsource(Mb.MqttMiniClient.__init__)
+        self.assertIn('target', src)
+        conn = inspect.getsource(Mb.MqttMiniClient)
+        self.assertIn('本机 broker 不认我们的监控证书', conn)
+        self.assertIn('_target', conn)
+        self.assertIn('127.0.0.1:1883', conn)
+        # 桥接的本机连接必须声明自己是"本机"
+        br = self._read("bridge.py")
+        self.assertIn('target="本机"', br)
 
     def test_ui_has_cluster_selector(self):
         html = self._read("admin/bridge.html")

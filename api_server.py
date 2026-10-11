@@ -108,14 +108,9 @@ except Exception as _e_st:
     _STATIONS_AVAILABLE = False
     print("[INIT] fmo_stations 模块加载失败（站点目录不可用）: %s" % _e_st)
 
-# ==================== APRS 台站发现（FMO 台站只能从 APRS-IS 扫）====================
-try:
-    import fmo_aprs
-    _APRS_AVAILABLE = True
-except Exception as _e_aprs:
-    fmo_aprs = None
-    _APRS_AVAILABLE = False
-    print("[INIT] fmo_aprs 模块加载失败（APRS 台站发现不可用）: %s" % _e_aprs)
+# ==================== APRS 台站发现（需求4：已上移总系统）====================
+# 分系统不再扫描/展示 FMO 台站；fmo_aprs.py 模块保留，桥接仍从它导入
+# MQTT 探测凭证工具（build_probe_credentials / load_probe_cert）。
 
 # ==================== MQTT 互联桥接（FUS 之间语音互传，无主）====================
 try:
@@ -128,6 +123,20 @@ except Exception as _e_br:
     print("[INIT] bridge 模块加载失败（MQTT 互联不可用）: %s" % _e_br)
 
 _BRIDGE = None          # 桥接服务单例（main() 里创建）
+
+# ==================== UDAC（统一动态授权与信任控制中心）====================
+# FUS 第四组件：SAS 判"身份可信"，FAS 判"认证与审计"，桥接管"互通"，
+# UDAC 判"已认证实体现在能做什么、还能不能继续信"。只读消费 SAS 证书
+# 状态与桥接健康度/音质，输出信任评分与动态授权决策（详见 udac.py）。
+try:
+    import udac as _udac
+    _UDAC_AVAILABLE = True
+except Exception as _e_udac:
+    _udac = None
+    _UDAC_AVAILABLE = False
+    print("[INIT] udac 模块加载失败（UDAC 不可用）: %s" % _e_udac)
+
+_UDAC = None            # UDAC 中心单例（main() 里创建）
 
 # ==================== 全局配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -402,6 +411,18 @@ def init_sync_service():
             # 上报里的 cluster / cluster_joined 直接读**实时状态**，不与配置字典绑定
             engine.bridge_state_source = lambda: (
                 _BRIDGE.live_state() if _BRIDGE is not None else {})
+            # ★ 上报地址（需求1）也实时取：引擎手里的 config 是浅拷贝，
+            #   顶层标量会冻在启动那一刻，自动扫描改了地址传不进去。
+            engine.address_source = _live_report_address
+            # ★ UDAC 台站信任排行随同步上报带给总系统（全局台站信任排行的数据源）
+            engine.udac_ranking_source = lambda: (
+                _UDAC.ranking_payload(20) if _UDAC is not None else None)
+            # ★ 总系统随拉取下发的 UDAC 事件 → 喂给本机 UDAC 中心
+            engine.udac_event_sink = lambda ev: (
+                _UDAC.handle_fullscan_triggered(ev.get('payload') or ev)
+                if (_UDAC is not None and isinstance(ev, dict)
+                    and str(ev.get('type') or '') == 'cert.fullscan.triggered')
+                else None)
         except Exception:  # noqa: BLE001
             pass
         engine.start()
@@ -1088,6 +1109,207 @@ def _fetch_master_clusters():
     return [], '；'.join('%s → %s' % (t['url'], t['error']) for t in tried[-2:]), tried
 
 
+def _is_public_ip(ip):
+    """是不是公网 IP（本机扫到的地址必须是公网 IP，内网/回环对 APP 与对端都没用）。"""
+    try:
+        from ipaddress import ip_address
+        a = ip_address(str(ip or "").strip())
+        return not (a.is_private or a.is_loopback or a.is_link_local
+                    or a.is_multicast or a.is_reserved or a.is_unspecified)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# UDAC 决策线程池：认证主链路绝不能被 UDAC 拖住
+_UDAC_POOL = None
+_UDAC_POOL_LOCK = threading.Lock()
+
+
+def _udac_enforce_bounded(action, callsign, clientid='', peerhost='',
+                          app_verified='', app_exempt='', timeout=0.45):
+    """
+    带超时的 UDAC 策略执行。
+
+    ★ 为什么必须有：EMQX 调本服务 /auth 时有等待窗口；UDAC 若因库锁/全量重算卡住
+      2~3 秒，EMQX 等不到响应就判连接失败 —— 表现就是**桥接本机连接 CONNACK 超时、
+      老是连不上**（真实踩过）。这里给硬超时：超时/池满就按"UDAC 本次未参与"继续，
+      认证主链路照常放行（UDAC 是增强，不该成为单点故障）。
+    返回 enforce 结果 dict；超时/异常返回 None。
+    """
+    c = _UDAC
+    if c is None:
+        return None
+    global _UDAC_POOL
+    try:
+        with _UDAC_POOL_LOCK:
+            if _UDAC_POOL is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _UDAC_POOL = ThreadPoolExecutor(max_workers=4,
+                                                thread_name_prefix='udac-pep')
+            pool = _UDAC_POOL
+        fut = pool.submit(c.enforce, action, callsign, clientid, peerhost,
+                          app_verified, app_exempt)
+        return fut.result(timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        print("[AUTH] UDAC 决策超时/异常，本次按未参与处理（不影响认证）: %s" % e)
+        return None
+
+
+def start_udac_ranking_loop(stop_event=None, interval=300.0):
+    """
+    后台定时刷新 UDAC 排行快照。
+
+    ★ 页面请求只读快照（ranking(recalc=False)）—— 否则每几秒一次的全量重算会把
+      库锁死、接口 60 秒超时、整页卡死（真实踩过）。
+    """
+    stop_event = stop_event or threading.Event()
+
+    def _loop():
+        stop_event.wait(25.0)
+        while not stop_event.is_set():
+            try:
+                c = _UDAC
+                if c is not None:
+                    c.recalc_ranking(200)
+            except Exception as e:  # noqa: BLE001
+                print("[UDAC] 排行快照刷新失败: %s" % e)
+            if stop_event.wait(interval):
+                break
+
+    t = threading.Thread(target=_loop, name="udac-ranking", daemon=True)
+    t.start()
+    return t
+
+
+def _live_report_address():
+    """
+    实时算"报给总系统的本机地址"（需求1）。
+
+    ★ 必须实时算：同步引擎手里是 `dict(CONFIG)` 的浅拷贝，app_domain/app_port
+      这种顶层标量在引擎构造那一刻就被冻住了；需求1 的自动扫描改了配置也传不进去，
+      结果总系统一直记着旧地址（实测：配置已是 117.57.55.106，
+      总系统 api_url 还是 http://127.0.0.1:35928）。
+    """
+    try:
+        app_domain = str((CONFIG or {}).get('app_domain') or '').strip()
+        app_port = (CONFIG or {}).get('app_port')
+        app_use_port = (CONFIG or {}).get('app_use_port', True)
+        if app_domain:
+            if app_use_port and app_port:
+                return {'api_url': 'http://%s:%s' % (app_domain, app_port),
+                        'domain': app_domain}
+            return {'api_url': 'http://%s' % app_domain, 'domain': app_domain}
+        return {'api_url': str((CONFIG or {}).get('api_url') or ''),
+                'domain': str((CONFIG or {}).get('domain') or '')}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _master_observed_ip(timeout=8):
+    """
+    问总系统"你看到的我是什么 IP" —— 这是**最准的本机公网地址**。
+
+    ★ 这里**只能走 master_url**，绝不能先试 127.0.0.1：
+      "来源 IP"是总系统从**这条连接**上看到的地址；走 127.0.0.1 去问，
+      它看到的永远是 127.0.0.1，写进上报地址就把 APP 和对端全带偏了（真实踩过）。
+      拿到值后还必须校验是公网 IP，否则一律不采信。
+
+    返回 (ip, 来源说明)。
+    """
+    master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
+    if not master:
+        return '', ''
+    try:
+        req = urllib.request.Request(master + '/api/myip',
+                                     headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            d = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+        ip = str(d.get('ip') or '').strip()
+        if ip and _is_public_ip(ip):
+            return ip, '总系统看到的来源 IP'
+        if ip:
+            print("[CONFIG] 总系统看到的来源 IP 不是公网地址（%s），不采用" % ip)
+    except Exception as e:  # noqa: BLE001
+        print("[CONFIG] 问总系统公网 IP 失败: %s" % e)
+    for svc in ('https://api.ipify.org', 'https://ifconfig.me/ip'):
+        try:
+            req = urllib.request.Request(svc, headers={'User-Agent': 'FUS'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                ip = resp.read().decode('utf-8', 'replace').strip()
+            if _is_public_ip(ip):
+                return ip, '外部回显服务'
+        except Exception:  # noqa: BLE001
+            continue
+    return '', ''
+
+def auto_apply_public_address(force_report=False):
+    """
+    需求1：上报地址自动化。
+
+    扫本机公网 IP → **直接写进配置并上报总系统**，不再有"填写地址 → 保存 → 再上传"
+    的三步流程。地址没变就什么都不做（幂等）。
+
+    返回 {ok, address, source, changed} 或 {ok: False, error}。
+    """
+    ip, source = _master_observed_ip()
+    if not ip:
+        return {'ok': False, 'error': '没扫到公网 IP（总系统不可达，外部回显也不通）'}
+    try:
+        port = int(CONFIG.get('app_port') or CONFIG.get('port') or PORT)
+    except (TypeError, ValueError):
+        port = PORT
+    old = str(CONFIG.get('app_domain') or '').strip()
+    try:
+        old_port = int(CONFIG.get('app_port') or 0)
+    except (TypeError, ValueError):
+        old_port = 0
+    changed = (old != ip) or (old_port != port) or (CONFIG.get('app_use_port') is False)
+    if not changed and not force_report:
+        return {'ok': True, 'address': '%s:%d' % (ip, port),
+                'source': source, 'changed': False}
+    CONFIG['app_domain'] = ip
+    CONFIG['app_port'] = port
+    CONFIG['app_use_port'] = True
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'error': '保存配置失败: %s' % e}
+    print("[CONFIG] 上报地址自动更新: %s → %s:%d（来源：%s）"
+          % (old or '(空)', ip, port, source))
+    # 立刻上报：总系统那边马上按新地址显示，不用等下一个上报周期
+    try:
+        eng = _SYNC_ENGINE
+        if eng is not None:
+            eng.report_to_master(full=False)
+    except Exception as e:  # noqa: BLE001
+        print("[CONFIG] 自动上报失败（下个周期会补上）: %s" % e)
+    return {'ok': True, 'address': '%s:%d' % (ip, port),
+            'source': source, 'changed': True}
+
+
+def start_auto_address_loop(stop_event=None, interval=600.0):
+    """
+    后台自动扫公网 IP 并上报（需求1：完全不用人工）。
+    启动约 20 秒后先扫一次，之后每 interval 秒扫一次；地址变了才写盘 + 上报。
+    """
+    stop_event = stop_event or threading.Event()
+
+    def _loop():
+        stop_event.wait(20.0)
+        while not stop_event.is_set():
+            try:
+                auto_apply_public_address()
+            except Exception as e:  # noqa: BLE001
+                print("[CONFIG] 自动上报地址失败: %s" % e)
+            if stop_event.wait(interval):
+                break
+
+    t = threading.Thread(target=_loop, name="auto-address", daemon=True)
+    t.start()
+    return t
+
+
 def _roster_fetch():
     """真正去总服务器拉一次（只在后台线程里调用）。返回 (ok, data)。"""
     master = str((CONFIG or {}).get('master_url') or '').rstrip('/')
@@ -1134,19 +1356,37 @@ def _roster_fetch():
                 addr = str(s.get('address') or '').strip()
                 if not addr:
                     continue
-                # address 形如 "fmo.fmrs.cn:35928"（分系统 API 口）→ 取主机名；
-                # MQTT 口按默认 1883（EMQX 默认）；非默认口可用「手动补充」覆盖。
+                # ★ 对端的 MQTT 地址优先用**它自己上报的** mqtt_host/mqtt_port：
+                #   名册里那个 address 是它的 HTTP API 口，MQTT 口不一定是 1883。
+                #   真实场景：有的分系统挂在公网隧道后面（HTTP 走一个端口、
+                #   MQTT 走另一个端口），硬拼 1883 会连到错的地方，表现就是
+                #   "对端一直在连、但始终连不上"。
+                mh = ''.join(ch for ch in str(s.get('mqtt_host') or '')
+                             if ch.isprintable()).strip()
+                mp = s.get('mqtt_port')
+                try:
+                    mp = int(mp) if mp else 0
+                except (TypeError, ValueError):
+                    mp = 0
+                # ★ 回环地址不能用：那是"对端自己连自己"的地址，拿到这边连它只会
+                #   连到**我们自己的本机**（等于没连，还会把本机 broker 搞乱）。
+                #   对方没好好填时宁可回退到"名册 HTTP 主机 + 1883"。
+                if mh.lower() in ('127.0.0.1', 'localhost', '::1', '0.0.0.0'):
+                    mh = ''
+                # HTTP 名册地址形如 "fmo.fmrs.cn:35928" → 取主机名
                 host = addr.split('/')[0].split('@')[-1]
                 if host.count(':') == 1:
                     host = host.split(':')[0]
                 host = host.strip()
+                if mh:
+                    host = mh
                 if not host:
                     continue
                 name = ''.join(ch for ch in str(s.get('name') or '')
                                if ch.isprintable()).strip()
                 out.append({
                     'host': host,
-                    'port': 1883,
+                    'port': mp if (mh and 1 <= mp <= 65535) else 1883,
                     'name': name or str(s.get('subsystem_id') or host),
                     'subsystem_id': str(s.get('subsystem_id') or '').strip(),
                     'online': bool(s.get('online')),
@@ -1621,12 +1861,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if path in ('/admin/sas', '/admin/sas/', '/admin/sas/index.html'):
             self._serve_admin_page()
             return
-        if path in ('/admin/stations', '/admin/stations/',
-                    '/admin/stations/index.html'):
-            self._serve_admin_file('stations.html')
-            return
         if path in ('/admin/bridge', '/admin/bridge/', '/admin/bridge/index.html'):
             self._serve_admin_file('bridge.html')
+            return
+        if path in ('/admin/udac', '/admin/udac/', '/admin/udac/index.html'):
+            self._serve_admin_file('udac.html')
             return
         if path == '/admin/index.html':
             self.send_response(302)
@@ -1797,6 +2036,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.handle_set_config()
             return
 
+        # 需求1：上报地址自动化（本机扫公网 IP 直接上报，不用手填/保存）
+        if path == '/api/config/auto-address':
+            self.handle_auto_address()
+            return
+
         self.send_json({'ok': False, 'error': '路径不存在'}, 404)
 
     # ---------- 管理后台页面 ----------
@@ -1871,6 +2115,27 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 'mqtt_port': mon.get('mqtt_port', 1883)
             }
         })
+
+    # ---------- API：POST /api/config/auto-address ----------
+    def handle_auto_address(self):
+        """
+        需求1：上报地址自动化。
+
+        扫本机公网 IP（以"总系统看到的来源 IP"为准）→ 直接写配置并立即上报总系统。
+        取消原来的"填上报地址 → 点保存 → 再上传"三步。
+        """
+        try:
+            force = False
+            try:
+                raw = self.read_body()
+                if raw:
+                    force = bool(json.loads(raw.decode('utf-8')).get('force'))
+            except Exception:  # noqa: BLE001
+                force = False
+            res = auto_apply_public_address(force_report=force)
+            self.send_json(res, 200 if res.get('ok') else 502)
+        except Exception as e:  # noqa: BLE001
+            self.send_json({'ok': False, 'error': '自动地址处理异常: %s' % e}, 500)
 
     # ---------- API：POST /api/config ----------
     def handle_set_config(self):
@@ -2472,7 +2737,15 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                                      # （"不是所有机子的 broker 都在同一个地方"）
                                      broker=(body.get('broker', '__keep__')
                                              if 'broker' in body else '__keep__'),
-                                     broker_port=body.get('broker_port'))
+                                     broker_port=body.get('broker_port'),
+                                     # 对外公布的本机 broker 地址（别人连我用这个）
+                                     advertise=(body.get('advertise_broker', '__keep__')
+                                                if 'advertise_broker' in body
+                                                else '__keep__'),
+                                     advertise_port=body.get('advertise_broker_port'),
+                                     # 需求2：抖动缓冲 / keepalive 运行时可调
+                                     jitter_buffer_ms=body.get('jitter_buffer_ms'),
+                                     keepalive_s=body.get('keepalive_s'))
                 if cfg.get('enabled'):
                     svc.start()      # 之前可能处于禁用状态，这里把连接线程拉起来
                 # 加入/退出集群要**立刻**让总系统知道：总系统的集群成员数只统计已加入的，
@@ -2539,12 +2812,7 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'POST' and path == '/auth':
                 self._handle_sas_auth()
                 return True
-            if method == 'GET' and path == '/api/fus/stations':
-                self._handle_fmo_stations()
-                return True
-            if method == 'POST' and path == '/api/fus/stations/scan':
-                self._handle_fmo_stations_scan()
-                return True
+            # 需求4：FMO 台站 API 已上移总系统，分系统不再提供
             if method == 'POST' and path == '/api/cert/bind':
                 self._handle_cert_bind()
                 return True
@@ -2598,6 +2866,30 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'POST' and path == '/api/sas/config':
                 self._handle_sas_config_set()
                 return True
+            # ---- UDAC 管理接口（统一动态授权与信任控制中心）----
+            if method == 'GET' and path == '/api/udac/status':
+                self._handle_udac_status(); return True
+            if method == 'GET' and path == '/api/udac/decisions':
+                self._handle_udac_decisions(); return True
+            if method == 'GET' and path == '/api/udac/ranking':
+                self._handle_udac_ranking(); return True
+            if method == 'GET' and path == '/api/udac/events':
+                self._handle_udac_events(); return True
+            if method == 'GET' and path == '/api/udac/policy':
+                self._handle_udac_policy_get(); return True
+            if method == 'POST' and path == '/api/udac/policy':
+                self._handle_udac_policy_publish(); return True
+            if method == 'POST' and path == '/api/udac/policy/promote':
+                self._handle_udac_policy_promote(); return True
+            if method == 'POST' and path == '/api/udac/policy/rollback':
+                self._handle_udac_policy_rollback(); return True
+            if method == 'POST' and path == '/api/udac/policy/simulate':
+                self._handle_udac_policy_simulate(); return True
+            if method == 'POST' and path == '/api/udac/rescan':
+                self._handle_udac_rescan(); return True
+            # 总系统全量扫描触发通知（内部接口，公网口不暴露）
+            if method == 'POST' and path == '/api/udac/events':
+                self._handle_udac_event_post(); return True
         except Exception as e:
             # 兜底：任何 SAS 处理异常都返回 500，不让进程崩溃
             try:
@@ -2720,6 +3012,46 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                         _note_bridge_inbound(str(clientid)[len('FMO-BRIDGE-'):])
                 except Exception:  # noqa: BLE001
                     pass
+                # ---- UDAC PEP（动态授权）：SAS 判完"身份可信"，
+                #      UDAC 判"现在还能不能继续信"。评分 → PDP（fail-closed）
+                #      → 动作映射到 EMQX 认证响应/客户端属性。
+                try:
+                    if _UDAC is not None:
+                        attrs2 = result.setdefault('client_attrs', {})
+                        # 带超时：UDAC 慢/卡时不能让 /auth 等太久（EMQX 会判失败）
+                        _ud = _udac_enforce_bounded(
+                            'mqtt.connect', str(attrs.get('callsign') or username),
+                            clientid=clientid, peerhost=peerhost,
+                            app_verified=str(attrs2.get('app_verified', '')),
+                            app_exempt=str(attrs2.get('app_exempt', '')))
+                        try:
+                            _UDAC.note_auth(str(attrs.get('callsign') or username),
+                                            clientid, peerhost, ok=True)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        act = (_ud or {}).get('action') or 'allow'
+                        # deny/disconnect/quarantine → 直接拒绝（新建接入失败关闭）
+                        if act in ('deny', 'disconnect', 'quarantine'):
+                            print("[AUTH] UDAC %s: callsign=%s 分=%.1f 原因=%s"
+                                  % (act, attrs.get('callsign'),
+                                     (_ud or {}).get('score', 0),
+                                     '; '.join(_ud.get('reasons', [])[:2])))
+                            self.send_json({
+                                'result': 'deny',
+                                'reason': 'UDAC 信任控制: %s'
+                                          % '; '.join((_ud or {}).get('reasons', [])[:2]),
+                            })
+                            return
+                        # 降权/限流/二次认证 → 挂 client_attrs，EMQX 侧可据此限权
+                        if act in ('rate_limit', 'degrade', 'step_up'):
+                            attrs2['udac_action'] = act
+                            attrs2['udac_score'] = '%.1f' % _ud.get('score', 0)
+                            print("[AUTH] UDAC %s: callsign=%s 分=%.1f"
+                                  % (act, attrs.get('callsign'), (_ud or {}).get('score', 0)))
+                except Exception as _e_udac_pep:  # noqa: BLE001
+                    # PEP 挂了不能影响认证主链路（fail-open 仅限"审计/标注"，
+                    # 拒绝路径在 enforce 内部已 fail-closed）
+                    print("[AUTH] UDAC PEP 异常（不影响认证）: %s" % _e_udac_pep)
                 print("[AUTH] 通过: callsign=%s uid=%s app_verified=%s(%s) clientid=%s" % (
                     attrs.get('callsign'), attrs.get('uid'),
                     attrs.get('app_verified'), attrs.get('app_sig'), clientid or '-'))
@@ -2760,6 +3092,12 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                                      peerhost or '-'))
                 except Exception as _e_rec:  # noqa: BLE001
                     print("[AUTH] 拒绝事件记录失败（不影响认证）: %s" % _e_rec)
+                # UDAC：失败也喂行为基线（失败频率本身就是风控特征）
+                try:
+                    if _UDAC is not None:
+                        _UDAC.note_auth(username, clientid, peerhost, ok=False)
+                except Exception:  # noqa: BLE001
+                    pass
                 _t("record_reject")
             self.send_json(result)
             _t("send_json")
@@ -2770,6 +3108,143 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             _t("send_exc")
             if _tr:
                 _auth_trace_write(_T, "exception")
+
+    # ---------- UDAC 管理接口 ----------
+    def _require_udac(self):
+        """UDAC 可用性检查；不可用时已回复 503，调用方直接 return"""
+        if not _UDAC_AVAILABLE or _UDAC is None:
+            self.send_json({'ok': False, 'error': 'UDAC 未启用（udac 模块不可用）'}, 503)
+            return False
+        return True
+
+    def _handle_udac_status(self):
+        """GET /api/udac/status —— 仪表盘总览（信任分布/P99/桥接健康/音质/策略版本）"""
+        if not self._require_udac():
+            return
+        self.send_json(_UDAC.status())
+
+    def _handle_udac_decisions(self):
+        """GET /api/udac/decisions?limit= —— 最近决策审计"""
+        if not self._require_udac():
+            return
+        try:
+            limit = int(self.path.split('limit=')[1].split('&')[0])
+        except (IndexError, ValueError):
+            limit = 100
+        self.send_json({'ok': True, 'decisions': _UDAC.decisions(min(limit, 500))})
+
+    def _handle_udac_ranking(self):
+        """GET /api/udac/ranking —— 台站信任排行（本机视角，先重算再返回）"""
+        if not self._require_udac():
+            return
+        try:
+            limit = int(self.path.split('limit=')[1].split('&')[0])
+        except (IndexError, ValueError):
+            limit = 50
+        self.send_json({'ok': True, 'ranking': _UDAC.ranking(min(limit, 200))})
+
+    def _handle_udac_events(self):
+        """GET /api/udac/events —— 只追加事件日志（udac.*）"""
+        if not self._require_udac():
+            return
+        try:
+            limit = int(self.path.split('limit=')[1].split('&')[0])
+        except (IndexError, ValueError):
+            limit = 100
+        self.send_json({'ok': True, 'events': _UDAC.events(min(limit, 500))})
+
+    def _handle_udac_policy_get(self):
+        """GET /api/udac/policy —— 当前策略 + 版本历史"""
+        if not self._require_udac():
+            return
+        self.send_json({'ok': True, 'current': _UDAC.policy.current(),
+                        'versions': _UDAC.policy.versions()})
+
+    def _handle_udac_policy_publish(self):
+        """POST /api/udac/policy —— 发布新策略版本（JSON definition + 灰度%）"""
+        if not self._require_udac():
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        ok, res = _UDAC.policy.publish(
+            body.get('definition'), gray_percent=body.get('gray_percent', 0),
+            created_by=str(body.get('created_by') or 'admin'),
+            note=str(body.get('note') or ''))
+        if ok:
+            self.send_json({'ok': True, 'version': res})
+        else:
+            self.send_json({'ok': False, 'error': res}, 400)
+
+    def _handle_udac_policy_promote(self):
+        """POST /api/udac/policy/promote —— 灰度版本转正"""
+        if not self._require_udac():
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        ok, res = _UDAC.policy.promote(body.get('version'))
+        self.send_json({'ok': ok, 'version': res} if ok
+                       else {'ok': False, 'error': res}, 200 if ok else 400)
+
+    def _handle_udac_policy_rollback(self):
+        """POST /api/udac/policy/rollback —— 回滚到历史版本"""
+        if not self._require_udac():
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        ok, res = _UDAC.policy.rollback(body.get('version'))
+        self.send_json({'ok': ok, 'version': res} if ok
+                       else {'ok': False, 'error': res}, 200 if ok else 400)
+
+    def _handle_udac_policy_simulate(self):
+        """POST /api/udac/policy/simulate —— 策略仿真（试运行，不写审计）"""
+        if not self._require_udac():
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        ctx = {
+            'callsign': str(body.get('callsign') or ''),
+            'clientid': str(body.get('clientid') or ''),
+            'action': str(body.get('action') or 'mqtt.connect'),
+            'app_verified': str(body.get('app_verified', '')),
+            'trust_score': float(body.get('trust_score') or 0),
+            'bridge_health': _UDAC._bridge_health_dict(),
+            'audio': _UDAC._audio_dict(),
+        }
+        ver = body.get('version')
+        try:
+            ver = int(ver) if ver else None
+        except (TypeError, ValueError):
+            ver = None
+        # 仿真顺带给出演示用信任分（现场调策略时最直观）
+        demo = _UDAC.trust.score_for(ctx['callsign']) if ctx['callsign'] else None
+        self.send_json({'ok': True, 'simulate': _UDAC.policy.simulate(ctx, version=ver),
+                        'context': ctx, 'demo_trust': demo})
+
+    def _handle_udac_rescan(self):
+        """POST /api/udac/rescan —— 手动重算全量信任分快照"""
+        if not self._require_udac():
+            return
+        rows = _UDAC.recalc_ranking(limit=500)
+        self.send_json({'ok': True, 'count': len(rows),
+                        'ranking': rows[:100]})
+
+    def _handle_udac_event_post(self):
+        """POST /api/udac/events —— 内部事件接收（总系统全量扫描触发通知等）"""
+        if not self._require_udac():
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        etype = str(body.get('type') or '')
+        if etype == 'cert.fullscan.triggered':
+            self.send_json({'ok': True, 'result': _UDAC.handle_fullscan_triggered(body)})
+        else:
+            _UDAC.record_event(etype or 'udac.custom', body.get('payload'))
+            self.send_json({'ok': True})
 
     # ---------- POST /api/cert/bind（国服 ID 绑定） ----------
     def _handle_cert_bind(self):
@@ -3300,69 +3775,8 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         print("[CA] 根证书已被下载：%s fp=%s（根证书是公开信息，私钥不外发）"
               % (payload['ca_name'], payload['fingerprint'][:24]))
 
-    # ---------- GET /api/fus/stations ----------
-    def _handle_fmo_stations(self):
-        """
-        FMO 台站目录（APRS 扫描 + 可进入性探测）。
-
-        **FMO 台站不在任何数据库里**，是各站在 APRS-IS 上广播的站点名片
-        （FMO-V4,STATION 报文）。常驻采集线程长期累积 → 才能攒到几百个。
-
-        默认 only_enterable=1：只显示**探测过、且确实能进入**的台站
-        （能进 = 该台站的 MQTT broker 对 CONNECT 回了 CONNACK）。进不去的不显示。
-        带 ?all=1 可看全部（排障用）。
-        """
-        if not _APRS_AVAILABLE:
-            self.send_json({'ok': False,
-                            'error': 'fmo_aprs 模块不可用'}, 503)
-            return
-        store = getattr(self.__class__, 'aprs_store', None)
-        coll = getattr(self.__class__, 'aprs_collector', None)
-        if store is None:
-            self.send_json({'ok': False,
-                            'error': 'APRS 台站台账未初始化'}, 503)
-            return
-        qs = parse_qs(urlparse(self.path).query)
-        only_enterable = str((qs.get('all') or [''])[0]).lower() not in (
-            '1', 'true', 'yes')
-        self.send_json(fmo_aprs.build_aprs_station_payload(
-            store, coll, CONFIG, only_enterable=only_enterable))
-
-    # ---------- POST /api/fus/stations/scan ----------
-    def _handle_fmo_stations_scan(self):
-        """
-        启动/触发台站扫描。**不限时**：常驻采集器一直在听 APRS，
-        发现新台站立刻用本机证书真实登录探测。这里只做两件事：
-          1) 保证采集线程活着（死了拉起来）
-          2) 立刻对现有台账做一轮全量重探
-        然后**立即返回**当前结果（不阻塞等扫描），页面自己轮询看增长。
-        """
-        if not _APRS_AVAILABLE:
-            self.send_json({'ok': False,
-                            'error': 'fmo_aprs 模块不可用'}, 503)
-            return
-        store = getattr(self.__class__, 'aprs_store', None)
-        coll = getattr(self.__class__, 'aprs_collector', None)
-        if store is None:
-            self.send_json({'ok': False,
-                            'error': 'APRS 台站台账未初始化'}, 503)
-            return
-        restarted = False
-        swept = 0
-        if coll is not None:
-            restarted = coll.ensure_running()
-            try:
-                # 不清空台账、不强制全量重探：只挑「没探过/很久没探」的补探一批
-                swept = coll.sweep(force=True, min_interval=0)
-            except Exception as e:  # noqa: BLE001
-                print("[APRS] 补探提交失败: %s" % e)
-        payload = fmo_aprs.build_aprs_station_payload(
-            store, coll, CONFIG, only_enterable=True)
-        payload['scan'] = {'continuous': True, 'restarted': restarted,
-                           'swept': swept, 'total': store.count()}
-        print("[APRS] 扫描已启动（不限时）: 台账 %d，本轮重探 %d，线程重启=%s"
-              % (store.count(), swept, restarted))
-        self.send_json(payload)
+    # 需求4：FMO 台站扫描的界面与 API 已整体上移总系统，
+    # 分系统不再提供（历史处理器已删除）。
 
     # ---------- POST /api/ca/init ----------
     def _handle_sas_ca_init(self):
@@ -3684,48 +4098,28 @@ def main():
     else:
         print("[INIT] 互联桥接: 未启用（bridge 模块不可用）")
 
-    # ---- 初始化 APRS 台站采集线程（FMO 台站不在库里，只能从 APRS-IS 累积）----
-    # 台站广播有周期，短听只有个位数；常驻累积才能攒到几百个。
-    aprs_store, aprs_collector = None, None
-    if _APRS_AVAILABLE:
+    # ---- 需求4：APRS 台站采集已上移总系统（master 自带 APRS 扫描）----
+    # 分系统不再常驻采集/探测 FMO 台站，也不再注入相关类属性。
+
+    # ---- 初始化 UDAC（统一动态授权与信任控制中心，FUS 第四组件）----
+    # 只读消费：SAS 证书状态（身份维度）、桥接健康度/音质（环境维度）。
+    global _UDAC
+    if _UDAC_AVAILABLE:
         try:
-            aprs_store = fmo_aprs.AprsStationStore(BASE_DIR)
-            aprs_collector = fmo_aprs.AprsCollector(aprs_store, logger=print,
-                                                    base_dir=BASE_DIR)
-            # 登记「自己」：探测时跳过，避免拿自己的证书反复连自家 broker
-            # （真实事故：探自己把本机监控的 MQTT 连接挤掉 → 看起来像服务断联）
-            _self_hosts = [str(CONFIG.get('app_domain') or ''),
-                           str(CONFIG.get('domain') or ''),
-                           'localhost', '127.0.0.1']
-            try:
-                _self_hosts.append(socket.gethostbyname(socket.gethostname()))
-            except Exception:  # noqa: BLE001
-                pass
-            # master_url / api_url 里的域名也算自己（本机对外可能有好几个名字）
-            for _key in ('master_url', 'api_url'):
-                _u = str(CONFIG.get(_key) or '')
-                if '://' in _u:
-                    _u = _u.split('://', 1)[1]
-                _self_hosts.append(_u.split('/')[0].split(':')[0])
-            _self_cs = []
-            try:
-                if monitor is not None and getattr(monitor, 'stations', None):
-                    for _st in monitor.stations():
-                        if _st.get('callsign'):
-                            _self_cs.append(_st['callsign'])
-            except Exception:  # noqa: BLE001
-                pass
-            # 本机自己的站点名片呼号（BH6BHG）；APRS 上是带 SSID 的 BH6BHG-15，
-            # fmo_aprs.base_callsign() 会归一化后再比对
-            aprs_collector.set_self(hosts=_self_hosts, callsigns=_self_cs)
-            aprs_collector.start()
-            print("[INIT] APRS 台站采集: 已启动（%s:%d），台账现有 %d 个台站"
-                  % (fmo_aprs.APRS_HOST, fmo_aprs.APRS_PORT, aprs_store.count()))
+            _UDAC = _udac.UDACCenter(
+                BASE_DIR, logger=print,
+                cert_lookup=(lambda cs: sas_db.get_latest_certificate_by_callsign(cs))
+                            if sas_db is not None else None,
+                bridge_source=(lambda: _BRIDGE.status() if _BRIDGE is not None else None),
+                callsigns_source=(lambda: [r['callsign'] for r in sas_db.list_certificates(1000)])
+                                  if sas_db is not None else None)
+            ApiHandler.udac_center = _UDAC
+            print("[INIT] UDAC 已启动: %s（/admin/udac）" % _UDAC.db_path)
         except Exception as e:
-            print("[INIT] APRS 台站采集启动失败: %s" % e)
-            aprs_collector = None
+            print("[INIT] UDAC 启动失败: %s" % e)
+            _UDAC = None
     else:
-        print("[INIT] APRS 台站采集: 未启用（fmo_aprs 模块不可用）")
+        print("[INIT] UDAC: 未启用（udac 模块不可用）")
 
     # ---- 把 SAS / Sync / Monitor / BAS 对象注入 ApiHandler 类属性 ----
     ApiHandler.sas_db = sas_db
@@ -3733,8 +4127,6 @@ def main():
     ApiHandler.sas_config = sas_config
     ApiHandler.sync_engine = sync_engine  # SyncApiMixin 通过 self.__class__.sync_engine 访问
     ApiHandler.monitor = monitor
-    ApiHandler.aprs_store = aprs_store
-    ApiHandler.aprs_collector = aprs_collector
     ApiHandler.bas_http = bas_http
     ApiHandler.bas_service = bas_service
 
@@ -3746,6 +4138,18 @@ def main():
         _INBOUND_THREAD = start_inbound_probe(threading.Event())
     except Exception as e:  # noqa: BLE001
         print("[BRIDGE] 入向桥接探测线程启动失败: %s" % e)
+
+    # 需求1：上报地址自动化 —— 后台定期扫公网 IP 并直接上报（无需人工填写/保存）
+    try:
+        start_auto_address_loop()
+    except Exception as e:  # noqa: BLE001
+        print("[CONFIG] 自动地址线程启动失败: %s" % e)
+
+    # UDAC 排行快照后台刷新（页面只读快照，避免"每次请求全量重算"把库锁死）
+    try:
+        start_udac_ranking_loop()
+    except Exception as e:  # noqa: BLE001
+        print("[UDAC] 排行刷新线程启动失败: %s" % e)
 
     # 启动 HTTP 服务器（双端口：公网 API 口 + 内网管理口，管理口写死 = API 口 + 1）
     admin_port = port + 1
@@ -3776,12 +4180,15 @@ def main():
     print("  FUS 门户: http://内网IP:%d/admin" % admin_port)
     print("    ├─ SAS 系统（统一认证服务）: http://内网IP:%d/admin/sas" % admin_port)
     if bas_service is not None:
-        print("    └─ FAS 系统（统一审计服务）: http://内网IP:%d/admin/fus"
+        print("    ├─ FAS 系统（统一审计服务）: http://内网IP:%d/admin/fus"
               "  策略模式=%s" % (admin_port, bas_service.policy.mode()))
-        print("            EMQX 收数口: POST /api/ingest（X-Ingest-Token 自校验）")
-        print("            身份控制: %s" % ("启用" if bas_service.identity_control_enabled() else "关闭"))
+        print("    │    EMQX 收数口: POST /api/ingest（X-Ingest-Token 自校验）")
+        print("    │    身份控制: %s" % ("启用" if bas_service.identity_control_enabled() else "关闭"))
     else:
         print("  BAS 审计: 未启用")
+    if _UDAC is not None:
+        print("    └─ UDAC 系统（动态授权与信任控制）: http://内网IP:%d/admin/udac"
+              % admin_port)
     print("  数据库:   %s" % DB_PATH)
     print("  上传目录: %s" % UPLOAD_DIR)
     print("  在线判定: 最后心跳 %d 秒内为在线" % ONLINE_TIMEOUT)
