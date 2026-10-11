@@ -138,6 +138,17 @@
     var cur = j.cluster || j.default_cluster || '主集群';
     if ($('br-cluster-cur')) $('br-cluster-cur').textContent = cur;
 
+    // 本机 broker 地址 + 它从哪来（桥接设置 / SAS-MQTT 地址设置 / 默认值）
+    if ($('br-broker-cur')) {
+      $('br-broker-cur').textContent = j.broker || '—';
+      var src = j.broker_source || '';
+      $('br-broker-src').textContent = src ? '（来源：' + src + '）' : '';
+      // 只在用户没在编辑时回填，避免把正在输入的内容冲掉
+      var bh = $('br-broker-host'), bp = $('br-broker-port');
+      if (bh && document.activeElement !== bh) bh.value = j.broker_host || '';
+      if (bp && document.activeElement !== bp) bp.value = j.broker_port || '';
+    }
+
     var le = $('br-local-err');
     if (j.local_error) {
       le.textContent = '本机 broker：' + j.local_error;
@@ -496,7 +507,38 @@
     });
   }
 
+  /* ---------------- 本机 broker 地址（可选） ----------------
+   * 默认用管理页「APP 登录与 MQTT 地址配置」里的地址（SAS 也按它接入）。
+   * 现场"不是所有机子的 broker 都在同一个地方"，所以允许在这里单独指定；
+   * 留空即回到那个全局设置。
+   */
+  function saveBroker(btn) {
+    var host = ($('br-broker-host').value || '').trim();
+    var port = ($('br-broker-port').value || '').trim();
+    var msg = $('br-broker-msg');
+    if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+    post('/api/bridge/config', {
+      broker: host,                                  // 空串 = 回到 MQTT 地址设置
+      broker_port: port ? Number(port) : null
+    }).then(function (d) {
+      var c = d.config || {};
+      if (msg) {
+        msg.textContent = host
+          ? ('已指定本机 broker = ' + host + ':' + (c.broker_port || 1883))
+          : '已恢复为使用管理页「MQTT 地址」设置';
+      }
+      return load();
+    }).catch(function (e) {
+      if (msg) msg.textContent = '保存失败：' + (e && e.message ? e.message : e);
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = '保存 broker'; }
+    });
+  }
+
   /* ---------------- 事件绑定 ---------------- */
+  if ($('br-broker-save')) {
+    $('br-broker-save').addEventListener('click', function () { saveBroker(this); });
+  }
   if ($('br-cluster-apply')) {
     $('br-cluster-apply').addEventListener('click', function () { applyCluster(this); });
   }

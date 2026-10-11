@@ -2466,7 +2466,13 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                                      node_name=body.get('node_name'),
                                      channels=body.get('channels'),
                                      node_id=body.get('node_id'),
-                                     publish_local=body.get('publish_local'))
+                                     publish_local=body.get('publish_local'),
+                                     # broker 可选：不传 = 保持不变；传空串 = 回到
+                                     # "SAS/MQTT 地址设置"；传 host = 单独指定
+                                     # （"不是所有机子的 broker 都在同一个地方"）
+                                     broker=(body.get('broker', '__keep__')
+                                             if 'broker' in body else '__keep__'),
+                                     broker_port=body.get('broker_port'))
                 if cfg.get('enabled'):
                     svc.start()      # 之前可能处于禁用状态，这里把连接线程拉起来
                 # 加入/退出集群要**立刻**让总系统知道：总系统的集群成员数只统计已加入的，

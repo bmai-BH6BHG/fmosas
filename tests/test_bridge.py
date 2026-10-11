@@ -895,6 +895,84 @@ class ClusterTests(BridgeTestCase):
         self.assertIn("他证可以盖过", ms)
         self.assertIn('int(row["cluster_joined"] or 0)', ms)
 
+    def test_broker_address_resolution_and_override(self):
+        """
+        ★★ 现场问题：桥接页上的 broker 地址不对 —— "不是所有机子的 broker 都在同一个地方"。
+
+        原实现在 `__init__` 里取一次就固定：进程启动时 MQTT 地址还没配好（或后来在
+        配置页改了），桥接就一直用启动那一刻的旧值（默认 127.0.0.1:1883）。
+
+        现在必须：
+          * 每次现算（管理页改了 MQTT 地址 → 桥接跟着走）；
+          * 桥接自己能单独指定 broker（留空 = 回到 SAS/MQTT 地址设置）；
+          * 界面能看到这个地址是"从哪来的"。
+        """
+        # 1) 没配 MQTT 地址 → 默认值
+        #    注意：这里必须用**不带显式 broker** 的实例，否则测的是"调用方指定"那条路径
+        b = self._new_bridge_no_explicit()
+        host, port, src, _ = b._resolve_broker()
+        self.assertEqual(("127.0.0.1", 1883), (host, port))
+        self.assertIn("默认", src)
+
+        # 2) 配了 MQTT 地址（SAS/管理页那栏）→ 用它
+        b.config['monitor'] = {'mqtt_host': 'mqtt.example.com', 'mqtt_port': 1884}
+        host, port, src, changed = b._resolve_broker()
+        self.assertEqual(("mqtt.example.com", 1884), (host, port))
+        self.assertIn("SAS", src)
+        self.assertTrue(changed, "地址变了要能报出来，好让调用方重连")
+
+        # 3) 桥接自己指定 → 优先级最高
+        b.set_config(broker="10.0.0.9", broker_port=1885)
+        host, port, src, _ = b._resolve_broker()
+        self.assertEqual(("10.0.0.9", 1885), (host, port))
+        self.assertIn("桥接", src)
+
+        # 4) 留空 → 回到 MQTT 地址设置
+        b.set_config(broker="", broker_port=None)
+        host, port, src, _ = b._resolve_broker()
+        self.assertEqual(("mqtt.example.com", 1884), (host, port))
+        self.assertIn("SAS", src)
+
+        # 5) 落盘：broker 要写进配置（重启后还在）
+        saved = {}
+        b.save_fn = lambda cfg: saved.update(cfg)
+        b.set_config(broker="10.0.0.10", broker_port=1886)
+        self.assertEqual("10.0.0.10", (saved.get("bridge") or {}).get("broker"))
+        self.assertEqual(1886, (saved.get("bridge") or {}).get("broker_port"))
+
+        # 6) 状态里要能看出地址与来源
+        st = b.status()
+        self.assertIn("broker_source", st)
+        self.assertEqual("10.0.0.10", st.get("broker_host"))
+        self.assertEqual(1886, st.get("broker_port"))
+
+    def _new_bridge_no_explicit(self, node_id="sub-ME", **extra):
+        """
+        构造一个**不带显式 broker** 的桥接。
+
+        用于验证"broker 地址解析优先级"：走的是 `bridge.broker` →
+        `monitor.mqtt_host`（SAS/管理页那栏）→ 默认值 这条路。
+        （正常测试用的 new_bridge 会显式传 broker，那条路径优先级最高。）
+        """
+        cfg = {"subsystem_id": node_id, "monitor": {},
+               "bridge": {"enabled": False, "node_id": node_id,
+                          "node_name": node_id}}
+        cfg.update(extra)
+        svc = B.VoiceBridge(self.tmp, cfg, save_fn=lambda c: True, logger=None)
+        svc.credentials = lambda host, port: ("CALL", "pw")
+        self.bridges.append(svc)
+        return svc
+
+    def test_explicit_broker_argument_wins(self):
+        """调用方显式传进来的 broker（测试/嵌入部署）优先级最高，不被配置覆盖。"""
+        bk = self.new_broker()
+        b = self.new_bridge(bk, node_id="sub-ME")
+        self.assertEqual(("127.0.0.1", bk.port), (b.broker_host, b.broker_port))
+        b.config['monitor'] = {'mqtt_host': 'elsewhere', 'mqtt_port': 1883}
+        b._resolve_broker()
+        self.assertEqual(("127.0.0.1", bk.port), (b.broker_host, b.broker_port),
+                         "显式指定不该被配置里的 MQTT 地址顶掉")
+
     def test_member_ids_reports_confirmed_members(self):
         """
         ★ 本机要能报出"我确认到的集群成员"给总系统。
