@@ -354,8 +354,10 @@ fi
 [ -f "$SRC/api_server.py" ]        || die "安装包内缺少 api_server.py，包内容不完整"
 [ -f "$SRC/admin/index.html" ]     || die "安装包内缺少 admin/index.html，包内容不完整"
 [ -f "$SRC/admin/portal.html" ]    || die "安装包内缺少 admin/portal.html，包内容不完整"
+[ -f "$SRC/admin/udac.html" ]      || die "安装包内缺少 admin/udac.html，包内容不完整"
+[ -f "$SRC/udac.py" ]              || die "安装包内缺少 udac.py，包内容不完整"
 [ -f "$SRC/config.default.json" ]  || die "安装包内缺少 config.default.json，包内容不完整"
-say "包内容校验通过：api_server.py / admin/index.html / admin/portal.html / config.default.json"
+say "包内容校验通过：api_server.py / admin/index.html / admin/portal.html / admin/udac.html / udac.py / config.default.json"
 
 # ==========================================================================
 # 5/8 Python 依赖 cryptography
@@ -508,8 +510,37 @@ case "$PORT_STATUS" in
 esac
 ADMIN_PORT=$((PORT + 1))
 
+# ---- 6.4 服务器命名（需求1）：部署必须确认本服务器名称，不再默认"默认服务" ----
+# 首次部署（或仍是默认名）时询问；已有名字则沿用，不重复询问（升级场景）。
+SERVER_NAME_INPUT="${FMO_NAME:-}"
+EXISTING_NAME="$("$PY" - "$DIR/config.json" <<'PYEOF' 2>/dev/null
+import json, os, sys
+p = sys.argv[1]
+if os.path.exists(p):
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            print(str((json.load(f).get("name") or "").strip()))
+    except Exception:
+        pass
+PYEOF
+)"
+case "$EXISTING_NAME" in
+    ""|"FMO注册系统-默认"|"默认服务"|"FMO注册系统")
+        if [ -r /dev/tty ] && [ "${FMO_NONINTERACTIVE:-}" != "1" ]; then
+            printf '\n'
+            say "────────── 服务器命名 ──────────"
+            printf '请输入本服务器名称（展示在总系统名册，直接回车用主机名）：'
+            read -r SERVER_NAME_INPUT < /dev/tty || SERVER_NAME_INPUT=""
+        fi
+        [ -n "$SERVER_NAME_INPUT" ] || SERVER_NAME_INPUT="$(hostname 2>/dev/null | tr -d '\r' || true)"
+        [ -n "$SERVER_NAME_INPUT" ] || SERVER_NAME_INPUT="FMO-服务器"
+        say "服务器名称：$SERVER_NAME_INPUT（可随时在 config.json 的 name 字段修改）"
+        ;;
+    *) say "服务器名称：沿用已有「$EXISTING_NAME」（不重复询问）" ;;
+esac
+
 # ---- 6.3 生成 / 增量合并 config.json（绝不覆盖用户数据）----
-CFG_OUT="$("$PY" - "$DIR/config.json" "$SRC/config.default.json" "$PORT" "${FMO_DOMAIN:-}" "${FMO_MASTER:-}" <<'PYEOF'
+CFG_OUT="$("$PY" - "$DIR/config.json" "$SRC/config.default.json" "$PORT" "${FMO_DOMAIN:-}" "${FMO_MASTER:-}" "${SERVER_NAME_INPUT:-}" <<'PYEOF'
 import json, os, shutil, socket, sys, uuid
 
 cfg_path = sys.argv[1]
@@ -517,6 +548,7 @@ tpl_path = sys.argv[2]
 new_port = int(sys.argv[3])
 fmo_domain = (sys.argv[4] if len(sys.argv) > 4 else "").strip()
 fmo_master = (sys.argv[5] if len(sys.argv) > 5 else "").strip()
+fmo_name = (sys.argv[6] if len(sys.argv) > 6 else "").strip()
 
 PLACEHOLDER_DOMAINS = ("", "127.0.0.1", "localhost", "register.example.com")
 
@@ -603,6 +635,19 @@ cfg["port"] = new_port
 cfg["domain"] = domain
 cfg["api_url"] = "http://%s:%d" % (domain, new_port)
 
+# ---- 服务器命名（需求1）：不再默认"默认服务"，首次部署必须确认；已有名字保留 ----
+PLACEHOLDER_NAMES = ("", "FMO注册系统-默认", "默认服务", "FMO注册系统")
+old_name = str(cfg.get("name") or "").strip()
+name_source = "existing"
+if fmo_name:
+    cfg["name"] = fmo_name
+    name_source = "FMO_NAME"
+elif old_name in PLACEHOLDER_NAMES:
+    cfg["name"] = socket.gethostname() or "FMO-服务器"
+    name_source = "hostname"
+print("CFG_NAME=%s" % cfg["name"])
+print("CFG_NAME_SOURCE=%s" % name_source)
+
 # ---- master_url：仅在为空/默认时才写入 FMO_MASTER ----
 master_written = "no"
 if fmo_master:
@@ -666,6 +711,7 @@ cfg_val() { printf '%s\n' "$CFG_OUT" | sed -n "s/^$1=//p" | head -n 1 | tr -d '\
 CFG_STATUS="$(cfg_val CFG_STATUS)"
 [ -n "$CFG_STATUS" ] || die "config.json 合并过程异常（无输出）"
 say "config.json：$([ "$CFG_STATUS" = "created" ] && echo "新建（以包内 config.default.json 为模板）" || echo "原地增量更新（保留已有配置）")"
+say "  name       : $(cfg_val CFG_NAME)  [来源: $(cfg_val CFG_NAME_SOURCE)]"
 say "  domain     : $(cfg_val CFG_DOMAIN)  [来源: $(cfg_val CFG_DOMAIN_SOURCE)]"
 say "  api_url    : $(cfg_val CFG_API_URL)"
 say "  port       : $(cfg_val CFG_PORT)  管理口: $ADMIN_PORT"
@@ -714,6 +760,8 @@ else
     [ -f "$DIR/api_server.py" ] || die "同步后安装目录缺少 api_server.py"
     [ -f "$DIR/admin/index.html" ] || die "同步后安装目录缺少 admin/index.html"
     [ -f "$DIR/admin/portal.html" ] || die "同步后安装目录缺少 admin/portal.html（FUS 门户）"
+    [ -f "$DIR/admin/udac.html" ] || die "同步后安装目录缺少 admin/udac.html（UDAC 管理页）"
+    [ -f "$DIR/udac.py" ] || die "同步后安装目录缺少 udac.py"
     chmod +x "$DIR/start.sh" 2>/dev/null || true
     chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" 2>/dev/null || true
     say "源码已同步到：$DIR（config.json / *_users.db / *_sas.db / ca/ / uploads/ / roots/ 均未被覆盖）"
@@ -918,8 +966,8 @@ fi
 
 if [ "$HEALTH_OK" = 1 ]; then
     say "自检通过：$HEALTH_URL → $(printf '%s' "$BODY" | head -c 200)"
-    # FUS 各入口都要能出 HTML：门户 → SAS → FAS → 互联桥接
-    for _u in "/admin" "/admin/sas" "/admin/fus" "/admin/bridge"; do
+    # FUS 各入口都要能出 HTML：门户 → SAS → FAS → 互联桥接 → UDAC
+    for _u in "/admin" "/admin/sas" "/admin/fus" "/admin/bridge" "/admin/udac"; do
         _BODY="$(http_get "http://127.0.0.1:${ADMIN_PORT}${_u}" | head -c 4000 || true)"
         if printf '%s' "$_BODY" | grep -qi '<html\|<!doctype'; then
             say "  页面可访问：http://127.0.0.1:${ADMIN_PORT}${_u}"
@@ -954,6 +1002,7 @@ echo "  FUS 门户 : http://<本机IP>:$ADMIN_PORT/admin        （内网访问�
 echo "  SAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/sas"
 echo "  FAS 系统 : http://<本机IP>:$ADMIN_PORT/admin/fus"
 echo "  互联桥接 : http://<本机IP>:$ADMIN_PORT/admin/bridge  （与其他 FUS 系统语音互传，无主、可自选）"
+echo "  UDAC 系统 : http://<本机IP>:$ADMIN_PORT/admin/udac  （动态授权与信任控制中心）"
 echo "  健康检查 : $HEALTH_URL"
 echo "  配置文件 : $DIR/config.json"
 if [ "$SERVICE_STARTED" = 1 ]; then

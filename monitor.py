@@ -290,10 +290,13 @@ class MqttMiniClient:
     循环读取下行 PUBLISH 并回调。仅供监控订阅使用。"""
 
     def __init__(self, host, port, client_id, username=None, password=None,
-                 keepalive=60, on_message=None, read_timeout=5.0):
+                 keepalive=60, on_message=None, read_timeout=5.0, target="对端"):
         self.host = host
         self.port = int(port)
         self.client_id = client_id
+        # 这个连接连的是谁："本机" 还是 "对端"。只用于把 rc=5 的提示说对方向
+        # （两种情况的成因与处理完全不同，说错了会把人带偏）。
+        self._target = target
         self.username = username
         self.password = password
         self.keepalive = keepalive
@@ -308,6 +311,10 @@ class MqttMiniClient:
         self._pkt_id = 0
         # 最近一次 SUBACK（包号, 返回码列表）。订阅是否被对端 ACL 允许看它。
         self.last_suback = None
+        # 最近一次 PINGRESP 到达时刻（time.time()）。
+        # 需求2（桥接健康度）：上层在发 PINGREQ 前记下时间，收到 PINGRESP 后
+        # 用「到达 - 发出」算 RTT。默认 0 = 尚未收到过。
+        self.last_pingresp_at = 0.0
 
     # ---- 底层 ----
     def _recv_exact(self, n):
@@ -375,16 +382,29 @@ class MqttMiniClient:
         if len(resp[1]) < 2 or resp[1][1] != 0:
             rc = resp[1][1] if len(resp[1]) >= 2 else -1
             # 把 MQTT 的返回码翻译成"该去查什么"，别只丢一个数字让人猜。
-            hint = {
-                1: "协议版本不被接受",
-                2: "clientid 被对端拒绝",
-                3: "对端服务不可用",
-                4: "用户名或密码错误",
-                5: ("对端不认我方证书 —— 多半是它没把总系统下发的信任背书"
-                    "（trust_issued）落进自己的 sas.db.trust_chain："
-                    "确认它的同步在正常 pull；版本过旧（无 merge_trust_issued）"
-                    "或同步已停都会这样"),
-            }.get(rc, "")
+            # ★ rc=5 要分方向：连**对端** broker 被拒 = 对端不认我们；
+            #   连**本机** broker 被拒 = 本机 broker 不认我们的监控证书，
+            #   原因和处理完全不同（原来两种都用"对端"那套文案，会把人带偏）。
+            if rc == 5 and getattr(self, "_target", "对端") == "本机":
+                hint = ("本机 broker 不认我们的监控证书 —— 三种可能："
+                        "① broker 其实不在这个地址上（配置页那个 MQTT 地址是给外部/"
+                        "APP 用的，走公网或隧道时客户端证书常常被丢掉）→ 若 broker 就在"
+                        "本机，请在「互联桥接」页把【本机 broker 地址】填成 "
+                        "127.0.0.1:1883；"
+                        "② 本机 broker 的认证没接管到本服务（SAS 认证）→ 看 /admin/fus "
+                        "的 MQTT 认证接管；"
+                        "③ ca/monitor_cert.json 缺失或不是本机 CA 签发")
+            else:
+                hint = {
+                    1: "协议版本不被接受",
+                    2: "clientid 被对端拒绝",
+                    3: "对端服务不可用",
+                    4: "用户名或密码错误",
+                    5: ("对端不认我方证书 —— 多半是它没把总系统下发的信任背书"
+                        "（trust_issued）落进自己的 sas.db.trust_chain："
+                        "确认它的同步在正常 pull；版本过旧（无 merge_trust_issued）"
+                        "或同步已停都会这样"),
+                }.get(rc, "")
             raise MqttError("连接被拒绝 rc=%d%s" % (rc, ("（%s）" % hint) if hint else ""))
         self._last_io = time.time()
 
@@ -502,6 +522,8 @@ class MqttMiniClient:
             if len(body) >= 2:
                 sub_pid = struct.unpack_from(">H", body, 0)[0]
                 self.last_suback = (sub_pid, list(body[2:]))
+        if ptype == 13:  # PINGRESP —— 记录到达时刻，供上层测量 RTT（需求2 桥接健康度）
+            self.last_pingresp_at = time.time()
         return True
 
 

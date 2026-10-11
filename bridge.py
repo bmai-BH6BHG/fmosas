@@ -60,10 +60,10 @@ subsystem_id 比对（相互验证），不一致不认。语音订阅只在确�
 根 CA 即可放行 —— 这正是本系统已有的信任机制，不引入新的密钥体系。
 """
 
+import collections
 import hashlib
 import json
 import os
-import queue
 import threading
 import time
 
@@ -136,6 +136,46 @@ CLIENTID_PREFIX = "FMO-BRIDGE-"
 # 默认集群名（与总系统保持一致）：未选择时就是它 = 原有的全局互联
 DEFAULT_CLUSTER_NAME = "主集群"
 
+# ---------------- 需求2：桥接健康度与音频流质量 ----------------
+RTT_PROBE_INTERVAL = 10.0             # 对链路定期发 PINGREQ 测 RTT 的间隔（秒）
+PLAY_QUEUE_MAX = 2000                 # 重播（去抖动）队列上限，满了按"对端过载"丢帧计数
+JITTER_BUFFER_DEFAULT_MS = 80         # 音频流抖动缓冲默认值（0 = 关闭透传）
+JITTER_BUFFER_MAX_MS = 1000
+MOS_TARGET = 4.5                      # MOS 满分参考（ITU-T P.800），仅做本地估算
+
+
+def sniff_codec(payload):
+    """
+    嗅探音频载荷封装格式（需求2：编解码感知）。
+
+    现网语音为 Ogg/Opus 封装（见 master_server.ogg_wrap_opus）；
+    透传桥接不做转码，这里只识别并在健康度里如实上报，"编解码协商"
+    以端到端声明为准（capabilities 字段），不伪造转码能力。
+    """
+    p = payload or b""
+    if p[:4] == b"OggS":
+        return "opus_ogg"
+    if p[:3] == b"{":
+        return "json"
+    if p:
+        return "raw"
+    return "unknown"
+
+
+def estimate_mos(jitter_ms, loss_rate):
+    """
+    用抖动与疑似丢包率估算 MOS（ITU-T P.800 简化 E-model）。
+    仅作本地参考（非主观测试值），供策略/告警门控使用：
+      MOS >= 3.5 视为"音质合格"（非功能要求）。
+    """
+    try:
+        j = max(0.0, float(jitter_ms or 0.0))
+        l = min(1.0, max(0.0, float(loss_rate or 0.0)))
+        mos = MOS_TARGET - (j / 30.0) * 0.6 - l * 2.0
+        return round(max(1.0, min(MOS_TARGET, mos)), 2)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
 DEFAULT_BRIDGE = {
     "enabled": False,                 # 总开关。默认关：要不要互联由部署者自己决定
     "node_id": "",                    # 默认取 subsystem_id
@@ -150,9 +190,23 @@ DEFAULT_BRIDGE = {
     #   "不是所有机子的 broker 都在同一个地方"，所以要能单独指定。
     "broker": "",
     "broker_port": 0,
+    # ★ **对外公布**的本机 broker 地址：别人该用哪个地址来连我的 broker。
+    #   留空 = 不公布，对端按"名册里的 HTTP 主机 + 1883"连（老行为，绝大多数机器够用）。
+    #   只有本机 broker 对外不是那个地址时才需要填（例：挂在公网隧道后面，
+    #   HTTP 与 MQTT 各走一个端口 → 这里填隧道的 MQTT 地址）。
+    #   注意与上面 broker 的区别：broker 是"我怎么连我的 broker"，
+    #   advertise_broker 是"别人怎么连我的 broker"，两者常常不一样。
+    "advertise_broker": "",
+    "advertise_broker_port": 0,
     # 已确认过的集群成员节点 id（向总系统汇报"谁在集群里"用；写进配置防链路抖动死锁）
     "member_ids": [],
     "channels": ["RAW", "TELE"],
+    # ---------------- 需求2：音频流桥接质量 ----------------
+    # 抖动缓冲（ms）：远端帧到达后延迟这么多再重播给本机，吸收网络抖动，
+    # 换取更平滑的播放。0 = 关闭（逐帧透传，延迟最低但抖动原样透传）。
+    "jitter_buffer_ms": JITTER_BUFFER_DEFAULT_MS,
+    # MQTT keepalive（秒）：长连接保活周期，兼顾 NAT 表项与断线检测速度。
+    "keepalive_s": 60,
     # 是否把本机语音放到桥接主题上供**别人拉取**（关掉 = 完全不给别人听）。
     # 注意这是**全局**的：拉取模型下"听谁的"由听的人决定，所以发送方无法逐对端挑选听众。
     "publish_local": True,
@@ -282,6 +336,17 @@ def load_bridge_config(config):
     # 集群名清洗（总系统用它决定"我能跟谁互联"）
     cfg["cluster"] = str(cfg.get("cluster") or DEFAULT_CLUSTER_NAME).strip() \
         or DEFAULT_CLUSTER_NAME
+    # ---- 需求2：音频质量参数清洗 ----
+    try:
+        jb = int(cfg.get("jitter_buffer_ms") or 0)
+    except (TypeError, ValueError):
+        jb = JITTER_BUFFER_DEFAULT_MS
+    cfg["jitter_buffer_ms"] = max(0, min(JITTER_BUFFER_MAX_MS, jb))
+    try:
+        ka = int(cfg.get("keepalive_s") or 60)
+    except (TypeError, ValueError):
+        ka = 60
+    cfg["keepalive_s"] = max(10, min(300, ka))
     return cfg
 
 
@@ -315,6 +380,18 @@ class BridgeLink(threading.Thread):
         self.connected_at = 0.0
         self._client = None
         self._alive = True
+        # ---------------- 需求2：链路健康度（RTT / 音频流指标） ----------------
+        self.rtt_ms = 0.0              # 最近一次 PINGREQ→PINGRESP 往返（毫秒）
+        self.rtt_avg_ms = 0.0          # RTT 平滑值（EWMA，0.3 新值权重）
+        self._ping_sent_at = 0.0       # 探测发出时刻
+        self._rtt_pending = False      # 已发出探测、还没等到 PINGRESP
+        self.audio_frames = 0          # 收到的音频帧数
+        self.audio_last_at = 0.0       # 上一帧到达时刻
+        self.audio_gap_avg_ms = 0.0    # 帧间隔均值（EWMA）
+        self.audio_jitter_ms = 0.0     # 到达间隔抖动（EWMA，RFC3550 风格）
+        self.audio_gap_max_ms = 0.0    # 观察期内最大帧间隔
+        self.audio_loss_suspect = 0    # 疑似丢帧次数（间隔骤增 3 倍以上）
+        self._codec = "unknown"        # 最近识别到的载荷封装
         # 集群成员确认：连上先只订阅名片，收到"已加入集群"的名片才开始收语音。
         # 这样"装了本系统但没加入集群"的站不会被当成员，也不会白白收它的流量。
         self.member = False
@@ -324,6 +401,9 @@ class BridgeLink(threading.Thread):
 
     # ---- 状态 ----
     def snapshot(self):
+        # 疑似丢帧率：按帧数折算（观察期内），帧数太少时给 0 避免抖动
+        loss_rate = (self.audio_loss_suspect / self.audio_frames) \
+            if self.audio_frames >= 20 else 0.0
         return {
             "id": self.peer_id,
             "name": self.peer.get("name") or self.peer.get("host"),
@@ -346,6 +426,22 @@ class BridgeLink(threading.Thread):
             # 是否与总服务器名册登记的身份核对一致（相互验证）
             "verified": bool(self.peer.get("verified")),
             "expect_id": self.peer.get("expect_id") or "",
+            # ---------------- 需求2：健康度快照 ----------------
+            "health": {
+                "rtt_ms": round(self.rtt_ms, 1),
+                "rtt_avg_ms": round(self.rtt_avg_ms, 1),
+                "packet_loss_rate": round(loss_rate, 4),
+                "reconnect_count": self.reconnects,
+            },
+            "audio": {
+                "frames": self.audio_frames,
+                "codec": self._codec,
+                "jitter_ms": round(self.audio_jitter_ms, 1),
+                "gap_avg_ms": round(self.audio_gap_avg_ms, 1),
+                "gap_max_ms": round(self.audio_gap_max_ms, 1),
+                "loss_suspect": self.audio_loss_suspect,
+                "mos_estimate": estimate_mos(self.audio_jitter_ms, loss_rate),
+            },
         }
 
     def stop(self):
@@ -384,7 +480,9 @@ class BridgeLink(threading.Thread):
                 client = MqttMiniClient(
                     self.peer["host"], self.peer["port"],
                     "%s%s" % (CLIENTID_PREFIX, self.svc.client_suffix()),
-                    username=username, password=password, keepalive=60,
+                    username=username, password=password,
+                    # 需求2：keepalive 可配置（长连接保持），默认 60s
+                    keepalive=self.svc.keepalive_s,
                     on_message=self._on_message, read_timeout=0.5)
                 self._client = client
                 client.connect()
@@ -407,8 +505,27 @@ class BridgeLink(threading.Thread):
                 backoff = RECONNECT_MIN
                 self.svc.log("[BRIDGE] 已连接 %s（%s:%d），等待集群名片…" % (
                     self.peer.get("name"), self.peer["host"], self.peer["port"]))
+                last_rtt_probe = time.time()
                 while not self.stop_event.is_set():
                     client.poll_once()
+                    # ---- 需求2：RTT 探测（PINGREQ→PINGRESP 往返）----
+                    if self._rtt_pending and \
+                            getattr(client, "last_pingresp_at", 0.0) > self._ping_sent_at:
+                        rtt = (client.last_pingresp_at - self._ping_sent_at) * 1000.0
+                        if 0.0 <= rtt < 10000.0:
+                            self.rtt_ms = rtt
+                            self.rtt_avg_ms = (self.rtt_avg_ms * 0.7 + rtt * 0.3) \
+                                if self.rtt_avg_ms else rtt
+                        self._rtt_pending = False
+                    now_t = time.time()
+                    if now_t - last_rtt_probe >= RTT_PROBE_INTERVAL:
+                        last_rtt_probe = now_t
+                        try:
+                            client.ping()
+                            self._ping_sent_at = time.time()
+                            self._rtt_pending = True
+                        except Exception:  # noqa: BLE001
+                            pass
                     if not self.member and (self.reject_reason
                                             or time.time() > self.confirm_deadline):
                         # 对方没在名片里声明"已加入集群"（或身份与名册不符）→ 不是成员
@@ -474,7 +591,27 @@ class BridgeLink(threading.Thread):
             self.svc.on_peer_announce(self.key, payload)
             return
         self.rx_frames += 1
-        self.last_rx = time.time()
+        now = time.time()
+        self.last_rx = now
+        # ---------------- 需求2：音频流到达指标（抖动/丢帧嫌疑） ----------------
+        if self.audio_last_at:
+            gap = (now - self.audio_last_at) * 1000.0
+            if 0.0 <= gap < 60000.0:
+                if self.audio_gap_avg_ms:
+                    # RFC3550 风格抖动估计：J += (|D| - J) / 16，D=相邻间隔之差
+                    d = abs(gap - self.audio_gap_avg_ms)
+                    self.audio_jitter_ms += (d - self.audio_jitter_ms) / 16.0
+                    self.audio_gap_avg_ms += (gap - self.audio_gap_avg_ms) / 8.0
+                    if gap > max(3.0 * self.audio_gap_avg_ms,
+                                 self.audio_gap_avg_ms + 150.0):
+                        self.audio_loss_suspect += 1
+                else:
+                    self.audio_gap_avg_ms = gap
+                if gap > self.audio_gap_max_ms:
+                    self.audio_gap_max_ms = gap
+        self.audio_frames += 1
+        self.audio_last_at = now
+        self._codec = sniff_codec(payload)
         self.svc.on_remote_frame(self.peer, topic, payload)
 
     def update_peer(self, peer):
@@ -519,6 +656,15 @@ class VoiceBridge(object):
         self.channels = list(self._cfg.get("channels") or ["RAW"])
         # 所属集群：桥接只在同集群内互联（名册按它过滤）
         self.cluster = str(self._cfg.get("cluster") or DEFAULT_CLUSTER_NAME)
+        # ---------------- 需求2：音频流质量参数 ----------------
+        self._jitter_buffer_ms = int(self._cfg.get("jitter_buffer_ms")
+                                     or 0)  # 0 = 透传
+        self.keepalive_s = int(self._cfg.get("keepalive_s") or 60)
+        self._codec_seen = "unknown"          # 最近识别到的对端载荷封装
+        # 本机 broker RTT（需求2：健康度）
+        self._local_rtt_ms = 0.0
+        self._local_ping_sent_at = 0.0
+        self._local_rtt_pending = False
         # 调用方显式传入的 broker（测试/嵌入部署用）：优先级最高，且不再被配置覆盖
         self._explicit_broker = None
         if broker:
@@ -534,10 +680,17 @@ class VoiceBridge(object):
         self._local_ready = False
         self._local_state = "disabled"
         self._local_error = ""
-        self._out_queue = queue.Queue(maxsize=2000)   # 跨线程发布队列
+        # 跨线程重播队列：(release_at, topic, payload)。
+        # 需求2：改为带释放时间的 deque —— 远端帧按抖动缓冲延迟释放，
+        # 吸收网络抖动（0 = 逐帧透传）。FIFO 顺序下 release_at 单调不减，
+        # 队首未到期时后面的也不会到期，O(1) 判断即可。
+        self._play = collections.deque()
+        self._play_lock = threading.Lock()
         self._dedupe = {}
         self._injected = {}          # 本机重播出去的内容摘要（回环抑制）
-        self._stats = {"published": 0, "rx_frames": 0, "deduped": 0}
+        self._stats = {"published": 0, "rx_frames": 0, "deduped": 0,
+                       "replayed": 0, "dropped_queue_full": 0,
+                       "dropped_late": 0}
         self._peer_tx = {}                    # peer_id -> 已发出的消息数
         self._unaddressed = {}                # 已提示过"还没拿到名片"的对端
         self._backoff_until = {}              # target key -> 非成员下次可试时间
@@ -743,8 +896,11 @@ class VoiceBridge(object):
                 client = MqttMiniClient(
                     self.broker_host, self.broker_port,
                     "%s%s-LOCAL" % (CLIENTID_PREFIX, self.client_suffix()),
-                    username=username, password=password, keepalive=60,
+                    username=username, password=password,
+                    keepalive=self.keepalive_s,
                     on_message=self._on_local_message,
+                    # rc=5 的提示要按方向说：这是**本机** broker，不是对端
+                    target="本机",
                     # ★ 读超时调小：本机连接除了收源生语音，还负责把"对端转来的
                     #   语音"重播出去（跨线程经队列投递）。如果用默认 5s 读超时，
                     #   重播要等这次读超时才发生 → 互联语音最多晚 5 秒，实时语音不可接受。
@@ -765,9 +921,26 @@ class VoiceBridge(object):
                     self.broker_host, self.broker_port,
                     ", ".join("FMO/%s" % c for c in self.channels)))
                 last_sync = time.time()
+                last_rtt_probe = time.time()
                 while not self._stop.is_set():
                     client.poll_once()
-                    self._drain_out_queue(client)   # 跨线程的重播请求在这里落地
+                    # ---- 需求2：本机 broker RTT 探测 ----
+                    if getattr(self, "_local_rtt_pending", False) and \
+                            getattr(client, "last_pingresp_at", 0.0) > self._local_ping_sent_at:
+                        rtt = (client.last_pingresp_at - self._local_ping_sent_at) * 1000.0
+                        if 0.0 <= rtt < 10000.0:
+                            self._local_rtt_ms = rtt
+                        self._local_rtt_pending = False
+                    now_t = time.time()
+                    if now_t - last_rtt_probe >= RTT_PROBE_INTERVAL:
+                        last_rtt_probe = now_t
+                        try:
+                            client.ping()
+                            self._local_ping_sent_at = time.time()
+                            self._local_rtt_pending = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                    self._drain_out_queue(client)   # 跨线程的重播请求在这里落地（按抖动缓冲定时释放）
                     # 总开关被关掉时立刻退出内层循环，回到外层去把连接收掉并置为 disabled。
                     # （否则会一直挂着旧连接，界面上看起来"关了还连着"）
                     if not self._cfg.get("enabled"):
@@ -800,6 +973,10 @@ class VoiceBridge(object):
             finally:
                 self._local_ready = False
                 self._local_client = None
+                # 断线清空未释放的旧帧：重连后从新帧开始播，
+                # 否则积压的几十秒旧语音会一口气倾泻给本机（听感极差）
+                with self._play_lock:
+                    self._play.clear()
                 if client is not None:
                     try:
                         client.disconnect()
@@ -810,14 +987,28 @@ class VoiceBridge(object):
             backoff = min(backoff * 2, RECONNECT_MAX)
 
     def _drain_out_queue(self, client):
-        """把其它线程投递的重播请求，在本线程（唯一写者）发出去。"""
-        for _ in range(200):
-            try:
-                topic, payload = self._out_queue.get_nowait()
-            except queue.Empty:
-                return
+        """
+        把其它线程投递的重播请求，在本线程（唯一写者）按**释放时间**发出去。
+
+        需求2：抖动缓冲 —— 每帧带 release_at（到达 + jitter_buffer_ms），
+        队首未到期即停（FIFO 下 release_at 单调，后面的必然也未到期）。
+        本机连接断开时由 finally 清空队列（旧帧播了也是过期语音）。
+        """
+        now = time.time()
+        for _ in range(300):
+            item = None
+            with self._play_lock:
+                if not self._play:
+                    return
+                head = self._play[0]
+                if head[0] > now:
+                    return                      # 还没到释放时间
+                item = self._play.popleft()
+            _, topic, payload = item
             try:
                 client.publish(topic, payload)
+                with self._lock:
+                    self._stats["replayed"] += 1
             except Exception as e:  # noqa: BLE001
                 self.log("[BRIDGE] 本机重播失败: %s" % e)
                 return
@@ -1016,10 +1207,26 @@ class VoiceBridge(object):
         #   监控全都按"本机收到的语音"处理 —— 不需要任何一端改配置。
         #   同时登记内容摘要，供本机连接回环抑制（我们自己也会收到这一帧）。
         self._mark_injected(payload)
-        try:
-            self._out_queue.put_nowait((channel_topic(channel), payload))
-        except queue.Full:
-            self.log("[BRIDGE] 重播队列已满，丢弃一帧（对端流量过载）")
+        # ★ 抖动缓冲：不立刻重播，按"到达时间 + jitter_buffer_ms"定时释放，
+        #   把网络到达间隔的抖动抹平（需求2 音质优化核心一环）。
+        #   FIFO 单调释放 → 队首未到期即整体未到期，_drain_out_queue 里 O(1) 判断。
+        now = time.time()
+        with self._lock:
+            if self._codec_seen == "unknown":
+                self._codec_seen = sniff_codec(payload)
+            self._stats["play_queued"] = self._stats.get("play_queued", 0) + 1
+        over = False
+        with self._play_lock:
+            if len(self._play) >= PLAY_QUEUE_MAX:
+                over = True
+            else:
+                self._play.append((now + self._jitter_buffer_ms / 1000.0,
+                                   channel_topic(channel), payload))
+        if over:
+            self.log("[BRIDGE] 重播队列已满，丢弃一帧（对端流量过载/消费过慢）")
+            with self._lock:
+                self._stats["dropped_queue_full"] = \
+                    self._stats.get("dropped_queue_full", 0) + 1
 
     def _is_duplicate(self, origin, channel, payload):
         key = (origin, channel, hashlib.sha1(payload).hexdigest())
@@ -1161,6 +1368,9 @@ class VoiceBridge(object):
                 #   "不是所有机子的 broker 都在同一个地方"，所以要能单独指定并落盘。
                 "broker": str(self._cfg.get("broker") or ""),
                 "broker_port": int(self._cfg.get("broker_port") or 0),
+                # 对外公布的本机 broker 地址（别人连我用这个；留空=不公布）
+                "advertise_broker": str(self._cfg.get("advertise_broker") or ""),
+                "advertise_broker_port": int(self._cfg.get("advertise_broker_port") or 0),
                 # 已确认过的集群成员节点 id（链路断了也能继续向总系统汇报，防死锁）
                 "member_ids": list(self._cfg.get("member_ids") or []),
                 "channels": list(self._cfg.get("channels") or ["RAW"]),
@@ -1178,7 +1388,7 @@ class VoiceBridge(object):
 
     def set_config(self, enabled=None, node_name=None, channels=None,
                    node_id=None, publish_local=None, cluster=None,
-                   broker="__keep__", broker_port=None):
+                   broker="__keep__", broker_port=None, **kwargs):
         with self._lock:
             if enabled is not None:
                 was = bool(self._cfg.get("enabled"))
@@ -1202,6 +1412,21 @@ class VoiceBridge(object):
                 self.channels = list(chans)
             if publish_local is not None:
                 self._cfg["publish_local"] = bool(publish_local)
+            # ★ 抖动缓冲：改了立即生效（下一帧就按新缓冲时长释放），无需重连
+            if "jitter_buffer_ms" in kwargs and kwargs.get("jitter_buffer_ms") is not None:
+                try:
+                    jb = int(kwargs.get("jitter_buffer_ms"))
+                except (TypeError, ValueError):
+                    jb = JITTER_BUFFER_DEFAULT_MS
+                jb = max(0, min(JITTER_BUFFER_MAX_MS, jb))
+                self._cfg["jitter_buffer_ms"] = jb
+                self._jitter_buffer_ms = jb
+            if "keepalive_s" in kwargs and kwargs.get("keepalive_s") is not None:
+                try:
+                    ka = int(kwargs.get("keepalive_s"))
+                except (TypeError, ValueError):
+                    ka = 60
+                self._cfg["keepalive_s"] = max(10, min(300, ka))
             if cluster is not None and str(cluster).strip():
                 # 换集群＝换"能跟谁互联"：清掉退避记录，让链路立刻按新名册重建
                 newc = str(cluster).strip()
@@ -1224,6 +1449,20 @@ class VoiceBridge(object):
                     self._cfg.pop("broker", None)
                     self._cfg.pop("broker_port", None)
                 self._local_restart = True
+            # ★ 对外公布地址：别人连我的 broker 用哪个地址（留空 = 不公布，对端走老行为）
+            if "advertise" in kwargs and kwargs.get("advertise") != "__keep__":
+                ab = str(kwargs.get("advertise") or "").strip()
+                with self._lock:
+                    if ab:
+                        self._cfg["advertise_broker"] = ab
+                        try:
+                            self._cfg["advertise_broker_port"] = int(
+                                kwargs.get("advertise_port") or DEFAULT_PORT)
+                        except (TypeError, ValueError):
+                            self._cfg["advertise_broker_port"] = DEFAULT_PORT
+                    else:
+                        self._cfg.pop("advertise_broker", None)
+                        self._cfg.pop("advertise_broker_port", None)
         self._persist()
         self._sync_links()
         return self.public_config()
@@ -1363,6 +1602,8 @@ class VoiceBridge(object):
                 "cluster": self.cluster,
                 "channels": list(self.channels),
                 "publish_local": bool(self._cfg.get("publish_local", True)),
+                "jitter_buffer_ms": int(self._jitter_buffer_ms),
+                "keepalive_s": int(self.keepalive_s),
                 "peers": [dict(p) for p in self._cfg["peers"]],
             }
 
@@ -1386,6 +1627,18 @@ class VoiceBridge(object):
             local_state = self._local_state
             local_error = self._local_error
             local_ready = self._local_ready
+            # ★ 消除"已加入集群 / 本机 broker 连接：未加入"的自相矛盾：
+            #   内部状态 "disabled" 同时被用于"总开关关闭"和"线程刚起、还没开始连"
+            #   两种情况，界面就把它显示成"未加入"——顶上却写着"已加入"，用户看到
+            #   就是自相矛盾（真实反馈）。这里按总开关纠正：总开关是开的却还没连上，
+            #   那是"等待连接/连接中"，不是"未加入"。
+            if enabled and local_state == "disabled":
+                local_state = "connecting"
+            local_rtt_ms = float(self._local_rtt_ms)
+            codec_seen = self._codec_seen
+            jb_ms = int(self._jitter_buffer_ms)
+        with self._play_lock:
+            queue_depth = len(self._play)
         now = time.time()
         # 成员列表 = 手动补充 + 自动发现（用户不用自己挑服务器）。
         # 未加入集群时仍列出**手动条目**，否则界面上会"消失"、也删不掉。
@@ -1412,6 +1665,11 @@ class VoiceBridge(object):
                     "rx_frames": 0, "last_rx": 0.0, "last_error": "",
                     "reconnects": 0, "uptime": 0.0, "alive": False,
                     "remote_id": t.get("remote_id") or "", "key": key,
+                    "health": {"rtt_ms": 0, "rtt_avg_ms": 0,
+                               "packet_loss_rate": 0, "reconnect_count": 0},
+                    "audio": {"frames": 0, "codec": "unknown", "jitter_ms": 0,
+                              "gap_avg_ms": 0, "gap_max_ms": 0,
+                              "loss_suspect": 0, "mos_estimate": None},
                 }
             snap["tx_frames"] = peer_tx.get(key, 0)
             out_peers.append(snap)
@@ -1422,6 +1680,41 @@ class VoiceBridge(object):
         # ★ 集群成员数**含本机自己**：刚加入、还没别的成员时应该是 1，不是 0
         #   （用户反馈：点了加入集群还显示 0，看不出自己到底进去没有）
         count = (1 if cfg["enabled"] else 0) + len(members)
+        # ---------------- 需求2：健康度与音质聚合 ----------------
+        # 取各成员链路的最差值当代表：木桶效应，最差一条链路决定体验
+        links_health = [p.get("health") or {} for p in members]
+        worst_loss = max([float(h.get("packet_loss_rate") or 0)
+                          for h in links_health] or [0.0])
+        reconnects_total = sum(int(h.get("reconnect_count") or 0)
+                               for h in links_health)
+        worst_jitter, worst_mos = 0.0, None
+        for p in members:
+            a = p.get("audio") or {}
+            if a.get("frames"):
+                worst_jitter = max(worst_jitter, float(a.get("jitter_ms") or 0))
+                m = a.get("mos_estimate")
+                if m is not None:
+                    worst_mos = min(worst_mos, float(m)) if worst_mos else float(m)
+        health = {
+            "local_rtt_ms": round(local_rtt_ms, 1),
+            "reconnects_total": reconnects_total,
+            "packet_loss_rate": round(worst_loss, 4),
+            "jitter_ms": round(worst_jitter, 1),
+            "queue_depth": queue_depth,
+        }
+        audio = {
+            "jitter_buffer_ms": jb_ms,
+            "codec": codec_seen,
+            "replayed": stats.get("replayed", 0),
+            "dropped_queue_full": stats.get("dropped_queue_full", 0),
+            "dropped_late": stats.get("dropped_late", 0),
+            "mos_estimate": (round(worst_mos, 2) if worst_mos is not None
+                             else round(estimate_mos(worst_jitter, worst_loss), 2)
+                             if members else None),
+            # 回声消除/噪声抑制是端侧（APP/网关）能力，桥接只透传、如实声明
+            "capabilities": {"echo_cancel": "endpoint",
+                             "noise_suppress": "endpoint"},
+        }
         return {
             "ok": True,
             "enabled": cfg["enabled"],
@@ -1437,6 +1730,9 @@ class VoiceBridge(object):
             "broker_host": self.broker_host,
             "broker_port": self.broker_port,
             "broker_source": getattr(self, "broker_source", ""),
+            # 对外公布的本机 broker 地址（别人连我用这个；可能为空 = 走名册默认）
+            "advertise_broker": str(self._cfg.get("advertise_broker") or ""),
+            "advertise_broker_port": int(self._cfg.get("advertise_broker_port") or 0),
             "topics": list(cfg["channels"]),
             "local_state": local_state,
             "local_error": local_error,
@@ -1452,6 +1748,8 @@ class VoiceBridge(object):
                 "rx_frames": stats.get("rx_frames", 0),
                 "deduped": stats.get("deduped", 0),
             },
+            "health": health,
+            "audio": audio,
             "peers": out_peers,
             "members": members,
         }

@@ -444,7 +444,7 @@ say "系统文件已替换（用户数据未改动）"
 # 语法自检：任何 .py 编译不过就回滚
 if command -v python3 >/dev/null 2>&1; then
     if ! python3 -m py_compile "$DIR/api_server.py" "$DIR/sas_server.py" \
-            "$DIR/monitor.py" "$DIR/sync_engine.py" "$DIR/bridge.py" 2>"$TMP_ROOT/pyc.log"; then
+            "$DIR/monitor.py" "$DIR/sync_engine.py" "$DIR/bridge.py" "$DIR/udac.py" 2>"$TMP_ROOT/pyc.log"; then
         err "语法自检未通过："
         sed 's/^/    /' "$TMP_ROOT/pyc.log" >&2 || true
         ROLLBACK_NEEDED=1
@@ -453,6 +453,55 @@ if command -v python3 >/dev/null 2>&1; then
     fi
 fi
 [ "$ROLLBACK_NEEDED" = 0 ] || rollback_now
+
+# ---------------------------------------------------------------- 服务器命名（需求1）
+#  升级同样需要服务器名：已有名字则保留、不重复询问；
+#  仍是默认名（老版本装上来的）才补填一次。只改 name 字段，不碰 config.json 其他内容。
+step "5.5/6" "确认服务器名称"
+SERVER_NAME_EXISTING="$(python3 - "$DIR/config.json" <<'PYEOF' 2>/dev/null
+import json, os, sys
+p = sys.argv[1]
+if os.path.exists(p):
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            print(str((json.load(f).get("name") or "").strip()))
+    except Exception:
+        pass
+PYEOF
+)"
+case "$SERVER_NAME_EXISTING" in
+    ""|"FMO注册系统-默认"|"默认服务"|"FMO注册系统")
+        SERVER_NAME_INPUT="${FMO_NAME:-}"
+        if [ -z "$SERVER_NAME_INPUT" ] && [ -r /dev/tty ] && [ "${FMO_NONINTERACTIVE:-}" != "1" ]; then
+            printf '请输入本服务器名称（展示在总系统名册，直接回车用主机名）：'
+            read -r SERVER_NAME_INPUT < /dev/tty || SERVER_NAME_INPUT=""
+        fi
+        [ -n "$SERVER_NAME_INPUT" ] || SERVER_NAME_INPUT="$(hostname 2>/dev/null | tr -d '\r' || true)"
+        [ -n "$SERVER_NAME_INPUT" ] || SERVER_NAME_INPUT="FMO-服务器"
+        if python3 - "$DIR/config.json" "$SERVER_NAME_INPUT" <<'PYEOF'
+import json, os, sys
+p, name = sys.argv[1], sys.argv[2]
+try:
+    with open(p, "r", encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    cfg["name"] = name
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, p)
+except Exception as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(1)
+PYEOF
+        then
+            say "服务器名称已写入：$SERVER_NAME_INPUT"
+        else
+            warn "服务器名称写入失败（不影响升级，可稍后手动改 config.json 的 name）"
+        fi
+        ;;
+    *) say "服务器名称：沿用已有「$SERVER_NAME_EXISTING」（不重复询问）" ;;
+esac
 
 # ---------------------------------------------------------------- 起服务 + 健康检查
 step "6/6" "重启服务并做健康检查"

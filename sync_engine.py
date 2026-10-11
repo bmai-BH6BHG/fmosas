@@ -55,6 +55,7 @@ import json
 import os
 import sqlite3
 import time
+from urllib.parse import urlparse
 import threading
 import urllib.request
 import urllib.error
@@ -200,6 +201,10 @@ class SyncEngine:
         #   上报如果只读配置字典，一旦别处把 bridge 整个替换过，读到的就是启动时
         #   的旧值 —— 表现为"界面上已加入、总系统一直显示未加入"（真实事故）。
         self.bridge_state_source = None
+        # ★ 由外部注入：返回**实时**的上报地址 {'api_url':..,'domain':..}。
+        #   引擎拿的是 dict(CONFIG) 浅拷贝，顶层标量在构造那刻就被冻住，
+        #   需求1 的自动扫描改了配置也传不进来（真实踩过）。
+        self.address_source = None
         self.db_path = db_path
         self.mode = mode
         self.base_dir = base_dir or os.path.dirname(os.path.abspath(db_path))
@@ -801,24 +806,60 @@ class SyncEngine:
         # 上报地址优先采用后台"APP 登录地址配置"（app_domain/app_port/app_use_port），
         # 在界面保存后即生效，免手改 config.json 的 api_url；
         # 未配置 app_domain 时回退静态 api_url/domain。
-        app_domain = str(self.config.get('app_domain', '') or '').strip()
-        app_port = self.config.get('app_port')
-        app_use_port = self.config.get('app_use_port', True)
-        if app_domain:
-            if app_use_port and app_port:
-                api_url = 'http://%s:%s' % (app_domain, app_port)
+        # ★ 优先问**实时**来源（由 api_server 注入，直接读 CONFIG）：
+        #   引擎手里的 config 是启动时的浅拷贝，顶层标量不会再变。
+        api_url = ''
+        domain = ''
+        live = None
+        try:
+            if self.address_source:
+                live = self.address_source() or {}
+        except Exception:  # noqa: BLE001
+            live = None
+        if live:
+            api_url = str(live.get('api_url') or '')
+            domain = str(live.get('domain') or '')
+        if not api_url:
+            app_domain = str(self.config.get('app_domain', '') or '').strip()
+            app_port = self.config.get('app_port')
+            app_use_port = self.config.get('app_use_port', True)
+            if app_domain:
+                if app_use_port and app_port:
+                    api_url = 'http://%s:%s' % (app_domain, app_port)
+                else:
+                    api_url = 'http://%s' % app_domain
+                domain = app_domain
             else:
-                api_url = 'http://%s' % app_domain
-            domain = app_domain
-        else:
-            api_url = self.config.get('api_url', '')
-            domain = self.config.get('domain', '')
+                api_url = self.config.get('api_url', '')
+                domain = self.config.get('domain', '')
+        if not domain and api_url:
+            try:
+                domain = urlparse(api_url).hostname or ''
+            except Exception:  # noqa: BLE001
+                domain = ''
+
+        # ★ 上报"**别人该用哪个地址来连我的 broker**"（bridge.advertise_broker）。
+        #   注意**不能**用 monitor.mqtt_host：那是我自己连自己 broker 用的地址，
+        #   常常是 127.0.0.1 —— 别人拿到它只会连到**它自己的本机**，等于没连。
+        #   没配（留空）就不报，对端回退到"名册 HTTP 主机 + 1883"的老行为。
+        _bcfg = self.config.get('bridge') or {}
+        mqtt_host = str(_bcfg.get('advertise_broker') or '').strip()
+        try:
+            mqtt_port = int(_bcfg.get('advertise_broker_port') or 0)
+        except (TypeError, ValueError):
+            mqtt_port = 0
 
         payload = {
             'subsystem_id': self.subsystem_id,
             'name': self.config.get('name', ''),
             'domain': domain,
             'api_url': api_url,
+            # ★ 顺带上报本机 **MQTT 地址**：名册里那个地址是 HTTP API 口，MQTT 口不一定
+            #   是 1883。真实场景：有的分系统挂在公网隧道后面（HTTP、MQTT 各走一个端口），
+            #   对端按 1883 硬拼就会连到错的地方 —— 表现是"一直在连、始终连不上"。
+            #   总系统把它存下来、随名册发给别人，别人就按正确地址来连。
+            'mqtt_host': mqtt_host,
+            'mqtt_port': mqtt_port,
             'full': full,
             'since': since,
             'timestamp': now_ts(),
@@ -855,6 +896,17 @@ class SyncEngine:
                 members = list(self.member_source() or [])
                 if members:
                     payload['cluster_members'] = members
+        except Exception:  # noqa: BLE001
+            pass
+        # ★ UDAC 台站信任排行（本机 top N）随上报带给总系统：
+        #   总系统把各分系统的排行汇总成"全局台站信任排行"（udac-trust-score
+        #   的全局视图）。UDAC 未启用时这里为空，总系统按旧字段处理即可。
+        try:
+            src = getattr(self, 'udac_ranking_source', None)
+            if callable(src):
+                rows = src()
+                if rows:
+                    payload['udac_ranking'] = rows[:20]
         except Exception:  # noqa: BLE001
             pass
         if self.sync_token:
@@ -960,6 +1012,20 @@ class SyncEngine:
         # 实际数据在 resp_body['data'] 里
         payload_data = resp_body.get('data', {}) or {}
         merged = self.merge_all(payload_data, source='master')
+
+        # ★ 总系统随拉取下发的 UDAC 事件（udac.cert.fullscan.triggered 等）→
+        #   喂给本机 UDAC 中心：全量扫描触发后本机重算台站信任分（总系统 → UDAC 通知）
+        try:
+            evs = payload_data.get('udac_events')
+            sink = getattr(self, 'udac_event_sink', None)
+            if evs and callable(sink):
+                for ev in evs:
+                    try:
+                        sink(ev)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
 
         # 记数
         counts = payload_data.get('counts', {}) if isinstance(payload_data, dict) else {}
