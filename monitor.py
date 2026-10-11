@@ -154,6 +154,64 @@ def ogg_wrap_opus(data, channels=1):
     return bytes(out)
 
 
+def _opus_packets_of(data):
+    """把存储的 [u16 LE 长度][Opus 原始包] 序列解成包列表。"""
+    packets = []
+    off, n = 0, len(data or b'')
+    while off + 2 <= n:
+        plen = struct.unpack_from('<H', data, off)[0]
+        off += 2
+        if off + plen > n:
+            break
+        packets.append(bytes(data[off:off + plen]))
+        off += plen
+    return packets
+
+
+def ogg_wrap_opus_multi(chunks, channels=1, gap_ms=1200, max_bytes=None):
+    """
+    把**多段**录音合并成一个可连续播放/可下载的 Ogg/Opus。
+
+    ★ 需求：录音库要能把"某个时间段"整体听着或导出成一个文件。
+      段与段之间的停顿用 **granule 跳变**表示 —— 这是 Ogg 的合法用法，
+      播放器会自动补静音；不伪造静音包（伪造包在部分解码器上会直接报错）。
+
+    :param chunks: [[u16 长度][Opus 包]…, …] —— 每段就是 voice_segments.audio
+    :param gap_ms: 段与段之间补多长停顿（默认 1.2 秒，听感上分得清"谁在说"）
+    :param max_bytes: 合并后的大小上限（超过就停止追加，避免一次导出太大；None=不限）
+    """
+    segs = [p for p in (_opus_packets_of(c) for c in (chunks or [])) if p]
+    if not segs:
+        raise ValueError('no opus packets')
+    serial = 0x464D4F31  # "FMO1"
+    out = bytearray()
+    head = b'OpusHead' + struct.pack('<BBHIhB', 1, channels, 0, 48000, 0, 0)
+    out += _ogg_page(head, 0, serial, 0, 2)
+    vendor = b'FMO'
+    tags = b'OpusTags' + struct.pack('<I', len(vendor)) + vendor + struct.pack('<I', 0)
+    out += _ogg_page(tags, 0, serial, 1, 0)
+    gap = int(max(0.0, float(gap_ms)) * 48.0)   # 48kHz 采样数
+    granule, seq, nbytes, truncated = 0, 2, 0, False
+    flat = []
+    for si, pkts in enumerate(segs):
+        if si:
+            granule += gap        # 段间停顿（granule 跳变）
+        for pkt in pkts:
+            flat.append(pkt)
+            nbytes += len(pkt)
+            if max_bytes and nbytes > max_bytes:
+                truncated = True
+                break
+        if truncated:
+            break
+    last = len(flat) - 1
+    for i, pkt in enumerate(flat):
+        granule += _opus_packet_samples(pkt)
+        out += _ogg_page(pkt, granule, serial, seq, 4 if i == last else 0)
+        seq += 1
+    return bytes(out)
+
+
 # -------------------- FMO 帧解析（移植自 APP fmo_frame.rs） --------------------
 
 def parse_fmo_frame(f):
@@ -564,9 +622,14 @@ class VoiceStore:
       另外原实现没设 synchronous，默认 FULL 会让每次 commit 都 fsync。
     """
 
-    def __init__(self, db_path, retention_days=3):
+    def __init__(self, db_path, retention_days=0, max_db_mb=0,
+                 beacon_retention_days=30):
         self.db_path = db_path
-        self.retention_days = retention_days
+        # ★ 保留策略：retention_days=0 → **永久保留**（用户要求"从部署那一刻开始
+        #   就一直留着、随时能听"）；max_db_mb>0 → 容量上限，超了删最老的段保护磁盘。
+        self.retention_days = int(retention_days or 0)
+        self.max_db_mb = int(max_db_mb or 0)
+        self.beacon_retention_days = int(beacon_retention_days or 0)
         self._lock = threading.RLock()
         self._shared = None
         self._init_db()
@@ -696,6 +759,133 @@ class VoiceStore:
                 (seg_id,)).fetchone()
             return (r["codec"], r["audio"]) if r else (None, None)
 
+    def recordings(self, from_ts=0.0, to_ts=0.0, callsign="", origin=None,
+                   limit=200, offset=0):
+        """
+        录音库分页查询（**只取元数据，不带音频**，方便一次列很多）。
+        origin=None 表示不过滤；origin="" 表示只看本机收的；非空看只看桥接转来的。
+        返回 (rows, total)。
+        """
+        where = ["start_ts >= ?", "start_ts < ?"]
+        args = [float(from_ts or 0), float(to_ts or 0) or time.time() + 1]
+        if callsign:
+            where.append("callsign = ?")
+            args.append(str(callsign).strip().upper())
+        if origin is not None:
+            if origin == "*":
+                # 只看桥接转来的（origin 非空）
+                where.append("COALESCE(origin,'') <> ''")
+            else:
+                where.append("COALESCE(origin,'') = ?")
+                args.append(str(origin or ""))
+        w = " AND ".join(where)
+        with self._lock:
+            conn = self._conn()
+            total = conn.execute(
+                "SELECT COUNT(*) c FROM voice_segments WHERE " + w, args).fetchone()["c"]
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, callsign, session, start_ts, end_ts, duration_ms, codec, "
+                "frames, COALESCE(origin,'') AS origin, "
+                "COALESCE(LENGTH(audio),0) AS audio_bytes "
+                "FROM voice_segments WHERE " + w +
+                " ORDER BY start_ts ASC LIMIT ? OFFSET ?",
+                args + [int(limit), int(offset)]).fetchall()]
+        return rows, total
+
+    def timeline(self, from_ts=0.0, to_ts=0.0, bucket_sec=3600, callsign="",
+                 origin=None):
+        """
+        时间轴：把区间按 bucket_sec 分桶，返回每桶的段数与时长 —— 界面画"哪段时间有声音"。
+        分桶用 (start_ts - from_ts)//bucket_sec，由调用方把 from_ts 对齐到本地整点/整天，
+        因此不受服务器时区影响。
+        """
+        b = max(60, int(bucket_sec or 3600))
+        where = ["start_ts >= ?", "start_ts < ?"]
+        args = [float(from_ts or 0), float(to_ts or 0) or time.time() + 1]
+        if callsign:
+            where.append("callsign = ?")
+            args.append(str(callsign).strip().upper())
+        if origin is not None:
+            if origin == "*":
+                # 只看桥接转来的（origin 非空）
+                where.append("COALESCE(origin,'') <> ''")
+            else:
+                where.append("COALESCE(origin,'') = ?")
+                args.append(str(origin or ""))
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT CAST((start_ts - ?) / ? AS INTEGER) AS b, COUNT(*) AS c, "
+                "COALESCE(SUM(duration_ms),0) AS ms FROM voice_segments WHERE "
+                + " AND ".join(where) + " GROUP BY b ORDER BY b",
+                [float(from_ts or 0), b] + args).fetchall()
+        return [{"bucket": int(r["b"]), "count": int(r["c"]),
+                 "seconds": round((r["ms"] or 0) / 1000.0, 1)} for r in rows]
+
+    def range_stats(self, from_ts=0.0, to_ts=0.0, callsign="", origin=None):
+        """区间统计：段数 / 总时长 / 占用字节（界面显示"这个区间有多少东西"）。"""
+        where = ["start_ts >= ?", "start_ts < ?"]
+        args = [float(from_ts or 0), float(to_ts or 0) or time.time() + 1]
+        if callsign:
+            where.append("callsign = ?")
+            args.append(str(callsign).strip().upper())
+        if origin is not None:
+            if origin == "*":
+                # 只看桥接转来的（origin 非空）
+                where.append("COALESCE(origin,'') <> ''")
+            else:
+                where.append("COALESCE(origin,'') = ?")
+                args.append(str(origin or ""))
+        with self._lock:
+            conn = self._conn()
+            r = conn.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(duration_ms),0) ms, "
+                "COALESCE(SUM(LENGTH(audio)),0) b FROM voice_segments WHERE "
+                + " AND ".join(where), args).fetchone()
+        return {"count": int(r["c"] or 0),
+                "seconds": round((r["ms"] or 0) / 1000.0, 1),
+                "bytes": int(r["b"] or 0)}
+
+    def export_ogg(self, from_ts=0.0, to_ts=0.0, callsign="", origin=None,
+                   limit=3000, max_bytes=64 * 1024 * 1024):
+        """
+        把区间内的录音合并成一个 Ogg/Opus（可直接播放/下载）。
+        返回 (bytes, 段数)；没有内容返回 (None, 0)。
+        """
+        rows, total = self.recordings(from_ts, to_ts, callsign=callsign,
+                                      origin=origin, limit=limit, offset=0)
+        if not rows:
+            return None, 0
+        chunks, used, picked = [], 0, 0
+        for r in rows:
+            if used + int(r.get("audio_bytes") or 0) > max_bytes:
+                break
+            codec, audio = self.get_audio(r["id"])
+            if not audio or codec != "opus":
+                continue          # 只合并 Opus（ADPCM 段无法直接拼 Ogg）
+            chunks.append(audio)
+            used += len(audio)
+            picked += 1
+        if not chunks:
+            return None, 0
+        return ogg_wrap_opus_multi(chunks), picked
+
+    def delete_range(self, from_ts=0.0, to_ts=0.0, callsign=""):
+        """删除区间内的录音（界面上的"删除本区间"，交给前端二次确认）。返回删除条数。"""
+        where = ["start_ts >= ?", "start_ts < ?"]
+        args = [float(from_ts or 0), float(to_ts or 0) or time.time() + 1]
+        if callsign:
+            where.append("callsign = ?")
+            args.append(str(callsign).strip().upper())
+        with self._lock:
+            conn = self._conn()
+            n = conn.execute("DELETE FROM voice_segments WHERE " + " AND ".join(where),
+                             args).rowcount
+            conn.commit()
+        if n:
+            log("MONITOR", "录音库：删除区间内 %d 段录音" % n)
+        return n
+
     def add_beacon(self, callsign, freq1, freq2, tele_ts):
         with self._lock:
             conn = self._conn()
@@ -715,22 +905,80 @@ class VoiceStore:
             """, (since, limit)).fetchall()]
 
     def cleanup(self):
-        """清理过期语音段与信标。"""
-        cutoff = time.time() - self.retention_days * 86400
+        """
+        清理语音段与信标。返回 (删除语音段数, 删除信标数)。
+
+        ★ 保留策略（用户要求：从部署那一刻开始一直录、随时能听）：
+          * retention_days = 0 → **永久保留**，不按天删（默认）；
+          * retention_days > 0 → 仍按天数删（兼容旧配置）；
+          * max_db_mb > 0      → 容量上限：语音总量超了就删**最老**的段，
+                                 直到降到上限以内（保护磁盘，不会把服务器写满）；
+          * 信标按 beacon_retention_days 单独保留（默认 30 天）—— 信标是元数据、
+            数量掉得快（实测 3 天 2.9 万条），不能跟着语音一起永久堆。
+        """
+        cutoff = time.time() - self.retention_days * 86400 \
+            if self.retention_days and self.retention_days > 0 else None
+        bc_cutoff = time.time() - self.beacon_retention_days * 86400 \
+            if self.beacon_retention_days and self.beacon_retention_days > 0 else None
+        n_seg = n_bc = 0
         with self._lock:
             conn = self._conn()
-            c1 = conn.execute("DELETE FROM voice_segments WHERE start_ts < ?", (cutoff,))
-            c2 = conn.execute("DELETE FROM beacons WHERE created_at < ?", (cutoff,))
+            if cutoff is not None:
+                n_seg = conn.execute(
+                    "DELETE FROM voice_segments WHERE start_ts < ?", (cutoff,)).rowcount
+            else:
+                n_seg = self._trim_to_capacity(conn)
+            if bc_cutoff is not None:
+                n_bc = conn.execute(
+                    "DELETE FROM beacons WHERE created_at < ?", (bc_cutoff,)).rowcount
             conn.commit()
-            return c1.rowcount, c2.rowcount
+            return n_seg, n_bc
+
+    def _trim_to_capacity(self, conn):
+        """语音总量超过 max_db_mb 时，从最老的段开始删。返回删除条数（不提交）。"""
+        cap = int(self.max_db_mb) * 1024 * 1024
+        if cap <= 0:
+            return 0
+        total = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(audio)),0) b FROM voice_segments").fetchone()["b"] or 0
+        if total <= cap:
+            return 0
+        need = total - cap
+        freed, ids = 0, []
+        for r in conn.execute(
+                "SELECT id, COALESCE(LENGTH(audio),0) b FROM voice_segments "
+                "ORDER BY start_ts ASC").fetchall():
+            ids.append(r["id"])
+            freed += r["b"] or 0
+            if freed >= need:
+                break
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            conn.execute("DELETE FROM voice_segments WHERE id IN (%s)"
+                         % ",".join("?" * len(chunk)), chunk)
+        log("MONITOR", "录音库超过容量上限 %d MB，已删除最老的 %d 段（释放约 %.1f MB）"
+            % (self.max_db_mb, len(ids), freed / 1048576.0))
+        return len(ids)
 
     def stats(self):
+        """录音库总览（界面要显示"存了多少、能留多久"）。"""
         with self._lock:
             conn = self._conn()
             seg = conn.execute(
-                "SELECT COUNT(*) c, COALESCE(SUM(frames),0) f FROM voice_segments").fetchone()
+                "SELECT COUNT(*) c, COALESCE(SUM(frames),0) f, "
+                "COALESCE(SUM(duration_ms),0) ms, COALESCE(SUM(LENGTH(audio)),0) b, "
+                "MIN(start_ts) t0, MAX(end_ts) t1 FROM voice_segments").fetchone()
             bc = conn.execute("SELECT COUNT(*) c FROM beacons").fetchone()
-            return {"segments": seg["c"], "frames": seg["f"], "beacons": bc["c"]}
+        return {
+            "segments": seg["c"], "frames": seg["f"], "beacons": bc["c"],
+            "seconds": round((seg["ms"] or 0) / 1000.0, 1),
+            "bytes": int(seg["b"] or 0),
+            "first_ts": seg["t0"] or 0, "last_ts": seg["t1"] or 0,
+            "retention_days": self.retention_days,      # 0 = 永久保留
+            "keep_forever": not self.retention_days,
+            "max_db_mb": self.max_db_mb,
+            "beacon_retention_days": self.beacon_retention_days,
+        }
 
 
 # -------------------- 监控主线程 --------------------
@@ -750,12 +998,28 @@ class VoiceMonitor(threading.Thread):
         self.mqtt_host = str(mon.get("mqtt_host", "127.0.0.1"))
         self.mqtt_port = int(mon.get("mqtt_port", 1883))
         self.report_voice = bool(mon.get("report_voice", True))
-        retention = int(mon.get("retention_days", 3) or 3)
+        # ★ 0 = 永久保留（用户要求"从部署那一刻开始就一直录、随时能听"）
+        try:
+            retention = int(mon.get("retention_days", 0) or 0)
+        except (TypeError, ValueError):
+            retention = 0
+        if retention < 0:
+            retention = 0
+        try:
+            max_db_mb = int(mon.get("max_db_mb", 0) or 0)
+        except (TypeError, ValueError):
+            max_db_mb = 0
+        try:
+            beacon_days = int(mon.get("beacon_retention_days", 30) or 30)
+        except (TypeError, ValueError):
+            beacon_days = 30
         self.master_url = str(self.config.get("master_url", "")).rstrip("/")
         self.subsystem_id = str(self.config.get("subsystem_id", ""))
         self.sync_token = str(self.config.get("sync_token")
                               or os.environ.get("FMO_SYNC_TOKEN", ""))
-        self.store = VoiceStore(os.path.join(base_dir, "voice.db"), retention)
+        self.store = VoiceStore(os.path.join(base_dir, "voice.db"), retention,
+                                max_db_mb=max_db_mb,
+                                beacon_retention_days=beacon_days)
         self._stop_event = threading.Event()
         self._segments = {}          # (callsign, session) -> 进行中的段
         self._recent_done = {}       # (callsign, session) -> 刚收尾的段（流式取尾用）

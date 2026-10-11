@@ -16,7 +16,9 @@
         "mqtt_host": "127.0.0.1",
         "mqtt_port": 1883,
         "report_voice": true,
-        "retention_days": 3
+        "retention_days": 0,
+        "max_db_mb": 2048,
+        "beacon_retention_days": 30
     },
     "dmrid": {
         "enabled": true,

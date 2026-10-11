@@ -1964,6 +1964,19 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         if path == '/api/monitor/beacons':
             self._handle_monitor_beacons(parsed.query)
             return
+        # ---- 录音库（★ 随时回听：按时间/呼号翻查、整区间导出、删除）----
+        if path == '/api/monitor/recordings':
+            self._handle_monitor_recordings(parsed.query)
+            return
+        if path == '/api/monitor/timeline':
+            self._handle_monitor_timeline(parsed.query)
+            return
+        if path == '/api/monitor/rec_stats':
+            self._handle_monitor_rec_stats(parsed.query)
+            return
+        if path == '/api/monitor/export':
+            self._handle_monitor_export(parsed.query)
+            return
 
         # 未知路径
         self.send_json({'ok': False, 'error': '路径不存在'}, 404)
@@ -2039,6 +2052,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         # 需求1：上报地址自动化（本机扫公网 IP 直接上报，不用手填/保存）
         if path == '/api/config/auto-address':
             self.handle_auto_address()
+            return
+
+        # 录音库：删除区间内的录音（需 confirm=true）
+        if path == '/api/monitor/delete_range':
+            self._handle_monitor_delete_range()
             return
 
         self.send_json({'ok': False, 'error': '路径不存在'}, 404)
@@ -2605,6 +2623,129 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(data)
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    # ---------- 录音库：随时回听 ----------
+    def _rec_query_params(self, query):
+        """解析录音库公共参数（from/to/呼号/来源）。"""
+        q = parse_qs(query or '')
+        try:
+            from_ts = float(q.get('from', ['0'])[0] or 0)
+        except ValueError:
+            from_ts = 0.0
+        try:
+            to_ts = float(q.get('to', ['0'])[0] or 0)
+        except ValueError:
+            to_ts = 0.0
+        callsign = (q.get('callsign', [''])[0] or '').strip().upper()
+        # origin: 不传=不过滤；local=只看本机；否则按给定值（如某对端节点 id）
+        o = q.get('origin', [None])[0]
+        if o is None or o == '':
+            origin = None if 'origin' not in q else ''
+        elif o == 'local':
+            origin = ''
+        elif o == 'bridge':
+            origin = '*'      # 非空 = 桥接转来的
+        else:
+            origin = o
+        return from_ts, to_ts, callsign, origin
+
+    def _handle_monitor_recordings(self, query):
+        """录音库列表（分页，只回元数据）。"""
+        mon = self._monitor_store_or_503()
+        if mon is None:
+            return
+        try:
+            from_ts, to_ts, callsign, origin = self._rec_query_params(query)
+            q = parse_qs(query or '')
+            limit = min(int(q.get('limit', ['200'])[0] or 200), 2000)
+            offset = max(int(q.get('offset', ['0'])[0] or 0), 0)
+            rows, total = mon.store.recordings(from_ts, to_ts, callsign=callsign,
+                                               origin=origin, limit=limit, offset=offset)
+            stats = mon.store.range_stats(from_ts, to_ts, callsign=callsign,
+                                          origin=origin)
+            self.send_json({'ok': True, 'recordings': rows, 'total': total,
+                            'range': stats, 'limit': limit, 'offset': offset,
+                            'now': time.time()})
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    def _handle_monitor_timeline(self, query):
+        """录音时间轴（哪段时间有声音，供界面画分布条）。"""
+        mon = self._monitor_store_or_503()
+        if mon is None:
+            return
+        try:
+            from_ts, to_ts, callsign, origin = self._rec_query_params(query)
+            q = parse_qs(query or '')
+            bucket = min(max(int(q.get('bucket', ['3600'])[0] or 3600), 60), 86400)
+            tl = mon.store.timeline(from_ts, to_ts, bucket_sec=bucket,
+                                    callsign=callsign, origin=origin)
+            self.send_json({'ok': True, 'timeline': tl, 'bucket': bucket,
+                            'from': from_ts, 'to': to_ts, 'now': time.time()})
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    def _handle_monitor_rec_stats(self, query):
+        """录音库总览（总量 + 保留策略 + 区间统计）。"""
+        mon = self._monitor_store_or_503()
+        if mon is None:
+            return
+        try:
+            from_ts, to_ts, callsign, origin = self._rec_query_params(query)
+            total = mon.store.stats()
+            rng = (mon.store.range_stats(from_ts, to_ts, callsign=callsign, origin=origin)
+                   if from_ts or to_ts else None)
+            self.send_json({'ok': True, 'total': total, 'range': rng,
+                            'now': time.time()})
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    def _handle_monitor_export(self, query):
+        """把区间内的录音合并成一个 Ogg/Opus 下载（整段时间一次听完）。"""
+        mon = self._monitor_store_or_503()
+        if mon is None:
+            return
+        try:
+            from_ts, to_ts, callsign, origin = self._rec_query_params(query)
+            body, n = mon.store.export_ogg(from_ts, to_ts, callsign=callsign,
+                                           origin=origin)
+            if not body:
+                self.send_json({'ok': False,
+                                'error': '该区间没有可导出的 Opus 录音'}, 404)
+                return
+            stamp = time.strftime('%Y%m%d-%H%M', time.localtime(from_ts or time.time()))
+            fname = 'fmo-voice-%s-%dseg.ogg' % (stamp, n)
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/ogg')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Content-Disposition',
+                             'attachment; filename="%s"' % fname)
+            self.send_header('X-Segments', str(n))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+
+    def _handle_monitor_delete_range(self):
+        """删除区间内的录音（前端需二次确认）。"""
+        mon = self._monitor_store_or_503()
+        if mon is None:
+            return
+        try:
+            body = self.read_body()
+            data = json.loads((body or b'{}').decode('utf-8') or '{}')
+            if not data.get('confirm'):
+                self.send_json({'ok': False, 'error': '缺少 confirm=true（防误删）'}, 400)
+                return
+            from_ts = float(data.get('from') or 0)
+            to_ts = float(data.get('to') or 0)
+            callsign = str(data.get('callsign') or '').strip().upper()
+            n = mon.store.delete_range(from_ts, to_ts, callsign=callsign)
+            self.send_json({'ok': True, 'deleted': n,
+                            'total': mon.store.stats()})
         except Exception as e:
             self.send_json({'ok': False, 'error': str(e)}, 500)
 

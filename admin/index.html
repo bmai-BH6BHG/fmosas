@@ -877,6 +877,59 @@
         </div>
     </div>
 
+    <!-- ★ 录音库：从部署那一刻起一直在录，按时间/呼号翻查、随时回听、可整段导出 -->
+    <div class="reg-form-wrap" style="margin-top:22px;">
+        <h2>📼 录音库
+            <span style="font-size:12px;color:#6c7a96;">一直在录 · 随时回听 · 默认永久保留</span>
+        </h2>
+        <div class="reg-row" style="flex-wrap:wrap;gap:8px;">
+            <label style="min-width:70px;color:#6c7a96;">日期</label>
+            <input type="date" id="rec-date" style="flex:0.4;min-width:150px;">
+            <label style="color:#6c7a96;">呼号</label>
+            <input type="text" id="rec-call" placeholder="留空=全部" style="flex:0.3;min-width:110px;">
+            <label style="color:#6c7a96;">来源</label>
+            <select id="rec-origin" style="flex:0.3;min-width:110px;">
+                <option value="">全部</option>
+                <option value="local">本机收的</option>
+                <option value="bridge">桥接转来的</option>
+            </select>
+            <button id="rec-load">查询</button>
+            <button class="sas-btn ghost" id="rec-today">今天</button>
+        </div>
+        <div class="reg-row">
+            <span id="rec-stats" style="color:#6c7a96;font-size:13px;">加载中…</span>
+        </div>
+        <!-- 24 小时分布条：哪段时间有声音，点一下就筛那一段 -->
+        <div id="rec-bars" style="display:flex;align-items:flex-end;gap:2px;height:46px;margin:6px 0 10px;"></div>
+        <div class="reg-row" style="gap:8px;flex-wrap:wrap;">
+            <button id="rec-play-all">▶ 顺序播放本区间</button>
+            <button class="sas-btn ghost" id="rec-export">⬇ 导出本区间（一个文件）</button>
+            <button class="sas-btn ghost" id="rec-del" style="color:#ff6b6b;">🗑 删除本区间</button>
+            <button class="sas-btn ghost" id="rec-stop">■ 停止播放</button>
+            <span id="rec-playing" style="color:#00e5ff;font-size:13px;"></span>
+        </div>
+        <div class="table-wrap" style="max-height:340px;overflow:auto;margin-top:6px;">
+            <table>
+                <thead><tr>
+                    <th style="width:150px;">时间</th><th style="width:100px;">呼号</th>
+                    <th style="width:90px;">时长</th><th style="width:80px;">编码</th>
+                    <th style="width:130px;">来源</th><th style="width:90px;">大小</th>
+                    <th>操作</th>
+                </tr></thead>
+                <tbody id="rec-tbody">
+                    <tr><td colspan="7" class="empty">选个日期，点「查询」</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="reg-row">
+            <span style="color:#5a6a86;font-size:12px;">
+                录音从服务启动那一刻就在写库（含互联桥接转来的声音）。默认 <b>永久保留</b>，
+                可用 <code>monitor.retention_days</code> 改按天保留、<code>monitor.max_db_mb</code> 设容量上限。
+            </span>
+        </div>
+        <div id="rec-result"></div>
+    </div>
+
     <!-- MQTT 地址配置（需求1：从原「APP 登录」流程迁到这里；不再有 APP 登录入口） -->
     <div class="reg-form-wrap" style="margin-top:22px;">
         <h2>📡 MQTT 地址配置</h2>
@@ -1142,6 +1195,237 @@ async function scanAddress(manual) {
     if (btn) btn.addEventListener('click', function () { scanAddress(true); });
 })();
 
+// ==================== 录音库（随时回听） ====================
+// 从服务启动那一刻起，语音段就在写库（含互联桥接转来的声音）；这里按时间/呼号翻查、
+// 逐条或连续回听、把整个区间导出成一个文件、必要时删除区间。
+var REC = {
+    inited: false, rows: [], total: 0, limit: 300, offset: 0,
+    filtHour: -1, seq: 0, playing: false
+};
+
+function recPad(n) { return (n < 10 ? '0' : '') + n; }
+function recToday() {
+    var d = new Date();
+    return d.getFullYear() + '-' + recPad(d.getMonth() + 1) + '-' + recPad(d.getDate());
+}
+function recDayBounds() {
+    var v = document.getElementById('rec-date').value || recToday();
+    var p = v.split('-');
+    if (p.length !== 3) { return [0, 0]; }
+    var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 0, 0, 0, 0);
+    var s = Math.floor(d.getTime() / 1000);
+    return [s, s + 86400];
+}
+function recFmtDur(ms) {
+    var s = (Number(ms) || 0) / 1000;
+    if (s < 60) { return (Math.round(s * 10) / 10) + ' 秒'; }
+    var m = Math.floor(s / 60), r = Math.round(s % 60);
+    return m + ' 分 ' + r + ' 秒';
+}
+function recFmtBytes(b) {
+    b = Number(b) || 0;
+    if (b < 1024) { return b + ' B'; }
+    if (b < 1048576) { return (b / 1024).toFixed(1) + ' KB'; }
+    return (b / 1048576).toFixed(2) + ' MB';
+}
+function recOriginLabel(o) {
+    return o ? ('桥接 · ' + String(o).replace(/^sub-/, '')) : '本机';
+}
+function recRangeQuery(extra) {
+    var b = recDayBounds(), from = b[0], to = b[1];
+    if (REC.filtHour >= 0) { from = b[0] + REC.filtHour * 3600; to = from + 3600; }
+    var q = '?from=' + from + '&to=' + to;
+    var cs = (document.getElementById('rec-call').value || '').trim();
+    if (cs) { q += '&callsign=' + encodeURIComponent(cs); }
+    var o = document.getElementById('rec-origin').value;
+    if (o) { q += '&origin=' + encodeURIComponent(o); }
+    return q + (extra || '');
+}
+function recInit() {
+    if (REC.inited) { return; }
+    REC.inited = true;
+    document.getElementById('rec-date').value = recToday();
+    document.getElementById('rec-load').addEventListener('click', function () {
+        REC.offset = 0; recLoad();
+    });
+    document.getElementById('rec-today').addEventListener('click', function () {
+        document.getElementById('rec-date').value = recToday();
+        document.getElementById('rec-call').value = '';
+        document.getElementById('rec-origin').value = '';
+        REC.filtHour = -1; REC.offset = 0; recLoad();
+    });
+    document.getElementById('rec-date').addEventListener('change', function () {
+        REC.filtHour = -1; REC.offset = 0; recLoad();
+    });
+    document.getElementById('rec-origin').addEventListener('change', function () {
+        REC.filtHour = -1; REC.offset = 0; recLoad();
+    });
+    document.getElementById('rec-call').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { REC.filtHour = -1; REC.offset = 0; recLoad(); }
+    });
+    document.getElementById('rec-play-all').addEventListener('click', recPlayAll);
+    document.getElementById('rec-stop').addEventListener('click', recStop);
+    document.getElementById('rec-export').addEventListener('click', recExport);
+    document.getElementById('rec-del').addEventListener('click', recDelete);
+    recLoad();
+}
+function recStop() {
+    REC.seq++;
+    REC.playing = false;
+    if (window.MON && MON.stopCurrentAudio) { MON.stopCurrentAudio(); }
+    document.getElementById('rec-playing').textContent = '';
+}
+async function recLoad() {
+    var st = document.getElementById('rec-stats');
+    var tb = document.getElementById('rec-tbody');
+    st.textContent = '加载中…';
+    try {
+        var r = await fetch('/api/monitor/recordings' +
+            recRangeQuery('&limit=' + REC.limit + '&offset=' + REC.offset)).then(function (x) { return x.json(); });
+        if (!r.ok) { throw new Error(r.error || '读取失败'); }
+        REC.rows = r.recordings || [];
+        REC.total = r.total || 0;
+        var tl = await fetch('/api/monitor/timeline' + recRangeQuery('&bucket=3600'))
+            .then(function (x) { return x.json(); });
+        var all = await fetch('/api/monitor/rec_stats').then(function (x) { return x.json(); });
+        recRenderBars((tl && tl.timeline) || []);
+        recRenderRows();
+        var t = (all && all.total) || {};
+        var keep = t.keep_forever ? '永久保留'
+            : ('保留 ' + (t.retention_days || 0) + ' 天');
+        var cap = t.max_db_mb ? ('，容量上限 ' + t.max_db_mb + ' MB') : '，未设容量上限';
+        st.innerHTML = '本区间：<b>' + (r.range.count || 0) + '</b> 段 · ' +
+            recFmtDur((r.range.seconds || 0) * 1000) + ' · ' + recFmtBytes(r.range.bytes) +
+            '　｜　全库：<b>' + (t.segments || 0) + '</b> 段 · ' + recFmtDur((t.seconds || 0) * 1000) +
+            ' · ' + recFmtBytes(t.bytes) +
+            (t.first_ts ? '（最早 ' + fmtTime(t.first_ts) + '）' : '') +
+            '　｜　' + keep + cap;
+    } catch (e) {
+        REC.rows = [];
+        tb.innerHTML = '<tr><td colspan="7" class="empty">读取失败: ' + esc(e.message) + '</td></tr>';
+        st.textContent = '读取失败';
+    }
+}
+function recRenderBars(tl) {
+    var box = document.getElementById('rec-bars');
+    var byHour = {};
+    var max = 1;
+    (tl || []).forEach(function (x) {
+        byHour[x.bucket] = x;
+        if (Number(x.seconds || 0) > max) { max = Number(x.seconds); }
+    });
+    var html = '';
+    for (var hh = 0; hh < 24; hh++) {
+        var x = byHour[hh] || { count: 0, seconds: 0 };
+        var pct = Math.max(2, Math.round((Number(x.seconds || 0) / max) * 100));
+        var on = (REC.filtHour === hh);
+        var col = on ? '#00e5ff' : (x.count ? 'rgba(0,229,255,.5)' : 'rgba(255,255,255,.08)');
+        html += '<div title="' + recPad(hh) + ':00–' + recPad(hh) + ':59　' + x.count +
+            ' 段 · ' + recFmtDur(Number(x.seconds || 0) * 1000) + '"' +
+            ' data-h="' + hh + '" style="flex:1;height:' + pct + '%;min-height:3px;' +
+            'background:' + col + ';border-radius:3px 3px 0 0;cursor:pointer;"></div>';
+    }
+    box.innerHTML = html;
+    Array.prototype.forEach.call(box.children, function (el) {
+        el.addEventListener('click', function () {
+            var hh = Number(el.getAttribute('data-h'));
+            REC.filtHour = (REC.filtHour === hh) ? -1 : hh;   // 再点一次取消
+            REC.offset = 0;
+            recLoad();
+        });
+    });
+}
+function recRenderRows() {
+    var tb = document.getElementById('rec-tbody');
+    if (!REC.rows.length) {
+        tb.innerHTML = '<tr><td colspan="7" class="empty">这个区间没有录音</td></tr>';
+        return;
+    }
+    tb.innerHTML = REC.rows.map(function (x, i) {
+        return '<tr>' +
+            '<td>' + fmtTime(x.start_ts) + '</td>' +
+            '<td><b>' + esc(x.callsign || '-') + '</b></td>' +
+            '<td>' + recFmtDur(x.duration_ms) + '</td>' +
+            '<td>' + esc(x.codec || '-') + '</td>' +
+            '<td>' + esc(recOriginLabel(x.origin)) + '</td>' +
+            '<td>' + recFmtBytes(x.audio_bytes) + '</td>' +
+            '<td><button class="sas-btn ghost rec-p" data-i="' + i + '" style="padding:2px 10px;">▶ 播放</button> ' +
+            '<a class="sas-btn ghost" style="padding:2px 10px;text-decoration:none;" ' +
+            'href="/api/monitor/audio?id=' + x.id + '" download="fmo-' + x.id + '.ogg">⬇ 下载</a></td>' +
+            '</tr>';
+    }).join('');
+    Array.prototype.forEach.call(tb.querySelectorAll('.rec-p'), function (b) {
+        b.addEventListener('click', function () {
+            recPlayOne(Number(b.getAttribute('data-i')));
+        });
+    });
+}
+function recPlayOne(i) {
+    var x = REC.rows[i];
+    if (!x) { return; }
+    REC.playing = false;         // 单条播放：停掉连续播放
+    if (window.MON && MON.playSegment) {
+        MON.playSegment({ id: x.id, callsign: x.callsign, codec: x.codec,
+                          start_ts: x.start_ts, duration_ms: x.duration_ms,
+                          origin: x.origin });
+    } else {
+        window.open('/api/monitor/audio?id=' + x.id, '_blank');
+    }
+}
+function recPlayAll() {
+    if (!REC.rows.length) { showToast('info', '没有录音', '这个区间没有可播放的录音'); return; }
+    REC.playing = true;
+    var mySeq = ++REC.seq;
+    var i = 0;
+    var label = document.getElementById('rec-playing');
+    function step() {
+        if (!REC.playing || mySeq !== REC.seq || i >= REC.rows.length) {
+            REC.playing = false;
+            label.textContent = '';
+            return;
+        }
+        var x = REC.rows[i];
+        label.textContent = '正在播放 ' + (i + 1) + '/' + REC.rows.length +
+            '：' + (x.callsign || '-') + ' ' + fmtTime(x.start_ts).slice(11);
+        recPlayOne(i);
+        i++;
+        setTimeout(step, Number(x.duration_ms || 0) + 900);
+    }
+    step();
+}
+function recExport() {
+    var url = '/api/monitor/export' + recRangeQuery();
+    showToast('info', '正在导出', '把本区间录音合并成一个 Ogg 文件…');
+    window.location.href = url;
+}
+async function recDelete() {
+    var b = recDayBounds();
+    var from = b[0], to = b[1];
+    if (REC.filtHour >= 0) { from = b[0] + REC.filtHour * 3600; to = from + 3600; }
+    var cs = (document.getElementById('rec-call').value || '').trim().toUpperCase();
+    var what = (REC.filtHour >= 0 ? (recPad(REC.filtHour) + ':00–' + recPad(REC.filtHour) + ':59')
+                                  : document.getElementById('rec-date').value) +
+        (cs ? ('　呼号 ' + cs) : '');
+    var ok = await confirmModal({
+        title: '删除录音',
+        body: '确认删除 ' + what + ' 的录音？删除后无法恢复。',
+        okText: '删除', danger: true, warn: true
+    });
+    if (!ok) { return; }
+    try {
+        var r = await fetch('/api/monitor/delete_range', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from: from, to: to, callsign: cs, confirm: true })
+        }).then(function (x) { return x.json(); });
+        if (!r.ok) { throw new Error(r.error || '删除失败'); }
+        showToast('ok', '已删除', '删除 ' + r.deleted + ' 段录音');
+        REC.offset = 0;
+        recLoad();
+    } catch (e) {
+        showToast('err', '删除失败', e.message);
+    }
+}
+
 // ==================== 初始化 ====================
 
 // 初始加载
@@ -1151,38 +1435,8 @@ scanAddress(false);        // 打开页面即自动扫描公网 IP 并直接上�
 // 每 5 秒刷新
 setInterval(loadData, 5000);
 
-// 手动注册表单提交
-document.getElementById('reg-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    var btn = document.getElementById('reg-btn');
-    var result = document.getElementById('reg-result');
-    var form = document.getElementById('reg-form');
-    btn.disabled = true;
-    btn.textContent = '添加中...';
-    result.className = '';
-    result.textContent = '';
-    try {
-        var formData = new FormData(form);
-        var resp = await fetch('/api/register', { method: 'POST', body: formData });
-        var data = await resp.json();
-        if (data.ok) {
-            result.className = 'ok';
-            result.textContent = '用户添加成功：' + (formData.get('callsign') || '');
-            form.reset();
-            loadData();
-        } else {
-            result.className = 'err';
-            result.textContent = data.error || '添加失败';
-        }
-    } catch (err) {
-        result.className = 'err';
-        result.textContent = '请求失败: ' + err.message;
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '添加用户';
-    }
-});
+// ★ 「手动注册表单提交」已移除：注册系统页已上移总系统，本页不再有该表单。
+//   （留着会对 null 调 addEventListener 抛错，把后面的初始化全断掉 —— 真实踩过）
 
 // ============================================================
 //  以下为新增：导航栏切换 + 通用组件 + SAS 配置界面
@@ -1286,12 +1540,16 @@ function switchPage(page) {
     tabs.forEach(function(t) {
         t.classList.toggle('active', t.getAttribute('data-page') === page);
     });
-    document.getElementById('page-register').style.display = (page === 'register') ? '' : 'none';
+    // ★ page-register 已移除（注册系统上移总系统）：这里不能再直接取它的 style，
+    //   否则切页时抛错、后面的分支全不执行。用存在性判断。
+    var pgReg = document.getElementById('page-register');
+    if (pgReg) pgReg.style.display = (page === 'register') ? '' : 'none';
     document.getElementById('page-sas').style.display = (page === 'sas') ? '' : 'none';
     document.getElementById('page-monitor').style.display = (page === 'monitor') ? '' : 'none';
 
     if (page === 'monitor') {
         monitorStart();
+        recInit();          // 录音库（进语音监控页才加载，省资源）
     } else {
         monitorStop();
     }
