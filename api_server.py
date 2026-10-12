@@ -2239,6 +2239,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        # ★ 管理页禁止缓存：否则升级后浏览器一直拿旧页面，用户以为"改了没生效"
+        #   （真实踩过：录音库播放修复在页面上看不到）。
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
         self.wfile.write(body)
 
@@ -2272,7 +2277,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-cache')
+        # ★ 必须重新校验：否则升级后浏览器还在跑旧的 js/css，页面行为与代码不一致
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
         self.wfile.write(body)
 

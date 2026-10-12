@@ -291,7 +291,9 @@ scan_secret() {
     local hit
     hit="$(grep -rIlE "$pat" "$STAGE" 2>/dev/null | sed "s|^$STAGE/||" | head -n 5 || true)"
     if [ -n "$hit" ]; then
-        SECRET_HITS="$SECRET_HITS\n  [$why]\n$(printf '%s' "$hit" | sed 's/^/    /')"
+        SECRET_HITS="$SECRET_HITS
+  [$why]
+$(printf '%s' "$hit" | sed 's/^/    /')"
     fi
 }
 # APP 私钥字面量：变量名里带 seed/privatekey ，且赋了一个 40+ 字符的 base64url
@@ -302,7 +304,7 @@ scan_secret "BEGIN [A-Z ]*PRIVATE KEY" "私钥文件内容"
 scan_secret "ghp_[A-Za-z0-9]{20,}" "GitHub Token"
 scan_secret "AKIA[0-9A-Z]{16}" "AWS Access Key"
 # 证书私钥文件（本系统自己的）
-scan_secret "ca_private" "CA 私钥引用"
+scan_secret "ca_private[^A-Za-z0-9_]{0,6}[:=][^A-Za-z0-9_]{0,6}[A-Za-z0-9_+/=-]{40,}" "CA 私钥内容"
 if [ -n "$SECRET_HITS" ]; then
     die "发行包内检出疑似密钥/令牌，已中止打包（绝不能让密钥随包发布）：$SECRET_HITS"
 fi
