@@ -1263,6 +1263,8 @@ function recInit() {
     document.getElementById('rec-call').addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { REC.filtHour = -1; REC.offset = 0; recLoad(); }
     });
+    var volEl = document.getElementById('mon-vol');
+    if (volEl) { volEl.addEventListener('input', recSetVolume); }
     document.getElementById('rec-play-all').addEventListener('click', recPlayAll);
     document.getElementById('rec-stop').addEventListener('click', recStop);
     document.getElementById('rec-export').addEventListener('click', recExport);
@@ -1272,8 +1274,7 @@ function recInit() {
 function recStop() {
     REC.seq++;
     REC.playing = false;
-    if (window.MON && MON.stopCurrentAudio) { MON.stopCurrentAudio(); }
-    document.getElementById('rec-playing').textContent = '';
+    recStopAudio();
 }
 async function recLoad() {
     var st = document.getElementById('rec-stats');
@@ -1349,9 +1350,10 @@ function recRenderRows() {
             '<td>' + esc(x.codec || '-') + '</td>' +
             '<td>' + esc(recOriginLabel(x.origin)) + '</td>' +
             '<td>' + recFmtBytes(x.audio_bytes) + '</td>' +
-            '<td><button class="sas-btn ghost rec-p" data-i="' + i + '" style="padding:2px 10px;">▶ 播放</button> ' +
-            '<a class="sas-btn ghost" style="padding:2px 10px;text-decoration:none;" ' +
-            'href="/api/monitor/audio?id=' + x.id + '" download="fmo-' + x.id + '.ogg">⬇ 下载</a></td>' +
+            '<td><button class="sas-btn rec-p" data-i="' + i + '" style="padding:2px 10px;">▶ 播放</button> ' +
+            '<a class="sas-btn ghost" style="padding:2px 8px;text-decoration:none;opacity:.75;font-size:12px;" ' +
+            'href="/api/monitor/audio?id=' + x.id + '" download="fmo-' + x.id + '.ogg"' +
+            ' title="下载原始 Ogg 文件（不是播放）">⬇ 原文件</a></td>' +
             '</tr>';
     }).join('');
     Array.prototype.forEach.call(tb.querySelectorAll('.rec-p'), function (b) {
@@ -1360,16 +1362,67 @@ function recRenderRows() {
         });
     });
 }
+var REC_AUDIO = null;        // 当前播放器（<audio>）
+
+function recAudioUrl(id, fmt) {
+    return '/api/monitor/audio?id=' + id + (fmt ? '&fmt=' + fmt : '');
+}
+function recSetVolume() {
+    var v = document.getElementById('mon-vol');
+    if (REC_AUDIO && v) { REC_AUDIO.volume = (Number(v.value) || 80) / 100; }
+}
+function recStopAudio() {
+    if (REC_AUDIO) {
+        try { REC_AUDIO.pause(); } catch (e) {}
+        REC_AUDIO = null;
+    }
+    if (window.MON && MON.stopCurrentAudio) {
+        try { MON.stopCurrentAudio(); } catch (e) {}
+    }
+    var l = document.getElementById('rec-playing');
+    if (l) l.textContent = '';
+}
 function recPlayOne(i) {
     var x = REC.rows[i];
     if (!x) { return; }
     REC.playing = false;         // 单条播放：停掉连续播放
-    if (window.MON && MON.playSegment) {
-        MON.playSegment({ id: x.id, callsign: x.callsign, codec: x.codec,
-                          start_ts: x.start_ts, duration_ms: x.duration_ms,
-                          origin: x.origin });
-    } else {
-        window.open('/api/monitor/audio?id=' + x.id, '_blank');
+    recStopAudio();
+    recStart(x, false);
+}
+function recStart(x, useMp3) {
+    // ★ 一律用 <audio> 播，并且**绝不能**在失败时 window.open(audio 地址)：
+    //   浏览器会把 audio/ogg 当文件下载 —— 用户报的"点了会下载不播放"就是它。
+    //   放不了就换服务端转好的 MP3（?fmt=mp3），仍不行则明确报错。
+    var a = new Audio(recAudioUrl(x.id, useMp3 ? 'mp3' : ''));
+    REC_AUDIO = a;
+    a.preload = 'auto';
+    recSetVolume();
+    var label = document.getElementById('rec-playing');
+    var who = (x.callsign || '-') + ' ' + String(fmtTime(x.start_ts)).slice(11);
+    if (label) {
+        label.textContent = '正在播放：' + who + (useMp3 ? '（已转 MP3）' : '');
+    }
+    a.onended = function () {
+        if (label && REC_AUDIO === a) { label.textContent = ''; }
+    };
+    a.onerror = function () {
+        if (REC_AUDIO !== a) { return; }
+        if (!useMp3) {
+            // 浏览器多半不能解码 Ogg/Opus（Safari / 微信 / 部分手机）→ 转 MP3 重试
+            if (label) { label.textContent = '浏览器放不了这个格式，正在转 MP3…'; }
+            recStart(x, true);
+        } else {
+            if (label) { label.textContent = ''; }
+            showToast('err', '无法播放', '这段录音转 MP3 后仍无法播放，请看服务器日志');
+        }
+    };
+    var pr = null;
+    try { pr = a.play(); } catch (e) { a.onerror(); return; }
+    if (pr && pr.catch) {
+        pr.catch(function () {
+            // 自动播放被拦 / 解码失败：交给 onerror 路径（转 MP3 重试）
+            if (REC_AUDIO === a && a.error) { a.onerror(); }
+        });
     }
 }
 function recPlayAll() {

@@ -13,6 +13,8 @@ import http.server
 import socketserver
 import socket
 import sqlite3
+import struct
+import subprocess
 import json
 import hashlib
 import os
@@ -142,6 +144,164 @@ _UDAC = None            # UDAC 中心单例（main() 里创建）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = None  # 稍后在 CONFIG 加载后基于域名/IP 动态设置
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
+# ==================== 录音转码（播放兜底） ====================
+# 录音存的是 Ogg/Opus（ADPCM 少数）：Safari/微信/部分手机浏览器**不能解码**，
+# 于是页面上"点了不播放"。这里提供 /api/monitor/audio?fmt=mp3 兜底：
+#   opus  → ffmpeg(libmp3lame) 转 MP3（任何浏览器都能播）
+#   adpcm → Python 解 IMA-ADPCM 成 WAV（WAV 也是全平台可播）
+# 结果按 (段id, 格式) 缓存，避免重复转码。
+VOICE_CACHE_DIR = os.path.join(BASE_DIR, "voice_cache")
+VOICE_CACHE_MAX_MB = 256          # 缓存上限，超了整体清空（都是可再生成的派生数据）
+
+_IMA_STEP = (7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37,
+             41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173,
+             190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+             724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+             2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484,
+             7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+             18500, 20350, 22385, 24623, 27086, 29794, 32767)
+_IMA_IDX = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+
+
+def _find_ffmpeg():
+    for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"):
+        if os.path.exists(p):
+            return p
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, "ffmpeg")
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+FFMPEG = _find_ffmpeg()
+
+
+def _adpcm_to_wav(audio, rate=8000):
+    """
+    存储格式的 ADPCM（每 323B = [valprev s16][index u8][320B IMA-ADPCM]）→ WAV(PCM16)。
+    ★ 算法与页面 admin/index.html 的 decodeAdpcmSegment **逐位一致**（高半字节在前），
+      否则解出来的声音会不对。
+    """
+    pcm = bytearray()
+    n = len(audio) // 323
+    for b in range(n):
+        off = b * 323
+        vp = struct.unpack_from("<h", audio, off)[0]
+        idx = audio[off + 2]
+        if idx > 88:
+            idx = 88
+        for i in range(320):
+            by = audio[off + 3 + i]
+            for h in (0, 1):
+                nib = (by >> 4) if h == 0 else (by & 0x0F)
+                step = _IMA_STEP[idx]
+                diff = step >> 3
+                if nib & 4:
+                    diff += step
+                if nib & 2:
+                    diff += step >> 1
+                if nib & 1:
+                    diff += step >> 2
+                vp = (vp - diff) if (nib & 8) else (vp + diff)
+                if vp > 32767:
+                    vp = 32767
+                elif vp < -32768:
+                    vp = -32768
+                idx += _IMA_IDX[nib]
+                if idx < 0:
+                    idx = 0
+                elif idx > 88:
+                    idx = 88
+                pcm += struct.pack("<h", vp)
+    if not pcm:
+        return None
+    data = bytes(pcm)
+    hdr = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + \
+        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + \
+        b"data" + struct.pack("<I", len(data))
+    return hdr + data
+
+
+def _cache_path(seg_id, fmt):
+    return os.path.join(VOICE_CACHE_DIR, "%d.%s" % (seg_id, fmt))
+
+
+def _cache_trim():
+    """缓存超过上限就整体清空（派生数据，重转即可）。"""
+    try:
+        total = 0
+        for fn in os.listdir(VOICE_CACHE_DIR):
+            fp = os.path.join(VOICE_CACHE_DIR, fn)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+        if total > VOICE_CACHE_MAX_MB * 1024 * 1024:
+            for fn in os.listdir(VOICE_CACHE_DIR):
+                try:
+                    os.unlink(os.path.join(VOICE_CACHE_DIR, fn))
+                except OSError:
+                    pass
+            print("[语音] 转码缓存超过 %d MB，已清空" % VOICE_CACHE_MAX_MB)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _transcode_audio(seg_id, codec, audio, fmt):
+    """
+    把一段录音转成 fmt（'mp3' / 'wav'）。成功返回 (bytes, content_type)，失败 (None, None)。
+    需要 ffmpeg 的只有 mp3；wav 是纯 Python。
+    """
+    try:
+        os.makedirs(VOICE_CACHE_DIR, exist_ok=True)
+        cp = _cache_path(seg_id, fmt)
+        if os.path.exists(cp):
+            with open(cp, "rb") as f:
+                body = f.read()
+            if body:
+                return body, ("audio/mpeg" if fmt == "mp3" else "audio/wav")
+        if fmt == "wav":
+            if codec != "adpcm":
+                return None, None
+            body = _adpcm_to_wav(audio)
+            if not body:
+                return None, None
+            ctype = "audio/wav"
+        elif fmt == "mp3":
+            if not FFMPEG:
+                return None, None
+            if codec == "opus":
+                src = ogg_wrap_opus(audio)
+            elif codec == "adpcm":
+                src = _adpcm_to_wav(audio)
+                if not src:
+                    return None, None
+            else:
+                return None, None
+            p = subprocess.run(
+                [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-i", "pipe:0", "-vn", "-c:a", "libmp3lame", "-b:a", "32k",
+                 "-f", "mp3", "pipe:1"],
+                input=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=30)
+            if p.returncode != 0 or not p.stdout:
+                print("[语音] ffmpeg 转码失败: %s" % (p.stderr or b"")[:200])
+                return None, None
+            body = p.stdout
+            ctype = "audio/mpeg"
+        else:
+            return None, None
+        try:
+            with open(cp, "wb") as f:
+                f.write(body)
+            _cache_trim()
+        except OSError:
+            pass
+        return body, ctype
+    except Exception as e:  # noqa: BLE001
+        print("[语音] 转码异常: %s" % e)
+        return None, None
+
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 PORT = 35928
 ONLINE_TIMEOUT = 15  # 在线判定：最后心跳在 15 秒内 = 在线
@@ -2565,10 +2725,26 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         try:
             q = parse_qs(query or '')
             seg_id = int(q.get('id', ['0'])[0] or 0)
+            want_fmt = (q.get('fmt', [''])[0] or '').strip().lower()
             codec, audio = mon.store.get_audio(seg_id)
             if audio is None:
                 self.send_json({'ok': False, 'error': '语音段不存在'}, 404)
                 return
+            # ★ 转码兜底：浏览器放不了 Ogg/Opus（Safari/微信/部分手机）时，
+            #   页面会用 ?fmt=mp3 再来一次；绝不能让它退化成"下载文件"。
+            if want_fmt in ('mp3', 'wav'):
+                t_body, t_ctype = _transcode_audio(seg_id, codec, audio, want_fmt)
+                if t_body:
+                    self.send_response(200)
+                    self.send_header('Content-Type', t_ctype)
+                    self.send_header('Content-Length', str(len(t_body)))
+                    self.send_header('X-Codec', '%s->%s' % (codec, want_fmt))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(t_body)
+                    return
+                # 转不了就退回原始格式（页面自己会再判断）
             body, ctype = audio, 'application/octet-stream'
             if codec == 'opus':
                 try:
