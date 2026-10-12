@@ -231,7 +231,6 @@ for F in bas_fmo_parser.py bas_emqx.py bas_identity.py bas_audit_db.py \
          bas_audit.py bas_http.py bas_migrate.py bas_emqx_auth.py bas_diagnose.py; do
     copy_path "$F" 1
 done
-copy_path tests 0
 copy_path admin 1
 for F in config.default.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh upgrade.sh uploads/.gitkeep; do
@@ -287,6 +286,33 @@ LEAK="$(find "$STAGE" -type f \( -name '*.db' -o -name '*.db-*' -o -name '*_priv
 if [ -n "$LEAK" ]; then
     die "staging 中仍存在敏感/运行时文件，已中止打包：$LEAK"
 fi
+
+# ★★ 内容级密钥扫描（安全事件后新增）：文件名干净不代表内容干净。
+#    真实事故：APP 私钥 seed 被硬编码在测试与文档里，而它们被一起打进了发行包 →
+#    私钥随公开仓库与每个 release 一起发出去。
+#    这里按**模式**扫（不把任何真实密钥写进本脚本），命中就中止打包。
+SECRET_HITS=""
+scan_secret() {
+    local pat="$1" why="$2"
+    local hit
+    hit="$(grep -rIlE "$pat" "$STAGE" 2>/dev/null | sed "s|^$STAGE/||" | head -n 5 || true)"
+    if [ -n "$hit" ]; then
+        SECRET_HITS="$SECRET_HITS\n  [$why]\n$(printf '%s' "$hit" | sed 's/^/    /')"
+    fi
+}
+# APP 私钥字面量：变量名里带 seed/privatekey ，且赋了一个 40+ 字符的 base64url
+scan_secret "(app[_-]?seed|official[_-]?seed|private[_-]?key)[^A-Za-z0-9_]{0,6}[:=][^A-Za-z0-9_]{0,6}[A-Za-z0-9_-]{40,}" "APP 私钥字面量"
+# 私钥文件标记
+scan_secret "BEGIN [A-Z ]*PRIVATE KEY" "私钥文件内容"
+# 常见平台令牌
+scan_secret "ghp_[A-Za-z0-9]{20,}" "GitHub Token"
+scan_secret "AKIA[0-9A-Z]{16}" "AWS Access Key"
+# 证书私钥文件（本系统自己的）
+scan_secret "ca_private" "CA 私钥引用"
+if [ -n "$SECRET_HITS" ]; then
+    die "发行包内检出疑似密钥/令牌，已中止打包（绝不能让密钥随包发布）：$SECRET_HITS"
+fi
+echo "      密钥内容自检: 通过（未发现 APP 私钥/私钥文件/平台令牌）"
 
 find "$STAGE" -type f | sed "s|^$STAGE/||" | LC_ALL=C sort > "$WORK/files.txt"
 FILECOUNT="$(wc -l < "$WORK/files.txt" | tr -d '[:space:]')"

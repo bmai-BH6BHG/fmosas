@@ -34,8 +34,8 @@
 已经给你生成好了，**这两个值直接抄进代码**：
 
 ```
-APP_SEED   = -zbIIPI-9Q1mecFCbXGdTm7rL3D8gSC64s16mmE06i0   ← 烧进 APP（写死，绝不上传）
-APP_PUBKEY = 4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0   ← 已写入服务端 config.dmrid.app_pubkey
+APP_SEED   = <用 `python gen_app_key.py` 生成>   ← 只烧进 APP，绝不上传、绝不入库
+APP_PUBKEY = <同一命令输出的公钥>   ← 用 `sudo fus-set-appkey --pubkey <公钥>` 写入服务端
 ```
 
 - `APP_SEED`：APP 的 Ed25519 私钥 seed（32 字节，base64url），**烧进 APP 代码**。
@@ -202,7 +202,7 @@ APP_SIG_B64  = （用你的 APP_SEED 签名，服务端会用 app_pubkey 验签�
 - [ ] 实现 `derive_keypair` / `build_key_proof` / `build_app_signature`
 - [ ] 国服登录成功后，调 `POST /api/cert/bind`（§6）
 - [ ] 绑定成功拿 `cert_int`/`cert_user`/`fingerprint`，用派生 seed 调 `buildMqttPassword`（§7）
-- [ ] 服务端 `config.dmrid`：`enabled=true`、`app_pubkey=4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0`、`dev_mode=false`
+- [ ] 服务端 `config.dmrid`：`enabled=true`、`app_pubkey=<你自己的公钥>`、`dev_mode=false`
 - [ ] 用 §8 黄金向量自测通过
 
 ---
