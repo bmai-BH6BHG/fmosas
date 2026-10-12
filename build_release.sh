@@ -165,7 +165,7 @@ echo "[2/8] 预检查（必需文件 + shell 语法）..."
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py bridge.py \
-         config.default.json config.json requirements.txt start.sh \
+         config.default.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh upgrade.sh fix_bridge_acl.sh \
          uploads/.gitkeep \
          CONTRACT.md dist/VERSION; do
@@ -233,7 +233,7 @@ for F in bas_fmo_parser.py bas_emqx.py bas_identity.py bas_audit_db.py \
 done
 copy_path tests 0
 copy_path admin 1
-for F in config.default.json config.json requirements.txt start.sh \
+for F in config.default.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh upgrade.sh uploads/.gitkeep; do
     copy_path "$F" 1
 done
