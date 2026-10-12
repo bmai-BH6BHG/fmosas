@@ -182,15 +182,15 @@ MQTT CONNECT(username, password)
 期望输出（完整见 `dmrid_kdf_spec.md` §6）：
 
 ```
-SEED_B64URL   = One0wH4EkQBBpnTWWdZl9ZfZ_J3WI_MMEd6U3klBXGk
-PUB_B64URL    = 4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI
+SEED_B64URL   = <示例 seed 占位>
+PUB_B64URL    = <示例 pubkey 占位>
 KEYPROOF_B64  = BQCG4-I0VwdGEj0pDbIUHYFUPPJBYHy41FXn9FHGpz-GJVt4PmMp1Ii-UP6WI3XQkfC82lwW-dSjFJsMawkBAg
 ```
 
 APP 签名自测（用 §2 的 APP_SEED，timestamp=1700000000，pubkey_b64 用上面的 PUB_B64URL）：
 
 ```
-SIGN_MSG     = FMO-APP-auth:1700000000:BG2XFM:4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI
+SIGN_MSG     = FMO-APP-auth:1700000000:BG2XFM:<示例 pubkey 占位>
 APP_SIG_B64  = （用你的 APP_SEED 签名，服务端会用 app_pubkey 验签；格式对即可）
 ```
 

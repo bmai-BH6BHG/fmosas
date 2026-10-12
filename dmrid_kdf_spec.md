@@ -236,10 +236,10 @@ proof.signature = base64url( Ed25519_sign(seed, CBOR(proof_tbs)) )
 ```
 SALT_ASCII    = FMO-DMRID-v1:BG2XFM
 SALT_HEX      = 464d4f2d444d5249442d76313a42473258464d
-SEED_HEX      = 3a77b4c07e04910041a674d659d665f597d9fc9dd623f30c11de94de49415c69
-SEED_B64URL   = One0wH4EkQBBpnTWWdZl9ZfZ_J3WI_MMEd6U3klBXGk
+SEED_HEX      = <示例 seed hex 占位>
+SEED_B64URL   = <示例 seed 占位>
 PUB_HEX       = e0c1e7f1cc7e2a3796871d6a1dc303fc7c94baf6f2ce345bb08bc2983410a5e2
-PUB_B64URL    = 4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI
+PUB_B64URL    = <示例 pubkey 占位>
 KEYPROOF_B64  = BQCG4-I0VwdGEj0pDbIUHYFUPPJBYHy41FXn9FHGpz-GJVt4PmMp1Ii-UP6WI3XQkfC82lwW-dSjFJsMawkBAg
 ```
 
@@ -268,15 +268,15 @@ PROOF_SIG_B64URL  = aDKApbL3IyH2qm1_wJp_kDTJqpsKc2s6lKfhARvpBZ7pJzdnad2QEk0vTiGl
 固定输入：
 
 ```
-app_seed     = LlC44l7IPTvVlvMhTnuYP9zzLnUJbfY1koiRZThOOuo   (base64url，对应私钥)
-app_pubkey   = IvYZ3WOGz4Cbvn7dDi783o5k1JycYYVSpY7ahe8LA5Q   (base64url，服务端配置)
+app_seed     = <示例 app_seed 占位>   (base64url，对应私钥)
+app_pubkey   = <示例 app_pubkey 占位>   (base64url，服务端配置)
 timestamp    = 1700000000
 callsign     = BG2XFM
-pubkey_b64   = 4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI   (上面 6.1 的 PUB_B64URL)
+pubkey_b64   = <示例 pubkey 占位>   (上面 6.1 的 PUB_B64URL)
 ```
 
 ```
-SIGN_MSG     = FMO-APP-auth:1700000000:BG2XFM:4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI
+SIGN_MSG     = FMO-APP-auth:1700000000:BG2XFM:<示例 pubkey 占位>
 APP_SIG_B64  = aJOcqF3T-cFjcUmIpNkENX3OD3H2vtN0mpq7IRBty8Ft0pf8eutiIWkk2o2V3Q_6KZc5k5L1_16RNZyK0LZiBw
 ```
 

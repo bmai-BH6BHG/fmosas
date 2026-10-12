@@ -130,7 +130,7 @@ curl -X POST http://127.0.0.1:35928/api/cert/bind \
   -H "Content-Type: application/json" \
   -d '{
     "callsign": "BG2XFM",
-    "pubkey": "4MHn8cx-KjeWhx1qHcMD_HyUuvbyzjRbsIvCmDQQpeI",
+    "pubkey": "<示例 pubkey 占位>",
     "key_proof": "BQCG4-I0VwdGEj0pDbIUHYFUPPJBYHy41FXn9FHGpz-GJVt4PmMp1Ii-UP6WI3XQkfC82lwW-dSjFJsMawkBAg",
     "app_timestamp": 1700000000,
     "app_signature": "aJOcqF3T-cFjcUmIpNkENX3OD3H2vtN0mpq7IRBty8Ft0pf8eutiIWkk2o2V3Q_6KZc5k5L1_16RNZyK0LZiBw"
@@ -156,7 +156,7 @@ curl -X POST http://127.0.0.1:35928/api/cert/bind \
     "enabled": true,
     "base_url": "https://dmriapi.radiowo.com",
     "timeout": 10,
-    "app_pubkey": "IvYZ3WOGz4Cbvn7dDi783o5k1JycYYVSpY7ahe8LA5Q",
+    "app_pubkey": "<示例 app_pubkey 占位>",
     "app_timestamp_window": 300,
     "verify_password": false,
     "kdf_algorithm": "pbkdf2",

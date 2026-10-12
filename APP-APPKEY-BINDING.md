@@ -83,15 +83,15 @@ MQTT CONNECT 的 `password` 原本就是 `base64url(JSON)`（内含 `certPackage
 固定输入，任何人算出来必须完全一致：
 
 ```
-APP_SEED (测试用)   = AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8     (32 字节 0x00..0x1f)
-APP_PUBKEY (测试用) = A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg
-userPubkeyB64       = qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo     (32 字节 0xAA)
+APP_SEED (测试用)   = <32字节假密钥·示例占位>     (32 字节 0x00..0x1f)
+APP_PUBKEY (测试用) = <对应公钥·示例占位>
+userPubkeyB64       = <用户公钥·示例占位>     (32 字节 0xAA)
 callsign            = bh6bhg          → 消息里用大写 BH6BHG
 clientid            = FMO-BH6BHG-1075-B373
 timestamp           = 1791050000
 
 拼接后的消息 =
-FMO-APP-mqtt:1791050000:BH6BHG:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo:FMO-BH6BHG-1075-B373
+FMO-APP-mqtt:1791050000:BH6BHG:<用户公钥·示例占位>:FMO-BH6BHG-1075-B373
 
 期望 app_signature =
 H4AHq0IC3R28czvOss0YGZHQOE9B_MwIroEXN8GYBBGzKy73VM1t9XbSFO3awVtZHDoxHE1Hk_tzqHXDmfNwDQ
