@@ -1387,42 +1387,54 @@ function recPlayOne(i) {
     if (!x) { return; }
     REC.playing = false;         // 单条播放：停掉连续播放
     recStopAudio();
-    recStart(x, false);
+    // ★ 直接要 MP3：录音存的是 Ogg/Opus，Safari/微信/部分手机放不了；
+    //   服务端有 ffmpeg 就转 MP3，任何浏览器都能播（不赌浏览器解码器）。
+    recStart(x, 'mp3');
 }
-function recStart(x, useMp3) {
-    // ★ 一律用 <audio> 播，并且**绝不能**在失败时 window.open(audio 地址)：
+function recStart(x, fmt) {
+    // fmt: 'mp3'（首选）| ''（原始 Ogg，兜底）
+    // ★ 无论哪条失败路径，都**绝不** window.open(audio 地址)：
     //   浏览器会把 audio/ogg 当文件下载 —— 用户报的"点了会下载不播放"就是它。
-    //   放不了就换服务端转好的 MP3（?fmt=mp3），仍不行则明确报错。
-    var a = new Audio(recAudioUrl(x.id, useMp3 ? 'mp3' : ''));
+    var a = new Audio(recAudioUrl(x.id, fmt));
     REC_AUDIO = a;
     a.preload = 'auto';
     recSetVolume();
     var label = document.getElementById('rec-playing');
     var who = (x.callsign || '-') + ' ' + String(fmtTime(x.start_ts)).slice(11);
-    if (label) {
-        label.textContent = '正在播放：' + who + (useMp3 ? '（已转 MP3）' : '');
-    }
+    if (label) { label.textContent = '正在播放：' + who; }
+    var done = false;            // 防止"error 与 play 拒绝"双重触发
     a.onended = function () {
         if (label && REC_AUDIO === a) { label.textContent = ''; }
     };
-    a.onerror = function () {
-        if (REC_AUDIO !== a) { return; }
-        if (!useMp3) {
-            // 浏览器多半不能解码 Ogg/Opus（Safari / 微信 / 部分手机）→ 转 MP3 重试
-            if (label) { label.textContent = '浏览器放不了这个格式，正在转 MP3…'; }
-            recStart(x, true);
-        } else {
-            if (label) { label.textContent = ''; }
-            showToast('err', '无法播放', '这段录音转 MP3 后仍无法播放，请看服务器日志');
+    function fail(why) {
+        if (done || REC_AUDIO !== a) { return; }
+        done = true;
+        if (fmt === 'mp3') {
+            // 转码这条路不通（服务端没 ffmpeg 等）→ 试原始格式
+            if (label) { label.textContent = 'MP3 转码不可用，改用原始格式…'; }
+            recStart(x, '');
+            return;
         }
-    };
+        if (label) { label.textContent = ''; }
+        showToast('err', '无法播放',
+                  '浏览器无法播放这段录音（' + (why || '解码失败') + '）。' +
+                  '可点「⬇ 原文件」下载后用本地播放器打开。');
+    }
+    a.onerror = function () { fail('解码失败'); };
     var pr = null;
-    try { pr = a.play(); } catch (e) { a.onerror(); return; }
+    try {
+        pr = a.play();
+    } catch (e) {
+        fail(String(e && e.message || e));
+        return;
+    }
     if (pr && pr.catch) {
-        pr.catch(function () {
-            // 自动播放被拦 / 解码失败：交给 onerror 路径（转 MP3 重试）
-            if (REC_AUDIO === a && a.error) { a.onerror(); }
+        pr.catch(function (e) {
+            // 注意：这里**不能**只看 a.error —— 解码失败时它常为 null，
+            // 上一版就是因此"点了没反应"。一律按失败处理。
+            fail(String(e && e.message || e));
         });
+        if (pr.then) { pr.then(function () { done = false; }); }
     }
 }
 function recPlayAll() {
