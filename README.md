@@ -389,7 +389,9 @@ git push origin v1.0.0
 * `ca/ca_private.json`（CA 私钥）、`*_users.db`、`*_sas.db`、`voice.db`、`udac.db`、审计库、`uploads/`
   均为运行时敏感数据，已在 `.gitignore` 排除，发布包中也不包含。
 * 管理端口（公网口 + 1）只在内网使用，不要做端口映射（UDAC / 桥接 / SAS 页都在这里）。
-* APP 私钥 `APP_SEED` 只烧进 APP，不要写进 `config.json` 或上传服务器。
+* APP 私钥 `APP_SEED` **只烧进 APP**：不要写进 `config.json`、不要上传服务器、
+  **不要贴进代码/文档/工单**。服务端只保存对应的公钥（`dmrid.app_pubkey`）。
+  本仓库不再内置任何 APP 密钥，也不在发版包里带 `tests/`，打包时会扫描密钥字面量。
 * UDAC 的「直通」只针对**已经在别处完成验证**的接入（APP 签名 / APP 客户端 / 内部豁免 / MQTT 桥接），
   普通用户仍走完整的信任评分与策略门控；如需收紧，见上面的排障表。
 
