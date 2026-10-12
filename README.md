@@ -379,10 +379,10 @@ git push origin v1.0.0
 
 ## 文档
 
+> 接口文档（API / 绑定协议 / KDF 规格）不随本仓库与发行包发布。
+
 * [INSTALL.md](INSTALL.md) — 一键部署：发布、参数、默认行为、故障排查
 * [部署教程.md](部署教程.md) — 架构、配置项、API、SAS 认证、分布式同步
-* [API.md](API.md) — 接口清单
-* [dmrid_bind_api.md](dmrid_bind_api.md) / [dmrid_kdf_spec.md](dmrid_kdf_spec.md) — 国服 ID 绑定接口与 KDF 规格
 
 ## 安全
 

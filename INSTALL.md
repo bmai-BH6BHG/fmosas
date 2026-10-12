@@ -340,8 +340,6 @@ curl -fsSL <BASE>/uninstall.sh | sudo bash -s -- --purge
 
 * [README.txt](README.txt) — 部署包说明与接口列表
 * [部署教程.md](部署教程.md) — 完整的架构、配置项、API、SAS、同步说明
-* [API.md](API.md) — 接口细节
-* [dmrid_bind_api.md](dmrid_bind_api.md) / [dmrid_kdf_spec.md](dmrid_kdf_spec.md) — 国服 ID 绑定接口与 KDF 规格
 * [CONTRACT.md](CONTRACT.md) — 本次一键部署改造的接口契约（开发/维护者用）
 
 ---
