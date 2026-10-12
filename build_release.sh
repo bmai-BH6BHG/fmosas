@@ -238,18 +238,12 @@ for F in config.default.json requirements.txt start.sh \
 done
 # 文档（缺失只告警，不阻断打包；Lead 负责增补）
 copy_path README.txt 0
-copy_path API.md 0
 copy_path INSTALL.md 0
 copy_path 部署教程.md 0
 copy_path CONTRACT.md 0
-copy_path APP-APPKEY-BINDING.md 0
 # 注意：dist/VERSION 必须在下面的 "rm -rf ... $STAGE/dist" 剪枝之后放入 staging，
 #       否则会被一并删除（发布包需要它，客户端安装脚本会优先读取站根 VERSION）。
-for F in "$REPO"/dmrid_*.md; do
-    if [ -e "$F" ]; then
-        copy_path "$(basename "$F")" 0
-    fi
-done
+# ★ API 文档一律不进发行包（接口清单/绑定协议/KDF 规格都不对外发布）
 
 # 兜底剪枝：即使上游目录混入运行时产物也绝不进包
 find "$STAGE" -type d -name '__pycache__' -prune -exec rm -rf -- {} + 2>/dev/null || true
@@ -313,6 +307,16 @@ if [ -n "$SECRET_HITS" ]; then
     die "发行包内检出疑似密钥/令牌，已中止打包（绝不能让密钥随包发布）：$SECRET_HITS"
 fi
 echo "      密钥内容自检: 通过（未发现 APP 私钥/私钥文件/平台令牌）"
+
+# ★ API 文档不进包（用户要求：接口文档不对外发布）
+DOC_LEAK="$(find "$STAGE" -type f \( -name 'API.md' -o -name '*-api.md' \
+        -o -name '*_api.md' -o -name 'dmrid_*spec*.md' -o -name '*BINDING*.md' \
+        -o -path '*/spec/*.md' \) -print 2>/dev/null || true)"
+if [ -n "$DOC_LEAK" ]; then
+    die "发行包内出现 API 文档（不应对外发布），已中止打包：$DOC_LEAK"
+fi
+echo "      API 文档自检: 通过（包内无接口文档）"
+
 
 find "$STAGE" -type f | sed "s|^$STAGE/||" | LC_ALL=C sort > "$WORK/files.txt"
 FILECOUNT="$(wc -l < "$WORK/files.txt" | tr -d '[:space:]')"
