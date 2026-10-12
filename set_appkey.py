@@ -54,13 +54,13 @@ import sys
 import time
 
 # ---------------------------------------------------------------- 常量
-# 官方 APP 验签公钥（Ed25519，base64url）。这是**公开**信息，写死在服务端没问题。
-# 对应的私钥 seed 只存在于 APP 内部，不在这里、也不在任何发行包中。
-#   原始公钥 hex: e0b2f692b5ce16f56216f6dd3f7a6f4c92b6a595cc21135643a9f3f23a7982bd
-#   SPKI hex    : 302a300506032b6570032100e0b2f692b5ce16f56216f6dd3f7a6f4c92b6a595cc21135643a9f3f23a7982bd
-OFFICIAL_APP_PUBKEY = "4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0"
-OFFICIAL_APP_PUBKEY_HEX = ("e0b2f692b5ce16f56216f6dd3f7a6f4c92b6a595cc21"
-                           "135643a9f3f23a7982bd")
+# ★ 这里**故意不内置任何 APP 公钥**。
+#   以前内置了"官方 APP 公钥"：等于把 APP 的信任锚随源码/发版包发给所有人，
+#   而对应的私钥 seed 曾随源码一起公开（安全事件）—— 所有部署共用一把 APP 密钥
+#   本身就是单点风险，一旦私钥外泄就是全网点可被冒充。
+#   现在：每个部署必须自己生成密钥对，并把公钥用
+#         sudo fus-set-appkey --pubkey <你的公钥>
+#   写入 config.json 的 dmrid.app_pubkey；没写入则 APP 签名路径 fail-closed。
 
 SERVICE = "fmo-subsystem"
 CONFIG_CANDIDATES = [
@@ -213,18 +213,16 @@ def cmd_show(args, path, cfg):
                                        if cur is not None else "(未设置)")]
     if keys:
         for i, k in enumerate(keys):
-            tag = "官方公钥 ✓" if str(k).strip() == OFFICIAL_APP_PUBKEY else "非官方"
-            lines.append("  [%d] %s   %s" % (i, k, tag))
+            lines.append("  [%d] %s" % (i, k))
     else:
         lines.append("  ⚠ 未配置：生产环境下 APP 绑定会被拒绝（fail-closed）。")
-        lines.append("    执行 `sudo fus-set-appkey` 写入官方公钥即可。")
+        lines.append("    生成密钥对后执行：")
+        lines.append("      python gen_app_key.py                       # 生成 APP_SEED / APP_PUBKEY")
+        lines.append("      sudo fus-set-appkey --pubkey <APP_PUBKEY>   # 只把公钥写入服务端")
     if dm.get("app_seed"):
         lines.append("dmrid.app_seed: (已保存，长度 %d)" % len(str(dm.get("app_seed"))))
     lines.append("dmrid.enabled: %s" % dm.get("enabled", False))
     emit(args, {"ok": True, "config": path, "app_pubkey": cur,
-                "official": OFFICIAL_APP_PUBKEY,
-                "is_official": bool(keys) and all(
-                    str(k).strip() == OFFICIAL_APP_PUBKEY for k in keys),
                 "app_seed_saved": bool(dm.get("app_seed"))}, lines)
     return 0
 
@@ -234,12 +232,10 @@ def cmd_verify(args, path, cfg):
     cur = dm.get("app_pubkey")
     keys = cur if isinstance(cur, list) else ([cur] if cur else [])
     keys = [str(k).strip() for k in keys if str(k).strip()]
-    has_official = OFFICIAL_APP_PUBKEY in keys
     problems = []
     if not keys:
-        problems.append("未配置任何 APP 公钥 → 生产环境 APP 绑定会被拒绝")
-    elif not has_official:
-        problems.append("当前公钥里没有官方公钥：%s" % OFFICIAL_APP_PUBKEY)
+        problems.append("未配置任何 APP 公钥 → 生产环境 APP 绑定会被拒绝"
+                        "（用 sudo fus-set-appkey --pubkey <你的公钥> 写入）")
     # 若传了 seed，顺便校验 seed 与配置的公钥是否是同一对
     seed_note = ""
     if args.seed:
@@ -254,7 +250,6 @@ def cmd_verify(args, path, cfg):
             else:
                 seed_note += "  → 与配置一致 ✓"
     lines = ["配置文件: %s" % path,
-             "官方公钥: %s" % OFFICIAL_APP_PUBKEY,
              "当前公钥: %s" % (", ".join(keys) if keys else "(无)")]
     if seed_note:
         lines.append(seed_note)
@@ -263,13 +258,12 @@ def cmd_verify(args, path, cfg):
         for p in problems:
             lines.append("✗ %s" % p)
         emit(args, {"ok": False, "config": path, "keys": keys,
-                    "has_official": has_official, "problems": problems},
-             lines)
+                    "problems": problems}, lines)
         return 1
     lines.append("")
     lines.append("✓ 配置正确：服务端会用该公钥校验 APP 签名")
     emit(args, {"ok": True, "config": path, "keys": keys,
-                "has_official": has_official, "problems": []}, lines)
+                "problems": []}, lines)
     return 0
 
 
@@ -346,8 +340,11 @@ def main(argv=None):
             return 2
         source = "--seed 推导"
     else:
-        want = OFFICIAL_APP_PUBKEY
-        source = "官方公钥（默认）"
+        print("✗ 需要显式给出公钥：\n"
+              "    生成密钥对: python gen_app_key.py\n"
+              "    写入公钥  : sudo fus-set-appkey --pubkey <APP_PUBKEY>\n"
+              "  （本工具不再内置任何 APP 公钥）", file=sys.stderr)
+        return 2
 
     if not existed:
         # 配置不存在：给出一个最小可用结构，避免写出半截文件
@@ -383,14 +380,13 @@ def main(argv=None):
         "app_pubkey": dm["app_pubkey"],
         "previous": old if old is not None else None,
         "changed": changed,
-        "is_official": want == OFFICIAL_APP_PUBKEY,
         "dry_run": bool(args.dry_run),
         "app_seed_saved": bool(dm.get("app_seed")),
     }
 
     lines = ["配置文件: %s" % path,
              "公钥来源: %s" % source,
-             "公钥: %s%s" % (want, "   (官方公钥)" if want == OFFICIAL_APP_PUBKEY else ""),
+             "公钥: %s" % want,
              "之前: %s" % (json.dumps(old, ensure_ascii=False) if old else "(未设置)")]
 
     if args.dry_run:

@@ -516,10 +516,14 @@ DMRID_DEFAULT = {
     'enabled': False,                             # 是否启用国服ID绑定
     'base_url': 'https://dmriapi.radiowo.com',    # 国服后端 Base URL（不含 /api）
     'timeout': 10,                                # 国服请求超时（秒）
-    # APP 签名公钥（base64url，Ed25519）。内置**官方 APP 公钥**，新装系统开箱即可
-    # 校验官方 APP 的签名；不需要 APP 签名校验的部署可在 config.json 里显式设为 ""（fail-closed）。
-    # 换密钥/补密钥用专门命令：sudo fus-set-appkey（见 set_appkey.py）。
-    'app_pubkey': '4LL2krXOFvViFvbdP3pvTJK2pZXMIRNWQ6nz8jp5gr0',
+    # ★ APP 签名公钥（base64url，Ed25519）——**故意不内置**：
+    #   每个部署必须用 `sudo fus-set-appkey` 写入自己的公钥。
+    #   以前这里内置了"官方 APP 公钥"，等于是把 APP 的信任锚随源码/发版包发给所有人：
+    #   公钥本身虽不是秘密，但"所有部署都用同一把 APP 密钥"是单点风险，
+    #   一旦私钥外泄就是全网点被冒充（真实发生过：私钥 seed 曾随源码公开）。
+    #   为空时一律 fail-closed（未配置就不放行 APP 签名路径），
+    #   本地自测请用 dev_mode 或显式写入自己的公钥。
+    'app_pubkey': '',
     'app_timestamp_window': 300,                  # APP 签名时间戳允许窗口（秒）
     'verify_password': False,                     # False=仅查呼号存在(简化)；True=校验密码(强校验)
     'kdf_algorithm': 'pbkdf2',                    # pbkdf2 | scrypt（客户端派生用，须与 APP 一致）
