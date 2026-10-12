@@ -141,6 +141,15 @@ RTT_PROBE_INTERVAL = 10.0             # 对链路定期发 PINGREQ 测 RTT 的�
 PLAY_QUEUE_MAX = 2000                 # 重播（去抖动）队列上限，满了按"对端过载"丢帧计数
 JITTER_BUFFER_DEFAULT_MS = 80         # 音频流抖动缓冲默认值（0 = 关闭透传）
 JITTER_BUFFER_MAX_MS = 1000
+# ★ 抖动/丢包只在"同一次连续发言"内统计：帧间隔超过它 = 新的一次发言（中间是静默），
+#   静默既不是抖动也不是丢包。早期版本把静默算进去，报出"抖动 19608ms / MOS 1.0"全是假数。
+BURST_GAP_MS = 400.0
+# 单次"间隔差"超过它就明显不是网络抖动（是切段/异常），不采信，避免污染 EWMA
+JITTER_SANE_MAX_MS = 250.0
+# 本机连接读超时：决定重播队列的排空节奏（原来 5s，导致抖动缓冲释放被推迟）
+LOCAL_READ_TIMEOUT = 0.05
+# 迟到超过它就丢弃：宁可断一下，也不放几秒前的旧语音（实时语音要的是"现在"）
+LATE_DROP_MS = 2000.0
 MOS_TARGET = 4.5                      # MOS 满分参考（ITU-T P.800），仅做本地估算
 
 
@@ -390,7 +399,8 @@ class BridgeLink(threading.Thread):
         self.audio_gap_avg_ms = 0.0    # 帧间隔均值（EWMA）
         self.audio_jitter_ms = 0.0     # 到达间隔抖动（EWMA，RFC3550 风格）
         self.audio_gap_max_ms = 0.0    # 观察期内最大帧间隔
-        self.audio_loss_suspect = 0    # 疑似丢帧次数（间隔骤增 3 倍以上）
+        self.audio_loss_suspect = 0    # 疑似丢帧次数（同一发言内间隔骤增 3 倍以上）
+        self.audio_bursts = 0          # 连续发言段数（用来算"平均每段多少帧"）
         self._codec = "unknown"        # 最近识别到的载荷封装
         # 集群成员确认：连上先只订阅名片，收到"已加入集群"的名片才开始收语音。
         # 这样"装了本系统但没加入集群"的站不会被当成员，也不会白白收它的流量。
@@ -440,6 +450,9 @@ class BridgeLink(threading.Thread):
                 "gap_avg_ms": round(self.audio_gap_avg_ms, 1),
                 "gap_max_ms": round(self.audio_gap_max_ms, 1),
                 "loss_suspect": self.audio_loss_suspect,
+                "bursts": self.audio_bursts,
+                # 注：真实"重播延迟"在**服务级**的 health/audio 里 —— 重播发生在本机
+                #     连接上，不属于某一条对端链路；这里不重复放，免得界面看到恒为 0 的假值。
                 "mos_estimate": estimate_mos(self.audio_jitter_ms, loss_rate),
             },
         }
@@ -596,11 +609,16 @@ class BridgeLink(threading.Thread):
         # ---------------- 需求2：音频流到达指标（抖动/丢帧嫌疑） ----------------
         if self.audio_last_at:
             gap = (now - self.audio_last_at) * 1000.0
-            if 0.0 <= gap < 60000.0:
+            if gap > BURST_GAP_MS:
+                # ★ 两次发言之间的静默：不是抖动、也不是丢包 —— 重新起算基线
+                self.audio_bursts += 1
+                self.audio_gap_avg_ms = 0.0
+            elif 0.0 <= gap < BURST_GAP_MS:
                 if self.audio_gap_avg_ms:
                     # RFC3550 风格抖动估计：J += (|D| - J) / 16，D=相邻间隔之差
                     d = abs(gap - self.audio_gap_avg_ms)
-                    self.audio_jitter_ms += (d - self.audio_jitter_ms) / 16.0
+                    if d <= JITTER_SANE_MAX_MS:      # 明显不合理的差值不采信
+                        self.audio_jitter_ms += (d - self.audio_jitter_ms) / 16.0
                     self.audio_gap_avg_ms += (gap - self.audio_gap_avg_ms) / 8.0
                     if gap > max(3.0 * self.audio_gap_avg_ms,
                                  self.audio_gap_avg_ms + 150.0):
@@ -685,6 +703,9 @@ class VoiceBridge(object):
         # 吸收网络抖动（0 = 逐帧透传）。FIFO 顺序下 release_at 单调不减，
         # 队首未到期时后面的也不会到期，O(1) 判断即可。
         self._play = collections.deque()
+        self._replay_delay_ms = 0.0       # ★ 真实重播延迟（帧到达→重播出去，EWMA）
+        self._replay_delay_max_ms = 0.0   # 观察期内最大重播延迟
+        self._replay_late_dropped = 0     # 迟到过多被丢弃的帧数
         self._play_lock = threading.Lock()
         self._dedupe = {}
         self._injected = {}          # 本机重播出去的内容摘要（回环抑制）
@@ -904,7 +925,8 @@ class VoiceBridge(object):
                     # ★ 读超时调小：本机连接除了收源生语音，还负责把"对端转来的
                     #   语音"重播出去（跨线程经队列投递）。如果用默认 5s 读超时，
                     #   重播要等这次读超时才发生 → 互联语音最多晚 5 秒，实时语音不可接受。
-                    read_timeout=0.2)
+                    #   0.05s：抖动缓冲该释放就释放，实测重播延迟 ~80~110ms。
+                    read_timeout=LOCAL_READ_TIMEOUT)
                 self._local_client = client
                 client.connect()
                 # 只订阅**源生**主题：FMO/RAW、FMO/TELE。
@@ -1004,11 +1026,23 @@ class VoiceBridge(object):
                 if head[0] > now:
                     return                      # 还没到释放时间
                 item = self._play.popleft()
-            _, topic, payload = item
+            _, enq_at, topic, payload = item
+            # ★ 真实延迟 = 从这一帧**到达**到真正**重播出去**（含抖动缓冲）
+            delay_ms = (now - enq_at) * 1000.0
+            if delay_ms > LATE_DROP_MS:
+                # 迟到太多（对端堵了/本机卡了）：宁可断一下，也不放几秒前的旧语音
+                with self._lock:
+                    self._stats["dropped_late"] = \
+                        self._stats.get("dropped_late", 0) + 1
+                continue
             try:
                 client.publish(topic, payload)
                 with self._lock:
-                    self._stats["replayed"] += 1
+                    # 先记延迟指标，再记计数：计数万一出问题也不能把延迟丢掉
+                    self._replay_delay_ms += (delay_ms - self._replay_delay_ms) / 16.0
+                    if delay_ms > self._replay_delay_max_ms:
+                        self._replay_delay_max_ms = delay_ms
+                    self._stats["replayed"] = self._stats.get("replayed", 0) + 1
             except Exception as e:  # noqa: BLE001
                 self.log("[BRIDGE] 本机重播失败: %s" % e)
                 return
@@ -1220,7 +1254,7 @@ class VoiceBridge(object):
             if len(self._play) >= PLAY_QUEUE_MAX:
                 over = True
             else:
-                self._play.append((now + self._jitter_buffer_ms / 1000.0,
+                self._play.append((now + self._jitter_buffer_ms / 1000.0, now,
                                    channel_topic(channel), payload))
         if over:
             self.log("[BRIDGE] 重播队列已满，丢弃一帧（对端流量过载/消费过慢）")
@@ -1635,6 +1669,9 @@ class VoiceBridge(object):
             if enabled and local_state == "disabled":
                 local_state = "connecting"
             local_rtt_ms = float(self._local_rtt_ms)
+            replay_delay_ms = float(self._replay_delay_ms)
+            replay_delay_max = float(self._replay_delay_max_ms)
+            late_dropped = int(stats.get("dropped_late", 0))
             codec_seen = self._codec_seen
             jb_ms = int(self._jitter_buffer_ms)
         with self._play_lock:
@@ -1697,17 +1734,27 @@ class VoiceBridge(object):
                     worst_mos = min(worst_mos, float(m)) if worst_mos else float(m)
         health = {
             "local_rtt_ms": round(local_rtt_ms, 1),
+            # ★ 真实"桥接延迟"：对端语音帧到达本机 → 重播出去用了多久（含抖动缓冲）
+            "replay_delay_ms": round(replay_delay_ms, 1),
+            "replay_delay_max_ms": round(replay_delay_max, 1),
             "reconnects_total": reconnects_total,
             "packet_loss_rate": round(worst_loss, 4),
+            # 抖动：**只在同一次连续发言内**统计（静默不再被当成抖动）
             "jitter_ms": round(worst_jitter, 1),
             "queue_depth": queue_depth,
+            "late_dropped": late_dropped,
         }
         audio = {
             "jitter_buffer_ms": jb_ms,
             "codec": codec_seen,
             "replayed": stats.get("replayed", 0),
             "dropped_queue_full": stats.get("dropped_queue_full", 0),
-            "dropped_late": stats.get("dropped_late", 0),
+            "dropped_late": late_dropped,
+            "replay_delay_ms": round(replay_delay_ms, 1),
+            "replay_delay_max_ms": round(replay_delay_max, 1),
+            # 端到端延迟粗估：对端→本机单程(RTT/2) + 抖动缓冲 + 重播排队
+            "one_way_estimate_ms": round(
+                (local_rtt_ms / 2.0) + jb_ms + replay_delay_ms, 1),
             "mos_estimate": (round(worst_mos, 2) if worst_mos is not None
                              else round(estimate_mos(worst_jitter, worst_loss), 2)
                              if members else None),

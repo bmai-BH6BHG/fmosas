@@ -78,3 +78,17 @@ sas.db
 sas.db-journal
 sas.db-wal
 sas.db-shm
+
+# ---------------------------------------------------------------
+# 实例运行期数据：绝不入库（节点身份/审计/决策都在这几个文件里）
+#   ★ 分发模板是 config.default.json；安装脚本据此生成用户的 config.json
+# ---------------------------------------------------------------
+config.json
+udac.db
+udac.db-journal
+udac.db-wal
+udac.db-shm
+*_audit.db
+*_audit.db-journal
+*_audit.db-wal
+*_audit.db-shm

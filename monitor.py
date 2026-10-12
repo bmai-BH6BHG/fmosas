@@ -387,31 +387,62 @@ class MqttMiniClient:
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
-    def _read_packet(self):
-        """读取一个完整 MQTT 包。超时返回 None（用于 keepalive）。"""
-        first = self._recv_exact(1)
-        if first is None:
+    def _try_parse_buf(self):
+        """
+        从接收缓冲区里尝试取出一个完整 MQTT 包；**不足则返回 None 且完全不动缓冲区**。
+
+        ★★ 为什么必须这样（真实丢语音的根因）：
+
+          原写法是「先吃掉首字节和 remaining-length，再去读包体；包体一超时就返回 None」——
+          首个字节已经被消费掉了。于是当一个包的首部与包体**分两个 TCP 段到达**时
+          （读超时很短、或网络/负载抖动时很常见）：
+            包体留在缓冲区里，而它已经没有头部 → 从此**整个字节流解析错位**：
+            后面每个包都被当成垃圾丢掉（=静默丢语音），或解析出乱七八糟的主题。
+          桥接本机连接把读超时调到 0.05s 之后立刻大量触发（8 个中继集成测试全挂）。
+
+          改成"只在凑齐一个完整包时才消费缓冲区"，半包原样留着等下一批数据，
+          就绝不会错位 —— 短读超时也就安全了。
+        """
+        if not self._buf:
             return None
-        # remaining length（变长）
-        mult = 1
-        rl = 0
-        for _ in range(4):
-            b = self._recv_exact(1)
-            if b is None:
-                return None
-            rl += (b[0] & 0x7F) * mult
-            if not (b[0] & 0x80):
+        b0 = self._buf[0]
+        mult, rl, i = 1, 0, 1
+        while True:
+            if i >= len(self._buf):
+                return None                      # remaining-length 还没到齐
+            b = self._buf[i]
+            rl += (b & 0x7F) * mult
+            i += 1
+            if not (b & 0x80):
                 break
             mult *= 128
-        else:
-            raise MqttError("remaining length 非法")
-        body = b""
-        if rl:
-            body = self._recv_exact(rl)
-            if body is None:
-                return None
+            if i > 4:
+                # 长度域非法：这种流已经救不回来了，让上层断开重连
+                raise MqttError("remaining length 非法")
+        if len(self._buf) < i + rl:
+            return None                          # 包体还没到齐（保留半包，绝不消费）
+        body = bytes(self._buf[i:i + rl])
+        self._buf = self._buf[i + rl:]
         self._last_io = time.time()
-        return first[0], body
+        return b0, body
+
+    def _read_packet(self):
+        """
+        读取一个完整 MQTT 包。暂时没数据时返回 None（用于 keepalive）。
+
+        半包会留在 `self._buf` 里，下一次调用继续拼 —— 不会丢包、不会错位。
+        """
+        while True:
+            pkt = self._try_parse_buf()
+            if pkt is not None:
+                return pkt
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout:
+                return None                      # 半包留在缓冲区，下次继续
+            if not chunk:
+                raise MqttError("连接被关闭")
+            self._buf += chunk
 
     def _send(self, data):
         self._sock.sendall(data)

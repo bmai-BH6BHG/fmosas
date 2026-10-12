@@ -187,9 +187,11 @@
   }
 
   /* ---------------- 运行统计 ---------------- */
-  function card(k, v, cls) {
+  function card(k, v, cls, sub) {
     return '<div class="card"><div class="k">' + esc(k) + '</div>'
-      + '<div class="v' + (cls ? ' ' + cls : '') + '">' + esc(v) + '</div></div>';
+      + '<div class="v' + (cls ? ' ' + cls : '') + '">' + esc(v) + '</div>'
+      + (sub ? '<div class="k" style="margin-top:2px;opacity:.65;">' + esc(sub) + '</div>' : '')
+      + '</div>';
   }
   function renderStats(j) {
     var l = j.local || {};
@@ -202,6 +204,12 @@
       card('已加入状态', j.enabled ? '已加入' : '未加入', j.enabled ? 'ok' : '') +
       card('集群成员数', num(j.member_count)) +
       card('本机 broker 延迟', h.local_rtt_ms != null ? num(h.local_rtt_ms) + ' ms' : '—') +
+      // ★ 真实"桥接延迟"：对端语音帧到达本机 → 重播出去用了多久（含抖动缓冲）
+      card('桥接延迟', h.replay_delay_ms != null ? num(h.replay_delay_ms) + ' ms' : '—',
+           (typeof h.replay_delay_ms === 'number' && h.replay_delay_ms < 250) ? 'ok' : '',
+           h.replay_delay_max_ms ? ('峰值 ' + num(h.replay_delay_max_ms) + ' ms') : '') +
+      card('单向延迟估算', a.one_way_estimate_ms != null ? num(a.one_way_estimate_ms) + ' ms' : '—',
+           (typeof a.one_way_estimate_ms === 'number' && a.one_way_estimate_ms < 350) ? 'ok' : '') +
       card('链路抖动', h.jitter_ms != null ? num(h.jitter_ms) + ' ms' : '—',
            (typeof h.jitter_ms === 'number' && h.jitter_ms < 30) ? 'ok' : '') +
       card('疑似丢包', h.packet_loss_rate != null ? (num(h.packet_loss_rate * 100) + '%') : '—') +
@@ -209,8 +217,11 @@
       card('重连次数', num(h.reconnects_total || 0)) +
       card('抖动缓冲', a.jitter_buffer_ms != null ? num(a.jitter_buffer_ms) + ' ms' : '—');
     $('br-stats-src').textContent = '已加入状态 = 本机有没有加入集群；broker 延迟 = PING 往返；'
-      + '抖动 = 链路帧到达间隔波动（<30ms 为佳）；疑似丢包 = 帧间隔骤增判定的丢失比例；'
-      + 'MOS = 音质估算（≥3.5 良好，来自最差一条成员链路）；抖动缓冲可吸收到达抖动，设置里可调。';
+      + '桥接延迟 = 对端语音帧到达本机→重播出去（含抖动缓冲，这是"听起来慢不慢"的关键）；'
+      + '单向延迟估算 = 对端单程 + 抖动缓冲 + 重播排队；'
+      + '抖动 = 同一段发言内帧到达间隔的波动（<30ms 为佳，两次发言之间的静默不计入）；'
+      + '疑似丢包 = 同一段发言内帧间隔骤增的占比；'
+      + 'MOS = 音质估算（≥3.5 良好，取最差一条成员链路）；抖动缓冲可吸收到达抖动，设置里可调。';
   }
 
   /* ---------------- 成员列表（只读为主） ---------------- */
