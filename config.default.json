@@ -26,7 +26,7 @@
         "timeout": 10,
         "app_pubkey": "",
         "app_timestamp_window": 300,
-        "verify_password": false,
+        "verify_password": true,
         "kdf_algorithm": "pbkdf2",
         "kdf_pbkdf2_iterations": 600000,
         "kdf_scrypt_n": 32768,
