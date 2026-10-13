@@ -1293,14 +1293,21 @@ def _fetch_master_clusters():
 
 
 def _is_public_ip(ip):
-    """是不是公网 IP（本机扫到的地址必须是公网 IP，内网/回环对 APP 与对端都没用）。"""
+    """是否是公网 IP（排除保留段）。"""
+    t = str(ip or '').strip().strip('[]')
+    if not t:
+        return False
     try:
-        from ipaddress import ip_address
-        a = ip_address(str(ip or "").strip())
+        import ipaddress
+        a = ipaddress.ip_address(t)
         return not (a.is_private or a.is_loopback or a.is_link_local
                     or a.is_multicast or a.is_reserved or a.is_unspecified)
     except Exception:  # noqa: BLE001
         return False
+
+
+# IP 字面量判定用（互联/上报地址"是不是域名"就看它）
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
 # UDAC 决策线程池：认证主链路绝不能被 UDAC 拖住
@@ -1425,31 +1432,94 @@ def _master_observed_ip(timeout=8):
             continue
     return '', ''
 
+def _looks_like_ip(text):
+    """判断字符串是不是 IP 字面量（v4/v6）。域名/主机名一律 False。"""
+    t = str(text or '').strip().strip('[]')
+    if not t:
+        return False
+    if _IPV4_RE.match(t):
+        return True
+    try:
+        import ipaddress
+        return ':' in t and bool(ipaddress.ip_address(t))
+    except Exception:  # noqa: BLE001
+        return ':' in t
+
+
+def host_is_domain(host):
+    """是不是域名（而不是 IP 字面量）—— 互联/上报"该不该用域名"就看它。"""
+    h = str(host or '').strip().strip('[]')
+    return bool(h) and not _looks_like_ip(h)
+
+
+def resolve_host(host, timeout=6.0, retries=2):
+    """
+    把域名解析成 IP（带超时与重试）——**互联与上报统一走这里**。
+
+    为什么需要它：动态 IP 场景下域名是唯一稳定入口，但 DNS 偶有失败/超时；
+    直接 socket.getaddrinfo 抛异常会让桥接线程把"域名"当成"永远连不上"，
+    界面只显示"连接失败"，排查时看不出是 DNS 问题（真实被问过）。
+
+    返回 (ip or '', 错误说明)。host 是 IP 字面量时原样返回。
+    """
+    h = str(host or '').strip().strip('[]')
+    if not h:
+        return '', '地址为空'
+    if _looks_like_ip(h):
+        return h, ''
+    last = ''
+    for _ in range(max(1, retries)):
+        try:
+            infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+            for it in infos:
+                ip = str(it[4][0]).split('%')[0]
+                if ip:
+                    return ip, ''
+            last = '解析结果为空'
+        except Exception as e:  # noqa: BLE001
+            last = '%s: %s' % (type(e).__name__, e)
+    return '', ('域名解析失败（%s）' % last) if last else '域名解析失败'
+
+
 def auto_apply_public_address(force_report=False):
     """
-    需求1：上报地址自动化。
+    上报地址：**域名优先，绝不被自动扫描覆盖**。
 
-    扫本机公网 IP → **直接写进配置并上报总系统**，不再有"填写地址 → 保存 → 再上传"
-    的三步流程。地址没变就什么都不做（幂等）。
+    真实事故（用户反馈）："明明设置好了域名，又被系统强行变回来" ——
+    旧逻辑每 10 分钟扫一次公网 IP，然后**无条件覆盖 app_domain**，
+    手动填的域名被覆写成 IP；动态 IP 一变上报地址跟着变 → 互联全断。
 
-    返回 {ok, address, source, changed} 或 {ok: False, error}。
+    现在的规则：
+      1. app_domain 已配置且**是域名**（不是 IP 字面量）→ 一律不碰，
+         只按它上报（这才是"用域名上报"）；
+      2. app_domain 为空 → 扫一个公网 IP 兜底，并提示"请改用域名"；
+      3. app_domain 是个 IP（历史遗留）→ **不**自动改成扫到的 IP，
+         只在扫描到不同 IP 时打日志提示（绝不把用户域名覆写成 IP）。
     """
-    ip, source = _master_observed_ip()
-    if not ip:
-        return {'ok': False, 'error': '没扫到公网 IP（总系统不可达，外部回显也不通）'}
     try:
         port = int(CONFIG.get('app_port') or CONFIG.get('port') or PORT)
     except (TypeError, ValueError):
         port = PORT
-    old = str(CONFIG.get('app_domain') or '').strip()
-    try:
-        old_port = int(CONFIG.get('app_port') or 0)
-    except (TypeError, ValueError):
-        old_port = 0
-    changed = (old != ip) or (old_port != port) or (CONFIG.get('app_use_port') is False)
-    if not changed and not force_report:
-        return {'ok': True, 'address': '%s:%d' % (ip, port),
-                'source': source, 'changed': False}
+    cur = str(CONFIG.get('app_domain') or '').strip()
+    # 规则 1：手动填了域名 → 绝不动它（用户要的"用域名、别改我的"）
+    if cur and not _looks_like_ip(cur):
+        return {'ok': True, 'address': '%s:%d' % (cur, port),
+                'source': '手动配置的域名', 'changed': False,
+                'note': '已按域名上报；自动扫描不会覆盖它'}
+    if cur and _looks_like_ip(cur):
+        # 规则 3：历史遗留 IP —— 只提示，不覆盖（用户要的是改成域名）
+        ip, source = _master_observed_ip()
+        if ip and ip != cur:
+            print("[CONFIG] 注意：上报地址当前是 IP（%s），而公网 IP 已变成 %s；"
+                  "动态 IP 会变，建议把 app_domain 改成域名（改成后自动扫描"
+                  "不会再覆盖它）" % (cur, ip))
+        return {'ok': True, 'address': '%s:%d' % (cur, port),
+                'source': '配置里的地址（IP）', 'changed': False,
+                'note': '当前是 IP，建议改用域名；自动扫描不会覆盖它'}
+    # 规则 2：没填地址 → 扫一个公网 IP 兜底（并提示换域名）
+    ip, source = _master_observed_ip()
+    if not ip:
+        return {'ok': False, 'error': '没扫到公网 IP（总系统不可达，外部回显也不通）'}
     CONFIG['app_domain'] = ip
     CONFIG['app_port'] = port
     CONFIG['app_use_port'] = True
@@ -1458,9 +1528,8 @@ def auto_apply_public_address(force_report=False):
             json.dump(CONFIG, f, indent=4, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'error': '保存配置失败: %s' % e}
-    print("[CONFIG] 上报地址自动更新: %s → %s:%d（来源：%s）"
-          % (old or '(空)', ip, port, source))
-    # 立刻上报：总系统那边马上按新地址显示，不用等下一个上报周期
+    print("[CONFIG] 未配置域名，先用公网 IP 兜底: %s:%d（来源：%s）；"
+          "★ 动态 IP 会变，建议尽快把 app_domain 改成域名" % (ip, port, source))
     try:
         eng = _SYNC_ENGINE
         if eng is not None:
@@ -1468,7 +1537,8 @@ def auto_apply_public_address(force_report=False):
     except Exception as e:  # noqa: BLE001
         print("[CONFIG] 自动上报失败（下个周期会补上）: %s" % e)
     return {'ok': True, 'address': '%s:%d' % (ip, port),
-            'source': source, 'changed': True}
+            'source': source, 'changed': True,
+            'note': 'IP 只是兜底；请改用域名'}
 
 
 def start_auto_address_loop(stop_event=None, interval=600.0):

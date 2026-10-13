@@ -74,6 +74,21 @@ except Exception:
 DEFAULT_SYNC_INTERVAL = 30           # 增量上报间隔（秒）
 DEFAULT_FULL_REPORT_INTERVAL = 300   # 全量上报间隔（秒，5 分钟）
 DEFAULT_PULL_INTERVAL = 60           # 从总系统拉取间隔（秒）
+def _is_ip_literal_local(text):
+    """IP 字面量判定（上报/互联用；与 api_server._looks_like_ip 同口径）。"""
+    import ipaddress as _ip
+    import re as _re
+    t = str(text or '').strip().strip('[]')
+    if not t:
+        return False
+    if _re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", t):
+        return True
+    try:
+        return ':' in t and bool(_ip.ip_address(t))
+    except Exception:  # noqa: BLE001
+        return ':' in t
+
+
 DEFAULT_PEER_SYNC_INTERVAL = 60      # P2P 同步间隔（秒）
 HTTP_TIMEOUT = 10                    # HTTP 请求超时（秒）
 
@@ -837,6 +852,21 @@ class SyncEngine:
                 domain = urlparse(api_url).hostname or ''
             except Exception:  # noqa: BLE001
                 domain = ''
+        # ★ 上报地址**必须用域名**：动态 IP 会变，IP 一变总系统和所有对端手里的
+        #   地址全部失效 → 互联失败（用户明确要求：上报用域名，不要用 IP）。
+        # 1) domain 是 IP 而 api_url 里带的是域名 → 用域名
+        if domain and _is_ip_literal_local(domain) and api_url:
+            try:
+                h = urlparse(api_url).hostname or ''
+                if h and not _is_ip_literal_local(h):
+                    domain = h
+            except Exception:  # noqa: BLE001
+                pass
+        # 2) 还在用 IP 上报 → 日志说清楚风险与改法（不阻断，避免老部署升级后突然不上报）
+        if domain and _is_ip_literal_local(domain):
+            log('SYNC', '上报地址当前是 IP（%s）：动态 IP 会变，一变总系统与所有'
+                        '对端的地址就失效。请把 app_domain 改成域名后重启；'
+                        '改成域名后本系统不会再自动覆盖它' % domain)
 
         # ★ 上报"**别人该用哪个地址来连我的 broker**"（bridge.advertise_broker）。
         #   注意**不能**用 monitor.mqtt_host：那是我自己连自己 broker 用的地址，
