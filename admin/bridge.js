@@ -288,7 +288,15 @@
         + '" data-id="' + esc(id) + '">' +
       '<div class="br-head">' +
         '<span class="br-name">' + esc(p.name || id || '(未命名候选)') + '</span>' +
-        '<span class="br-host">' + esc((p.host || '—') + ':' + (p.port || 1883)) + '</span>' +
+        '<span class="br-host">' + esc((p.host || '—') + ':' + (p.port || 1883))
+          + (p.host_is_domain === false
+              ? ' <span class="br-pill warn" style="margin-left:4px;"'
+                + ' title="动态 IP 会变，一变就互联失败；建议改成域名">IP·会变</span>'
+              : (p.host_is_domain === true
+                  ? ' <span class="br-pill ok" style="margin-left:4px;"'
+                    + ' title="域名互联：IP 变了域名不变，互联更稳">域名</span>'
+                  : ''))
+          + '</span>' +
       '</div>' +
       '<div class="br-badges">' + badges.join('') + '</div>' +
       '<div class="br-meta">' + meta.join('') + '</div>' +

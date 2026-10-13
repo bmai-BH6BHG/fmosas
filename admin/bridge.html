@@ -325,12 +325,13 @@
     <summary>手动补充（名册里没有的站点）</summary>
     <div class="muted small" style="margin:6px 0;line-height:1.8;">
       一般不需要。只有对端还没上报到总服务器、或它的 MQTT 不是默认端口时才用。
-      补充进来的地址会和自动发现的站点一样，按「加入集群」的开关去互联。
+      补充进来的地址会和自动发现的站点一样，按「加入集群」的开关去互联。<br>
+      <b>请优先填域名，不要填 IP</b>：动态 IP 会变，一变就互联失败；域名不变。
     </div>
     <div class="panel">
       <div class="form">
         <label>名称<input id="br-f-name" placeholder="某某站（可留空）"></label>
-        <label>主机<input id="br-f-host" placeholder="fs.example.com 或 1.2.3.4"></label>
+        <label>主机（域名）<input id="br-f-host" placeholder="fs.example.com（推荐用域名）"></label>
         <label>端口<input id="br-f-port" type="number" min="1" max="65535" value="1883"></label>
         <label>备注<input id="br-f-note" placeholder="备注（选填）"></label>
       </div>

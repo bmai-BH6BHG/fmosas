@@ -64,8 +64,13 @@ import collections
 import hashlib
 import json
 import os
+import re
+import socket
 import threading
 import time
+
+# 填了 IP 的互联地址只提示一次（动态 IP 会变，域名才是稳定入口）
+_IP_HOST_WARNED = set()
 
 try:
     from monitor import MqttError, MqttMiniClient
@@ -285,6 +290,47 @@ def parse_in_topic(topic):
     return origin, parts[3].upper()
 
 
+
+_DNS_CACHE = {}          # host -> (ip, err, 过期时刻)
+_DNS_CACHE_TTL = 60.0    # 秒：动态 IP 场景缓存别太久，一变要能跟上
+_DNS_LOCK = threading.Lock()
+
+
+def _resolve_host_cached(host):
+    """带短缓存的域名解析（互联用）。返回 (ip or '', 错误说明)。"""
+    import socket as _s
+    import time as _t
+    h = str(host or "").strip().strip("[]")
+    if not h:
+        return "", "地址为空"
+    if not _host_is_domain(h):
+        return h, ""
+    now = _t.time()
+    with _DNS_LOCK:
+        hit = _DNS_CACHE.get(h)
+        if hit and hit[2] > now:
+            return hit[0], hit[1]
+    last = ""
+    ip = ""
+    for _ in range(2):                     # 重试一次，DNS 偶发抖动
+        try:
+            infos = _s.getaddrinfo(h, None, proto=_s.IPPROTO_TCP)
+            for it in infos:
+                cand = str(it[4][0]).split("%")[0]
+                if cand:
+                    ip = cand
+                    break
+            if ip:
+                break
+            last = "解析结果为空"
+        except Exception as e:  # noqa: BLE001
+            last = "%s: %s" % (type(e).__name__, e)
+    err = "" if ip else ("域名解析失败（%s）" % last if last else "域名解析失败")
+    with _DNS_LOCK:
+        _DNS_CACHE[h] = (ip, err, now + _DNS_CACHE_TTL)
+    return ip, err
+
+
 def peer_id_from_host(host, port=None):
     """
     对端没有显式 id 时，用 host(+port) 派生一个稳定 id。
@@ -298,6 +344,29 @@ def peer_id_from_host(host, port=None):
     return "peer-" + hashlib.sha1(h.encode("utf-8")).hexdigest()[:10]
 
 
+def _host_is_domain(host):
+    """host 是不是域名（不是 IP 字面量）。"""
+    h = str(host or "").strip().strip("[]")
+    if not h:
+        return False
+    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", h):
+        return False
+    return ":" not in h or "." in h.replace(":", ".")
+
+
+def _note_ip_host(host):
+    """填了 IP 时提示一次（同一条 IP 只提示一次，避免刷屏）。"""
+    global _IP_HOST_WARNED
+    try:
+        if host in _IP_HOST_WARNED:
+            return
+        _IP_HOST_WARNED.add(host)
+        print("[BRIDGE] 注意：互联地址填的是 IP（%s）。动态 IP 会变，一变就互联失败；"
+              "建议改成域名（host 填域名即可）" % host)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def normalize_peer(raw):
     """把配置里的对端条目规范化（容错：缺字段、类型不对都不崩）。"""
     p = raw if isinstance(raw, dict) else {}
@@ -308,11 +377,17 @@ def normalize_peer(raw):
         port = DEFAULT_PORT
     if not (0 < port < 65536):
         port = DEFAULT_PORT
+    # ★ 互联地址**优先用域名**：动态 IP 会变，域名才是稳定入口。
+    #   这里只做记录与提示，不强制（内网互联用 IP 也合理）。
+    hd = _host_is_domain(host)
+    if host and not hd:
+        _note_ip_host(host)
     return {
         "id": str(p.get("id") or "").strip() or peer_id_from_host(host, port),
         "name": str(p.get("name") or "").strip() or host,
         "host": host,
         "port": port,
+        "host_is_domain": hd,
         # enabled = 「加入」：我连它、听它的语音（单方面添加即可收听）
         "enabled": bool(p.get("enabled", True)),
         "note": str(p.get("note") or ""),
@@ -486,6 +561,14 @@ class BridgeLink(threading.Thread):
             self.not_member = False
             client = None
             try:
+                # ★ 域名先解析（带重试/超时）：动态 IP 场景域名是唯一稳定入口，
+                #   但 DNS 失败时若不过这一关，界面只会显示"连接失败"，
+                #   排查时完全看不出是域名解析问题（真实被问过）。
+                ph = str(self.peer.get("host") or "").strip()
+                if ph and _host_is_domain(ph):
+                    ip, derr = _resolve_host_cached(ph)
+                    if not ip:
+                        raise MqttError(derr or "域名解析失败")
                 creds = self.svc.credentials(self.peer["host"], self.peer["port"])
                 if not creds:
                     raise MqttError("本机监控证书不可用（ca/monitor_cert.json），无法向对端认证")
