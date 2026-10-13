@@ -670,7 +670,9 @@ load_sas_runtime_config()
 #       再用本机 Int CA 把其公钥签进用户证书，实现：
 #         - 用户无需保存/传输证书文件，凭国服账号密码即可完全接入（绑定→登录→MQTT）；
 #         - MQTT 认证仍走证书链 + proof 私钥签名，密码不出现在 MQTT 报文。
-# 与 DMRID 后端交互仅发生在「绑定」这一次（校验账号密码），之后不再调用。
+# 与 DMRID 后端交互仅发生在「绑定」这一次（校验国服账号），之后不再调用。
+# ★ 证书下发口径（已确定）：只验证**国服 ID** —— 用 /api/auth/login 校验国服账号，
+#   只要该账号有 guojiId 就签发；**不**再因为「国际 ID 未识别」而拒绝。
 
 DMRID_DEFAULT = {
     'enabled': False,                             # 是否启用国服ID绑定
@@ -685,7 +687,12 @@ DMRID_DEFAULT = {
     #   本地自测请用 dev_mode 或显式写入自己的公钥。
     'app_pubkey': '',
     'app_timestamp_window': 300,                  # APP 签名时间戳允许窗口（秒）
-    'verify_password': False,                     # False=仅查呼号存在(简化)；True=校验密码(强校验)
+    # ★ 默认 True：证书下发改用国服**登录**校验（呼号+密码）——
+    #   国服的 callsign-lookup 只在「国际 ID 被识别」时才给 guojiId，
+    #   拿它当门槛等于在验证国际 ID；登录接口返回的是国服账号的 guojiId。
+    #   口径：**只要有国服 ID 就发证**（黑名单仍然拦截）。
+    #   False 时退化为旧的 callsign-lookup 宽松模式（需 APP 不提交密码时用）。
+    'verify_password': True,
     'kdf_algorithm': 'pbkdf2',                    # pbkdf2 | scrypt（客户端派生用，须与 APP 一致）
     'kdf_pbkdf2_iterations': 600000,
     'kdf_scrypt_n': 32768,
@@ -954,8 +961,16 @@ def dmrid_login(login_id, password):
                        'error': payload.get('message') or '国服登录失败'}
     user = data.get('user') or data
     status = str(user.get('status') or '')
+    # ★ 只保留黑名单拦截：approved 以外的状态（pending/unknown 等）一律放行，
+    #   与「只要有国服 ID 就发证」的口径一致。
     if status == 'blacklisted' or user.get('isDisabled'):
         return False, {'code': 403, 'error': '该账号已被限制使用，请联系管理员'}
+    # 国服 ID：兼容 guojiId 单值 与 guojiIds 数组（后者可能多值）
+    if not user.get('guojiId'):
+        ids = user.get('guojiIds') or []
+        if isinstance(ids, (list, tuple)) and ids:
+            user = dict(user)
+            user['guojiId'] = ids[0]
     return True, {'user': user}
 
 
@@ -1003,7 +1018,11 @@ def dmrid_lookup(callsign):
     data = payload.get('data') or {}
     guoji_id = data.get('guojiId')
     if code != 200 or payload.get('code') != 200 or guoji_id is None:
-        return False, {'code': 404, 'error': '该呼号未识别到国服 ID（国际 ID），无法绑定'}
+        # 国服只在「国际 ID 被识别」时才给 guojiId —— 这里只说明结果，
+        # 不要再暗示是国际 ID 的问题（真正口径：没有国服 ID 就发不了证）。
+        return False, {'code': 404,
+                       'error': '该呼号在国服没有可用的国服 ID，无法绑定'
+                                '（若确认有国服 ID，请改用密码校验模式绑定）'}
     return True, {'callsign': str(data.get('callsign') or callsign).upper(),
                   'guojiId': guoji_id, 'dmrId': None}
 
@@ -3578,14 +3597,16 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
     # ---------- POST /api/cert/bind（国服 ID 绑定） ----------
     def _handle_cert_bind(self):
         """
-        国服 ID 绑定：向国服确认「该呼号存在国服 ID」，再用客户端从密码派生的
-        公钥签发用户证书，返回证书包 + 登录 token。
+        国服 ID 绑定：用国服账号（呼号+密码）登录校验，确认该账号的**国服 ID**，
+        再用客户端从密码派生的公钥签发用户证书，返回证书包 + 登录 token。
+        ★ 只认国服 ID：国际 ID 是否被识别不作为门槛；黑名单账号仍拒绝。
         之后 MQTT 认证走证书（客户端用派生私钥做 proof 签名），不再调用国服。
 
         请求体（简化模式，默认）：
           {callsign, pubkey(32B base64url), key_proof(base64url),
            app_timestamp, app_signature}
-        config.dmrid.verify_password=true 时额外要求 password 并校验密码。
+        config.dmrid.verify_password=true（默认）时要求 password，用国服登录接口校验；
+          该校验只认国服 ID（guojiId）；verify_password=false 时才退化为按呼号查询。
 
         key_proof = Ed25519_sign(seed, UTF8("FMO-DMRID-bind:" + callsign))
         （证明调用方确实持有 pubkey 对应私钥；seed = derive_keypair(callsign, password)）
@@ -3612,7 +3633,10 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': False, 'error': '呼号格式不正确（需 4-10 位大写字母和数字）'}, 400)
             return
         if verify_password and not password:
-            self.send_json({'ok': False, 'error': '密码不能为空'}, 400)
+            # 默认口径（verify_password=true）：用国服登录接口校验，需要密码 ——
+            # 只认国服 ID（guojiId），国际 ID 是否被识别不作为门槛。
+            self.send_json({'ok': False,
+                            'error': '需要国服账号密码用于校验（请由 APP 提交 password）'}, 400)
             return
         if not pubkey_b64 or not key_proof:
             self.send_json({'ok': False, 'error': '缺少 pubkey 或 key_proof（请用 derive_keypair 派生）'}, 400)
@@ -3634,7 +3658,11 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
 
         # 2. 国服身份校验（仅绑定这一次；之后 MQTT 用证书，不再调国服）
-        #    简化模式：仅查呼号存在（callsign-lookup）；强校验模式：校验密码（login）
+        #    ★ 口径：**只验证国服 ID** —— 用国服登录接口（呼号+密码）校验国服账号，
+        #      只要该账号有 guojiId 就发证。国际 ID 是否被识别**不作为门槛**：
+        #      旧代码用 callsign-lookup，而它只在国际 ID 被识别时才返回 guojiId，
+        #      等于把"国际 ID"当成了准入条件（用户明确要求去掉）。
+        #      黑名单仍在 dmrid_login 里拦截；approved 以外的状态不再拦。
         if verify_password:
             ok, res = dmrid_login(callsign, password)
             if not ok:
@@ -3644,10 +3672,6 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             auth_callsign = str(user.get('callsign', '')).strip().upper()
             if auth_callsign and auth_callsign != callsign:
                 self.send_json({'ok': False, 'error': '呼号不匹配（国服返回 %s）' % auth_callsign}, 403)
-                return
-            status = str(user.get('status') or '')
-            if status != 'approved':
-                self.send_json({'ok': False, 'error': '账号状态为 %s，未通过审核，无法接入' % (status or 'unknown')}, 403)
                 return
             guoji_id = user.get('guojiId')
             dmr_id = user.get('dmrId')
@@ -3662,6 +3686,12 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 return
             guoji_id = res.get('guojiId')
             dmr_id = res.get('dmrId')
+
+        # ★ 唯一的身份门槛：必须有国服 ID（国际 ID 不参与判定）
+        if not guoji_id:
+            self.send_json({'ok': False,
+                            'error': '该账号没有国服 ID，无法签发证书'}, 403)
+            return
 
         # 3. SAS 服务可用性
         sas_db, ca_mgr = self._require_sas()

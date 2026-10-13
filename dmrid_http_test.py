@@ -54,7 +54,7 @@ def main():
         'enabled': True, 'dev_mode': True,
         'base_url': 'https://dmriapi.radiowo.com', 'timeout': 5,
         'app_pubkey': '', 'app_timestamp_window': 300,
-        'verify_password': False,
+        'verify_password': True,   # ★ 新默认：国服登录校验（只认国服 ID）
         'kdf_algorithm': 'pbkdf2', 'kdf_pbkdf2_iterations': 600000,
     }
     cfg['subsystem_id'] = 'sub-fulltest'   # 避免自动重生成写回
@@ -118,6 +118,8 @@ def main():
         return {
             'callsign': callsign,
             'pubkey': pub_b64, 'key_proof': key_proof,
+            # ★ 新口径要 password：用国服登录接口校验国服账号，有国服 ID 才发证
+            'password': password,
             'app_timestamp': ts,
             'app_signature': build_app_signature(app_seed_use, ts, callsign, pub_b64),
         }
@@ -134,7 +136,14 @@ def main():
     assert code == 403 and not r.get('ok'), (code, r)
     print("[0b] 错误 APP 签名拒绝 OK: HTTP %d -> %s" % (code, r.get('error')))
 
-    # 1. 绑定（正确签名）
+    # 0c. 新口径：缺 password 应 400（登录校验需要国服密码）
+    body_no_pw = bind_body(app_seed)
+    body_no_pw.pop('password')
+    code, r = http_json(base + '/api/cert/bind', body_no_pw)
+    assert code == 400 and not r.get('ok'), (code, r)
+    print("[0c] 缺 password 拒绝 OK: HTTP %d -> %s" % (code, r.get('error')))
+
+    # 1. 绑定（正确签名 + 密码）
     code, bind = http_json(base + '/api/cert/bind', bind_body(app_seed))
     assert code == 200 and bind.get('ok'), (code, bind)
     print("[1] /api/cert/bind OK  uid=%s  fp=%s  guoji=%s  derived=%s" % (
@@ -157,21 +166,23 @@ def main():
     assert code == 200 and auth.get('result') == 'allow', (code, auth)
     print("[3] /auth OK  allow  client_attrs=%s" % auth.get('client_attrs'))
 
-    # 4. 错误 key_proof 应 403
+    # 4. 错误 key_proof 应 403（记得带 password：新口径缺密码会先 400）
     bad_proof = build_key_proof(seed, 'OTHERCALL')
     ts = int(time.time())
     code, bad = http_json(base + '/api/cert/bind', {
         'callsign': callsign, 'pubkey': pub_b64, 'key_proof': bad_proof,
+        'password': password,
         'app_timestamp': ts,
         'app_signature': build_app_signature(app_seed, ts, callsign, pub_b64),
     })
     assert code == 403 and not bad.get('ok'), (code, bad)
     print("[4] 错误 key_proof 拒绝 OK: HTTP %d -> %s" % (code, bad.get('error')))
 
-    # 5. 非法呼号格式应 400
+    # 5. 非法呼号格式应 400（同样带 password，确保验的是格式而不是密码）
     ts = int(time.time())
     code, bad = http_json(base + '/api/cert/bind', {
         'callsign': 'bad_sign', 'pubkey': pub_b64, 'key_proof': key_proof,
+        'password': password,
         'app_timestamp': ts,
         'app_signature': build_app_signature(app_seed, ts, 'bad_sign', pub_b64),
     })
