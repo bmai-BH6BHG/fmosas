@@ -142,10 +142,21 @@ def _sanitize_db_name(name):
 
 def get_db_prefix(config=None, default='default'):
     """
-    从配置中提取域名/IP，用于数据库命名前缀。
-    优先级：config['domain'] > config['api_url']解析 > config['app_domain'] > 本机IP
+    数据库命名前缀。**首选 subsystem_id**（稳定标识）—— 改域名/IP 都不会变。
+
+    真实事故：前缀取自 domain，用户按需求把地址从 IP 改成域名后，
+    前缀跟着变 → 又生成一套空库 → 旧库里的证书"全部消失"。
+    地址是动态会变的，绝不能拿它当库名。
+
+    优先级：config['db_prefix'] > config['subsystem_id'] > domain > api_url > app_domain > 本机IP
     """
     config = config or {}
+    explicit = str(config.get('db_prefix') or '').strip()
+    if explicit:
+        return _sanitize_db_name(explicit)
+    sid = str(config.get('subsystem_id') or '').strip()
+    if sid:
+        return _sanitize_db_name(sid)
     # 1. 从 domain 字段获取
     domain = config.get('domain', '')
     if domain and domain not in ('register.example.com', 'localhost', '127.0.0.1', ''):

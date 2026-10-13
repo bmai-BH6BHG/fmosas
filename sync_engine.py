@@ -1221,6 +1221,7 @@ class SyncEngine:
         if not remote_users:
             return 0
         merged = 0
+        skipped = 0     # 无国服 ID（旧流程存量）被跳过的人数
         with self._db_lock:
             conn = self.get_db()
             try:
@@ -1230,6 +1231,13 @@ class SyncEngine:
                         continue
                     callsign = u.get('callsign')
                     if not callsign:
+                        continue
+                    # ★ 只保留**国服 ID 用户**（用户口径 B）：
+                    #   曾经没有 8601（国服ID绑定）流程时注册的存量用户没有 guoji_id，
+                    #   它们不该再回流进本机用户库 —— 想用就重新用国服 ID 绑定。
+                    #   注意：本机自己刚绑定的用户一定带 guoji_id，不受影响。
+                    if not str(u.get('guoji_id') or '').strip():
+                        skipped += 1
                         continue
                     cur.execute("SELECT * FROM users WHERE callsign=?", (callsign,))
                     local = cur.fetchone()
@@ -1305,6 +1313,9 @@ class SyncEngine:
                 conn.commit()
             finally:
                 conn.close()
+        if skipped:
+            log('SYNC', '已跳过 %d 个无国服 ID 的旧存量用户（只保留国服 ID 用户）'
+                % skipped)
         return merged
 
     def merge_certificates(self, remote_certs, source='master'):

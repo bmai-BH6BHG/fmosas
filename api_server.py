@@ -322,15 +322,28 @@ def _sanitize_db_name(name):
 
 def get_db_prefix(config=None, default='default'):
     """
-    从配置中提取域名/IP，用于数据库命名前缀。
-    优先级：config['domain'] > config['api_url']解析 > config['app_domain'] > 本机IP
+    数据库命名前缀。**首选 subsystem_id** —— 它是稳定标识，
+    改域名/IP 都不会变（真实事故：前缀取域名，用户按需求把地址从 IP 改成域名后
+    又生出一套空库，39 张有效证书"消失"；动态 IP 场景下这种分裂会反复发生）。
+
+    优先级：
+      1. config['db_prefix']（运维显式固定，最优先）
+      2. config['subsystem_id'] ★ 稳定，推荐
+      3. domain > api_url 解析 > app_domain > 本机IP（旧逻辑，仅兜底）
     """
     config = config or {}
-    # 1. 从 domain 字段获取
+    # 1. 显式指定
+    explicit = str(config.get('db_prefix') or '').strip()
+    if explicit:
+        return _sanitize_db_name(explicit)
+    # 2. subsystem_id：稳定标识，不随地址变
+    sid = str(config.get('subsystem_id') or '').strip()
+    if sid:
+        return _sanitize_db_name(sid)
+    # 3. 旧逻辑兜底
     domain = config.get('domain', '')
     if domain and domain not in ('register.example.com', 'localhost', '127.0.0.1', ''):
         return _sanitize_db_name(domain)
-    # 2. 从 api_url 解析
     api_url = config.get('api_url', '')
     if api_url:
         try:
@@ -340,11 +353,9 @@ def get_db_prefix(config=None, default='default'):
                 return _sanitize_db_name(host)
         except Exception:
             pass
-    # 3. 从 app_domain 获取
     app_domain = config.get('app_domain', '')
     if app_domain:
         return _sanitize_db_name(app_domain)
-    # 4. 用本机 IP
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
@@ -370,6 +381,143 @@ def _migrate_db(new_path, old_names):
             except Exception as e:
                 print("[DB] 迁移失败: %s -> %s, %s" % (old_path, new_path, e))
                 return
+
+
+def merge_migrate_db(new_path, suffix):
+    """
+    把同目录下**所有**历史 {*}{suffix} 库真实合并进 new_path，然后留档改名。
+
+    为什么要"合并"而不是 rename：库名前缀改过一次（域名↔IP）就可能存在
+    **两代库**，rename 只能救一个，另一个的数据（几十张证书/几十个用户）就丢了
+    —— 真实事故。这里逐表逐列合并，主键/唯一键冲突跳过，谁都不丢。
+
+    返回合并的历史库文件名列表（无则空列表）。
+    """
+    import glob as _glob
+    import sqlite3 as _sq
+    d = os.path.dirname(new_path)
+    base = os.path.basename(new_path)
+    if base.endswith(suffix):
+        pattern = os.path.join(d, "*" + suffix)
+    else:
+        pattern = os.path.join(d, "*")
+    cands = []
+    for p in sorted(_glob.glob(pattern)):
+        if os.path.abspath(p) == os.path.abspath(new_path):
+            continue
+        b = os.path.basename(p)
+        if not b.endswith(suffix):
+            continue
+        if '.merged-' in b or '.bak' in b or b.endswith(('-wal', '-shm')):
+            continue
+        cands.append(p)
+    if not cands:
+        return []
+
+    # 目标库结构：不存在就新建（由调用方保证建表；这里用历史库的表结构兜底）
+    first = cands[0]
+    try:
+        conn = _sq.connect(new_path)
+    except Exception as e:  # noqa: BLE001
+        print("[DB] 合并失败（打不开目标库 %s）: %s" % (new_path, e))
+        return []
+    done = []
+    try:
+        for old in cands:
+            try:
+                conn.execute("ATTACH DATABASE ? AS old", (old,))
+            except Exception as e:  # noqa: BLE001
+                print("[DB] 跳过 %s（attach 失败: %s）" % (os.path.basename(old), e))
+                continue
+            try:
+                tabs = [r[0] for r in conn.execute(
+                    "SELECT name FROM old.sqlite_master WHERE type='table'"
+                    " AND name NOT LIKE 'sqlite_%'")]
+                for t in tabs:
+                    #   sync_log —— 历史同步日志，几万行且无价值，合并纯浪费 → 跳过
+                    if t == 'sync_log':
+                        continue
+                    #   ca_info  —— 特殊处理，见下：
+                    #     * 目标库已有记录 → **一行都不动**（当前生效根必须权威，
+                    #       被旧代覆盖会让全体证书立刻失效）；
+                    #     * 目标库为空（新建库）→ 补 1 行记录，把 CA 记录补全
+                    #       （CA 本体在 ca/ 文件里，这条只是记录）。
+                    if t == 'ca_info':
+                        try:
+                            has_ca = conn.execute(
+                                "SELECT count(*) FROM ca_info").fetchone()[0]
+                        except Exception:  # noqa: BLE001
+                            has_ca = 0
+                        if has_ca:
+                            continue
+                        ocols_ca = [r[1] for r in conn.execute(
+                            "PRAGMA old.table_info(ca_info)")]
+                        if not ocols_ca:
+                            continue
+                        cl_ca = ", ".join('"%s"' % c for c in ocols_ca)
+                        try:
+                            conn.execute(
+                                "INSERT INTO ca_info (%s) SELECT %s FROM old.ca_info"
+                                " LIMIT 1" % (cl_ca, cl_ca))
+                            conn.commit()
+                            print("[DB] 已补记当前 CA 记录（来自 %s，1 行；"
+                                  "不覆盖已有记录）" % os.path.basename(old))
+                        except Exception as e:  # noqa: BLE001
+                            print("[DB] 补 CA 记录失败（忽略，不影响 CA 本体）: %s"
+                                  % str(e)[:80])
+                        continue
+                    # 目标没有该表 → 直接照建（用历史库的建表语句）
+                    has = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (t,)).fetchone()
+                    if not has:
+                        ddl = conn.execute(
+                            "SELECT sql FROM old.sqlite_master WHERE type='table'"
+                            " AND name=?", (t,)).fetchone()[0]
+                        if ddl:
+                            conn.execute(ddl)
+                    tinfo = list(conn.execute("PRAGMA table_info(%s)" % t))
+                    ocols = [r[1] for r in conn.execute("PRAGMA old.table_info(%s)" % t)]
+                    # ★ INTEGER 主键必须排除：两代库的 id 都从 1 开始，
+                    #   带上 id 去 INSERT OR IGNORE 会把旧库的行**静默丢掉**
+                    #   （真实数据事故）。排除后由 SQLite 重新分配 id，
+                    #   唯一约束（callsign / cert_id / ca_id 等）仍然防重。
+                    intpk = [r[1] for r in tinfo
+                             if r[5] == 1 and 'INT' in str(r[2]).upper()]
+                    tcols = [r[1] for r in tinfo]
+                    cols = [c for c in tcols if c in ocols and c not in intpk]
+                    if not cols:
+                        continue
+                    cl = ", ".join('"%s"' % c for c in cols)
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO %s (%s) SELECT %s FROM old.%s"
+                            % (t, cl, cl, t))
+                    except Exception as e:  # noqa: BLE001
+                        print("[DB] 合并表 %s(%s) 部分失败: %s"
+                              % (os.path.basename(old), t, str(e)[:80]))
+                conn.commit()
+                done.append(os.path.basename(old))
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE old")
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        conn.close()
+
+    # 合并过的历史库改名留档（不再被下次合并扫到）
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    for old in cands:
+        if os.path.basename(old) in done:
+            try:
+                os.rename(old, old + ".merged-" + ts)
+            except Exception:  # noqa: BLE001
+                pass
+    if done:
+        print("[DB] 已合并历史库 %s → %s（原库改名 .merged-%s 留档）"
+              % ("、".join(done), os.path.basename(new_path), ts))
+    return done
 
 
 # ==================== 配置加载 ====================
@@ -446,6 +594,9 @@ CONFIG = load_config()
 
 # 根据配置动态生成数据库路径（基于域名/IP 前缀，避免多系统部署在同目录时数据库重名冲突）
 DB_PATH = os.path.join(BASE_DIR, "%s_users.db" % get_db_prefix(CONFIG))
+# ★ 库名前缀不再随地址变（subsystem_id）；把此前各代前缀的库**合并**过来，
+#   避免"改了地址 → 又一套空库 → 证书看起来全没了"（真实事故）。
+merge_migrate_db(DB_PATH, "_users.db")
 # 自动迁移旧数据库（users.db -> {prefix}_users.db），保证升级后不丢数据
 _migrate_db(DB_PATH, ["users.db"])
 print("[DB] 用户数据库路径: %s" % DB_PATH)
@@ -487,7 +638,10 @@ def init_sas_service():
     if sas_db_path_cfg and sas_db_path_cfg != 'sas.db':
         sas_config['db_path'] = sas_db_path_cfg
     else:
-        sas_config['db_path'] = os.path.join(BASE_DIR, "%s_sas.db" % get_db_prefix(CONFIG))
+        _sas_path = os.path.join(BASE_DIR, "%s_sas.db" % get_db_prefix(CONFIG))
+        # ★ 同样把各代前缀的 SAS 库合并过来（证书都在这里，丢了就要全体重签）
+        merge_migrate_db(_sas_path, "_sas.db")
+        sas_config['db_path'] = _sas_path
     if 'sas_ca_name' in CONFIG:
         sas_config['ca_name'] = CONFIG['sas_ca_name']
     if 'sas_validity_years' in CONFIG:

@@ -14,6 +14,9 @@ users.db-shm
 *_sas.db-journal
 *_sas.db-wal
 *_sas.db-shm
+# 多代库合并后的留档副本（merge_migrate_db 生成，如 xxx_users.db.merged-20261013-221149）
+*.db.merged-*
+*_audit.db.merged-*
 voice.db
 voice.db-journal
 voice.db-wal
