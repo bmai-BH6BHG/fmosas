@@ -834,10 +834,21 @@ def init_bas(config, base_dir, users_db_path=None, sas_db_path=None, logger=None
     """
     log = logger or (lambda m: print(m))
     try:
-        prefix = config.get("domain") or config.get("api_url") or "default"
+        # ★ 审计库前缀**优先用 subsystem_id**：它稳定，改域名/IP 都不会变。
+        #   真实事故：前缀取 domain，用户把地址从 IP 改成域名后审计库也分裂成两套
+        #   （23MB 旧库 vs 188KB 新库），历史审计记录看起来"全没了"。
         import re as _re
+        prefix = (str(config.get("db_prefix") or "").strip()
+                  or str(config.get("subsystem_id") or "").strip()
+                  or config.get("domain") or config.get("api_url") or "default")
         safe = _re.sub(r"[^a-zA-Z0-9.\-]", "_", str(prefix)).strip("._") or "default"
         audit_path = os.path.join(base_dir, "%s_audit.db" % safe)
+        # 把历史审计库合并进来（不丢历史）
+        try:
+            import api_server as _A
+            _A.merge_migrate_db(audit_path, "_audit.db")
+        except Exception as _e:  # noqa: BLE001
+            log("[BAS] 审计库合并跳过: %s" % _e)
         db = AuditDB(audit_path)
         svc = AuditService(db, config=config)
         svc.sas_lookup = make_sas_lookup(sas_db_path, users_db_path, logger=log)
