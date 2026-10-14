@@ -73,6 +73,67 @@ class FUSSideTests(unittest.TestCase):
         self.assertIn("upgrade.sh", self.src)
         self.assertIn("FMO_BASE_URL", self.src)
 
+    def test_detach_from_service_cgroup(self):
+        """
+        ★ 关键回归：升级/重启必须脱离本服务 cgroup。
+
+        真实事故：升级脚本执行到"停止服务"时，systemd（KillMode=control-group）
+        把同 cgroup 的脚本一起杀掉 → 服务 inactive、版本没变、节点失联。
+        群晖没有 systemd-run，所以必须写**临时 systemd unit** 再 start。
+        """
+        self.assertIn('def _launch_detached', self.src)
+        self.assertIn("systemd-run", self.src)          # 有则优先
+        self.assertIn("'/etc/systemd/system/%s.service'", self.src)  # 群晖可用方案
+        self.assertIn("'start', '--no-block'", self.src)  # 立即返回，不等它跑完
+        self.assertIn("Type=oneshot", self.src)
+        # 清理必须用 ExecStopPost（成功/失败都执行）；ExecStartPost 失败时不跑，
+        # 会残留 failed unit（真实踩过）
+        self.assertIn("ExecStopPost=", self.src)
+        self.assertNotIn("ExecStartPost=", self.src)
+        # systemd 单元环境极简：必须显式给 HOME/PATH，否则 upgrade.sh 的
+        # `set -u` 会在 `HOME: unbound variable` 处中止（真实事故）
+        self.assertIn("'HOME': '/root'", self.src)
+        # 升级与重启都走这条通道
+        self.assertIn("_launch_detached(", self.src)
+        self.assertIn("unit_prefix='fus-upgrade'", self.src)
+        self.assertIn("unit_prefix='fus-restart'", self.src)
+
+    def test_no_more_bare_popen_for_ops(self):
+        """不允许再出现"直接 Popen 跑升级脚本"的写法（会在停服务时被杀）。"""
+        self.assertNotIn("_runner = _detached_runner", self.src)
+
+
+class BridgeInfoEndpointTests(unittest.TestCase):
+    """② /api/bridge/info 必须真的可达（否则免证书探测永远失败）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.api = io.open(os.path.join(REPO, 'api_server.py'),
+                          encoding='utf-8').read()
+
+    def test_handled_inside_bridge_router(self):
+        """
+        必须在 _handle_bridge_routes 开头处理，且**在 _BRIDGE 判空之前** ——
+        否则桥接模块异常时探测直接 503，或落到"未知的桥接接口"404。
+        """
+        i = self.api.find('def _handle_bridge_routes')
+        self.assertGreater(i, 0)
+        block = self.api[i:i + 2500]
+        self.assertIn("path == '/api/bridge/info'", block)
+        # info 出现在 svc = _BRIDGE 之前
+        self.assertLess(block.find("path == '/api/bridge/info'"),
+                        block.find('svc = _BRIDGE'))
+
+    def test_returns_bridge_token_flag(self):
+        i = self.api.find("path == '/api/bridge/info'")
+        block = self.api[i:i + 900]
+        self.assertIn("'bridge_token': bool(_sec)", block)
+
+    def test_public_whitelist_keeps_readonly_only(self):
+        """公网只放行只读能力声明；且旧插错位置的那份 handler 已删除。"""
+        self.assertEqual(self.api.count("path == '/api/bridge/info'"), 1,
+                         'info 处理应只有一处（重复会导致路由不可达）')
+
 
 class MasterSideTests(unittest.TestCase):
     @classmethod

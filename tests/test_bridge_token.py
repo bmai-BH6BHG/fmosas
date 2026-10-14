@@ -177,7 +177,8 @@ class BridgeCredentialsTests(unittest.TestCase):
         """能力声明端点必须在公网白名单里（否则对端探不到）。"""
         src = io.open(os.path.join(REPO, 'api_server.py'), encoding='utf-8').read()
         self.assertIn("'/api/bridge/info'", src)
-        self.assertIn("'bridge_token': bool(_bk_sec)", src)
+        # 处理体在桥接路由器里（真正的可达位置），返回 bridge_token 标记
+        self.assertIn("'bridge_token': bool(_sec)", src)
 
     def test_roster_candidate_carries_api_url(self):
         """名册候选要带 api_url，探测才有目标。"""

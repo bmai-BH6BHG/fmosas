@@ -2371,23 +2371,6 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
 
         # 健康检查端点（便于总系统/监控探活）
-        if path == '/api/bridge/info':
-            # 桥接能力声明（只读、公网可访问）：告诉对端"我支持免证书桥接令牌"。
-            # 有 secret 才为真 —— 说明本机已从总系统拿到桥接密钥。
-            try:
-                _bk_sec = str((CONFIG or {}).get('bridge_secret') or '')
-                self.send_json({
-                    'ok': True,
-                    'service': 'fmo-subsystem',
-                    'subsystem_id': str((CONFIG or {}).get('subsystem_id') or ''),
-                    'name': str((CONFIG or {}).get('name') or ''),
-                    'bridge_token': bool(_bk_sec),
-                    'time': time.time(),
-                })
-            except Exception as _e_bi:  # noqa: BLE001
-                self.send_json({'ok': False, 'error': str(_e_bi)}, 500)
-            return
-
         if path == '/api/health':
             self.send_json({'ok': True, 'service': 'fmo-subsystem', 'time': time.time()})
             return
@@ -3244,6 +3227,21 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         """
         if not path.startswith('/api/bridge/'):
             return False
+        # ★ 能力声明放在最前面（且不依赖 _BRIDGE 是否可用）：
+        #   它只读配置，是"对端能否用免证书令牌"的唯一判据。
+        #   真实事故：先前插到了别的分发点，永远走不到 → 返回"未知的桥接接口"
+        #   → 对端能力探测恒为"不支持" → 免证书路径永远走不通。
+        if method == 'GET' and path == '/api/bridge/info':
+            _sec = str((CONFIG or {}).get('bridge_secret') or '')
+            self.send_json({
+                'ok': True,
+                'service': 'fmo-subsystem',
+                'subsystem_id': str((CONFIG or {}).get('subsystem_id') or ''),
+                'name': str((CONFIG or {}).get('name') or ''),
+                'bridge_token': bool(_sec),
+                'time': time.time(),
+            })
+            return True
         try:
             svc = _BRIDGE
             if svc is None:

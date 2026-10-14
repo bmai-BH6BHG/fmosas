@@ -179,6 +179,108 @@ def join_url(base, path):
 
 
 # ==================== SyncEngine ====================
+def _launch_detached(shell_cmd, unit_prefix='fus-ops', env_extra=None,
+                     cwd=None, logf=None):
+    """
+    在**本服务 cgroup 之外**启动一条命令，返回 (ok, err)。
+
+    为什么必须脱离 cgroup：systemd 默认 KillMode=control-group，停 fmo-subsystem
+    会把同一 cgroup 的所有进程一起杀掉 —— 包括"正在升级/重启本服务"的脚本 ✗
+    （真实事故：远程升级把自己停服后脚本同时被杀 → inactive、版本没变、节点失联）。
+
+    三条路（按可用性）：
+      1) systemd-run（有则最干净；群晖上通常**没有**）
+      2) 写临时 systemd unit 再 `systemctl start --no-block`（群晖可用方案）
+      3) setsid 兜底（**不脱离 cgroup，可能被连带杀掉** —— 只能算尽力而为）
+    """
+    import subprocess as _sp
+    import shutil as _shutil
+    ts = time.strftime('%Y%m%d%H%M%S')
+    unit = '%s-%s' % (unit_prefix, ts)
+    cmd = shell_cmd
+    if logf:
+        cmd = 'exec >%s 2>&1; %s' % (logf, shell_cmd)
+
+    try:
+        if _shutil.which('systemd-run'):
+            r = _sp.run(['systemd-run', '--collect', '--unit', unit,
+                         '--description', 'FUS remote ops (%s)' % unit_prefix,
+                         '/bin/sh', '-c', cmd],
+                        stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=20)
+            if r.returncode == 0:
+                return True, ''
+            log('SYNC', 'systemd-run 启动失败，改用临时 unit: %s'
+                % (r.stdout or b'').decode('utf-8', 'replace')[:120])
+
+        unit_path = '/etc/systemd/system/%s.service' % unit
+        # ★ systemd 单元默认环境极简：没有 HOME/PATH。
+        #   upgrade.sh 用 `set -u`，缺 HOME 会直接 "HOME: unbound variable" 中止
+        #   （真实事故：升级脚本刚起步就退出，服务没动、版本没变）。
+        #   这里显式补齐运行所需环境。
+        _env = {
+            'HOME': '/root',
+            'PATH': ('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:'
+                     '/sbin:/bin'),
+            'LANG': 'C.UTF-8',
+        }
+        for _k, _v in (env_extra or {}).items():
+            if _v:
+                _env[str(_k)] = str(_v)
+        env_lines = ''.join(
+            'Environment="%s=%s"\n' % (k, str(v).replace('"', ''))
+            for k, v in _env.items())
+        body = (
+            '[Unit]\n'
+            'Description=FUS remote ops (%s)\n'
+            'After=network.target\n'
+            '\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            'WorkingDirectory=%s\n'
+            '%s'
+            'ExecStart=/bin/sh -c %s\n'
+            # 执行完自清理：清失败记录 + 删 unit 文件 + 重载（避免残留 unit）
+            # ★ 必须用 ExecStopPost（无论成功/失败都执行）——ExecStartPost
+            #   只在成功后跑，失败时 unit 会残留成 failed（真实踩过）。
+            'ExecStopPost=/bin/sh -c %s\n'
+        ) % (
+            unit_prefix,
+            cwd or '/',
+            env_lines,
+            _sd_quote(cmd),
+            _sd_quote('systemctl reset-failed %s >/dev/null 2>&1; '
+                      'rm -f %s; systemctl daemon-reload >/dev/null 2>&1'
+                      % (unit, unit_path)),
+        )
+        with open(unit_path, 'w', encoding='utf-8') as fh:
+            fh.write(body)
+        r1 = _sp.run(['systemctl', 'daemon-reload'],
+                     stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=30)
+        r2 = _sp.run(['systemctl', 'start', '--no-block', unit],
+                     stdout=_sp.PIPE, stderr=_sp.STDOUT, timeout=30)
+        if r2.returncode == 0:
+            return True, ''
+        return False, ('临时 unit 启动失败: '
+                       + (r2.stdout or b'').decode('utf-8', 'replace')[:160])
+    except Exception as e:  # noqa: BLE001
+        # 兜底：至少脱离会话（不脱离 cgroup，可能被连带杀掉）
+        try:
+            _sp.Popen(['setsid', '/bin/sh', '-c', cmd], cwd=cwd,
+                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                      start_new_session=True)
+            log('SYNC', '警告：无 systemd 脱离手段，退化 setsid（停服务时可能被连带杀掉）: %s' % e)
+            return True, ''
+        except Exception as e2:  # noqa: BLE001
+            return False, str(e2)
+
+
+def _sd_quote(text):
+    """把一段 shell 命令转义成 systemd 的 ExecStart=/bin/sh -c "..." 参数。"""
+    t = str(text or '')
+    t = t.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    return '"%s"' % t
+
+
 class SyncEngine:
     """
     分布式同步引擎
@@ -1733,19 +1835,25 @@ class SyncEngine:
             env['FMO_BASE_URL'] = str(base_url).rstrip('/')
         env['FMO_UPGRADE_REASON'] = 'master-ops-command:%s' % cmd_id
         try:
-            # 不在本进程里等它结束：脚本会重启本服务，等下去会把自己等死。
-            # 用 setsid 脱离会话，输出重定向到日志文件。
+            # ★★ 必须用 systemd-run 放进**独立 transient unit**：
+            #   升级脚本会 "停止服务"，而 systemd 默认 KillMode=control-group
+            #   会杀掉同一 cgroup 的所有进程 —— 包括升级脚本自己 ✗
+            #   真实事故：本机被自己的升级指令停服后脚本同时被杀，
+            #   服务停在 inactive、版本没变、节点失联（靠手工 start 才救回）。
+            #   systemd-run 让脚本处在自己的 unit 里，停本服务不会连带杀它。
             logf = os.path.join(self.base_dir, 'upgrade_ops.log')
             with open(logf, 'ab') as fh:
                 fh.write(('\n=== [OPS] %s 触发升级 → %s @ %s ===\n'
                           % (time.strftime('%Y-%m-%d %H:%M:%S'),
                              target_version or '(latest)', base_url or '(default)')
                           ).encode('utf-8'))
-                subprocess.Popen(
-                    ['/bin/sh', script],
-                    stdout=fh, stderr=subprocess.STDOUT,
-                    env=env, cwd=self.base_dir,
-                    start_new_session=True)
+            _ok_launch, _err_launch = _launch_detached(
+                '/bin/sh %s' % script, unit_prefix='fus-upgrade',
+                env_extra={'FMO_BASE_URL': env.get('FMO_BASE_URL', ''),
+                           'FMO_UPGRADE_REASON': env.get('FMO_UPGRADE_REASON', '')},
+                cwd=self.base_dir, logf=logf)
+            if not _ok_launch:
+                return False, _err_launch
             return True, ''
         except Exception as e:  # noqa: BLE001
             return False, str(e)
@@ -1784,12 +1892,13 @@ class SyncEngine:
                 try:
                     time.sleep(self.OPS_DELAY_S)
                     import subprocess
-                    # 脱离会话执行：重启会把本进程一起带走，必须用 setsid 派生
-                    subprocess.Popen(
-                        ['/bin/sh', '-c',
-                         'sleep 1; systemctl restart fmo-subsystem'],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
+                    # ★ 同样必须脱离本服务的 cgroup：否则 systemctl restart 停服务时
+                    #   会把执行重启的脚本一起杀掉，重启就半途而废（真实事故）。
+                    _ok_r, _err_r = _launch_detached(
+                        'sleep 1; systemctl restart fmo-subsystem',
+                        unit_prefix='fus-restart')
+                    if not _ok_r:
+                        log('SYNC', '重启指令启动失败: %s' % _err_r)
                     log('SYNC', '重启指令已执行（服务将短暂中断）')
                 except Exception as e:  # noqa: BLE001
                     log('SYNC', '重启指令执行失败: %s' % e)
