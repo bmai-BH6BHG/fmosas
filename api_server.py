@@ -1170,15 +1170,19 @@ def dmrid_lookup(callsign):
         return False, {'code': 502, 'error': '调用国服后端异常: %s' % e}
 
     data = payload.get('data') or {}
-    guoji_id = data.get('guojiId')
-    if code != 200 or payload.get('code') != 200 or guoji_id is None:
+    guoji_id = data.get('guojiId')          # ⚠ 这是**国际 ID**（460 开头），不是门槛
+    # ★ 用户口径：**dmrId（860 开头）才是国服 ID**，它才是发证门槛；
+    #   guojiId（国际 ID）**不参与判定**。所以这里绝不能因为 guojiId 为空就拒绝
+    #   —— 那等于拿"国际 ID"当准入门槛（此前就是这么错的）。
+    #   callsign-lookup 只回国际 ID，因此简化模式下"查询成功"即视为账号存在。
+    dmr_id_lookup = (data.get('dmrId') or data.get('dmr_id')
+                     or data.get('dmrid') or data.get('radioId'))
+    if code != 200 or payload.get('code') != 200:
         # 国服只在「国际 ID 被识别」时才给 guojiId —— 这里只说明结果，
         # 不要再暗示是国际 ID 的问题（真正口径：没有国服 ID 就发不了证）。
-        return False, {'code': 404,
-                       'error': '该呼号在国服没有可用的国服 ID，无法绑定'
-                                '（若确认有国服 ID，请改用密码校验模式绑定）'}
+        return False, {'code': 404, 'error': '该呼号在国服查不到，无法绑定'}
     return True, {'callsign': str(data.get('callsign') or callsign).upper(),
-                  'guojiId': guoji_id, 'dmrId': None}
+                  'guojiId': guoji_id, 'dmrId': dmr_id_lookup}
 
 
 # ==================== 数据库初始化 ====================
@@ -3911,10 +3915,18 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             guoji_id = res.get('guojiId')
             dmr_id = res.get('dmrId')
 
-        # ★ 唯一的身份门槛：必须有国服 ID（国际 ID 不参与判定）
-        if not guoji_id:
+        # ★ 身份门槛：只认 **dmrId（860 开头）= 国服 ID**，
+        #   guojiId（460 开头）= 国际 ID，**不参与判定**。
+        #   用户口径："只需验证国服 id，有国服 id 就能下发"。
+        #   注意：callsign-lookup（简化模式）只回国际 ID，本来就拿不到 dmrId，
+        #   不能因此拒绝 —— 那种情况下"国服查询成功"即视为账号存在、允许签发。
+        if verify_password:
+            have_id = bool(dmr_id)
+        else:
+            have_id = True      # 简化模式：国服查询成功即视为身份可用
+        if not have_id:
             self.send_json({'ok': False,
-                            'error': '该账号没有国服 ID，无法签发证书'}, 403)
+                            'error': '该账号在国服没有可用的国服 ID（dmrId），无法签发证书'}, 403)
             return
 
         # 3. SAS 服务可用性

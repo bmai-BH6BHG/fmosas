@@ -790,6 +790,18 @@ class SyncEngine:
             except Exception as e:
                 log('SYNC', '读取 Intermediate CA 失败: %s' % e)
 
+        # ★ 上报前兜底校验：只允许出现**本机 CA**（rootCA/intermediateCA 各一把）。
+        #   防止任何历史污染再次被当成"我的根"上报给总系统 ——
+        #   一旦上报了别台的根，总系统就会登记错背书，导致**桥接 rc=5 断连**
+        #   （真实事故：8 台分系统的背书全部与真实根错配）。
+        allowed = self._local_ca_ids()
+        if allowed:
+            bad = [r for r in result if r.get('ca_id') not in allowed]
+            if bad:
+                log('SYNC', 'ca_info 上报：已剔除 %d 条非本机 CA（防再污染）'
+                    % len(bad))
+            result = [r for r in result if r.get('ca_id') in allowed]
+
         # 如果 since > 0（增量模式），只返回 last_modified > since 的记录
         if since > 0:
             result = [r for r in result if r.get('last_modified', 0) > since]
@@ -1537,11 +1549,49 @@ class SyncEngine:
             conn.close()
         return merged
 
+    def _local_ca_ids(self):
+        """
+        本机 CA 的 ca_id 集合（rootCA:<本机根公钥> / intermediateCA:<本机中间公钥>）。
+
+        ★ 为什么必须有它：现场实测各分系统的 ca_info 表被**别台的 CA** 污染
+          （BH8GPV 表里 4 把根、本机 6 把根）。污染后全量上报会把别人的根
+          当成"我的根"交上去，总系统据此登记背书 → 登记错 → 各台 trust_chain
+          存到对不上的根 → **MQTT 桥接互认失败 rc=5 断连**（真实事故）。
+          所以本机 ca_info 只允许存在自己的 CA，对端 CA 归 trust_chain 管。
+        """
+        ids = set()
+        ca_dir = self.config.get('ca_dir', 'ca')
+        if not os.path.isabs(ca_dir):
+            ca_dir = os.path.join(self.base_dir, ca_dir)
+        for fname, typ in (('cert_root.json', 'rootCA'),
+                           ('cert_int.json', 'intermediateCA')):
+            try:
+                p = os.path.join(ca_dir, fname)
+                if not os.path.exists(p):
+                    continue
+                with open(p, 'r', encoding='utf-8-sig') as f:
+                    cert = json.load(f)
+                pub = (cert.get('subject') or {}).get('publicKey') or ''
+                if pub:
+                    ids.add('%s:%s' % (typ, pub))
+            except Exception:  # noqa: BLE001
+                continue
+        return ids
+
     def merge_ca_info(self, remote_ca, source='master'):
-        """合并 CA 信息数据"""
+        """
+        合并 CA 信息数据。
+
+        ★ 只接受**本机自己的 CA**：其它来源的 CA（总系统下发的、对端同步来的）
+          一律不写进本机 ca_info 表 —— 那些属于"我信谁"，由 sas.db 的
+          trust_chain 承担。混进本表会导致上报时把别台的根当成自己的根，
+          进而使总系统登记错背书、桥接 rc=5 断连（真实事故）。
+        """
         if not remote_ca:
             return 0
+        allowed = self._local_ca_ids()
         merged = 0
+        skipped = 0
         with self._db_lock:
             conn = self.get_db()
             try:
@@ -1551,6 +1601,10 @@ class SyncEngine:
                         continue
                     ca_id = c.get('ca_id')
                     if not ca_id:
+                        continue
+                    if allowed and ca_id not in allowed:
+                        # 不是本机 CA → 不写本表（记为跳过，便于排障）
+                        skipped += 1
                         continue
                     cur.execute("SELECT * FROM ca_info WHERE ca_id=?", (ca_id,))
                     local = cur.fetchone()
@@ -1603,7 +1657,149 @@ class SyncEngine:
                 conn.commit()
             finally:
                 conn.close()
-        return merged
+        if skipped:
+            log('SYNC', 'ca_info 合并：跳过 %d 条非本机 CA 记录'
+                        '（对端 CA 归 trust_chain 管，不得混入本机 ca_info）' % skipped)
+
+    # ------------------------------------------------------------------
+    # 远程运维指令（总系统 → 分系统）
+    # ------------------------------------------------------------------
+    # 允许的包地址前缀（防被指向恶意包）：只认官方 releases 域名 + https
+    OPS_ALLOWED_BASE = (
+        'https://github.com/bmai-BH6BHG/fmosas/releases/',
+        'https://objects.githubusercontent.com/',
+    )
+    OPS_DELAY_S = 20.0          # 收到指令后延迟执行，先让本次 pull 收尾
+
+    def _ops_state_get(self, key):
+        """读本机运维状态（存在 sync_state 的保留行里，避免新增表）。"""
+        try:
+            conn = self.get_db()
+            try:
+                row = conn.execute(
+                    "SELECT last_status FROM sync_status WHERE peer=? AND direction=?",
+                    ('__ops__', key)).fetchone()
+                return (row['last_status'] if row else '') or ''
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            return ''
+
+    def _ops_state_set(self, key, value):
+        try:
+            conn = self.get_db()
+            try:
+                conn.execute(
+                    "INSERT INTO sync_status (peer, direction, last_sync, last_status)"
+                    " VALUES ('__ops__', ?, ?, ?)"
+                    " ON CONFLICT(peer, direction) DO UPDATE SET"
+                    " last_sync=excluded.last_sync, last_status=excluded.last_status",
+                    (key, now_ts(), str(value or '')[:200]))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _current_version(self):
+        """本机当前版本（从 VERSION 文件或 upgrade.sh 里的默认值取）。"""
+        for f in ('VERSION', os.path.join('dist', 'VERSION')):
+            try:
+                p = os.path.join(self.base_dir, f)
+                if os.path.exists(p):
+                    with open(p, 'r', encoding='utf-8-sig') as fh:
+                        v = fh.read().strip()
+                    if v:
+                        return v
+            except Exception:  # noqa: BLE001
+                continue
+        return ''
+
+    def _instantiate_upgrade(self, cmd_id, target_version, base_url):
+        """真正执行升级：调官方 upgrade.sh（内建 sha256 校验 + 重启服务）。"""
+        import subprocess
+        script = os.path.join(self.base_dir, 'upgrade.sh')
+        if not os.path.exists(script):
+            return False, '找不到升级脚本 upgrade.sh'
+        env = dict(os.environ)
+        if base_url:
+            # upgrade.sh 读 FMO_BASE_URL 覆盖默认分发地址
+            env['FMO_BASE_URL'] = str(base_url).rstrip('/')
+        env['FMO_UPGRADE_REASON'] = 'master-ops-command:%s' % cmd_id
+        try:
+            # 不在本进程里等它结束：脚本会重启本服务，等下去会把自己等死。
+            # 用 setsid 脱离会话，输出重定向到日志文件。
+            logf = os.path.join(self.base_dir, 'upgrade_ops.log')
+            with open(logf, 'ab') as fh:
+                fh.write(('\n=== [OPS] %s 触发升级 → %s @ %s ===\n'
+                          % (time.strftime('%Y-%m-%d %H:%M:%S'),
+                             target_version or '(latest)', base_url or '(default)')
+                          ).encode('utf-8'))
+                subprocess.Popen(
+                    ['/bin/sh', script],
+                    stdout=fh, stderr=subprocess.STDOUT,
+                    env=env, cwd=self.base_dir,
+                    start_new_session=True)
+            return True, ''
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    def handle_ops_command(self, cmd):
+        """
+        处理总系统下发的运维指令。
+
+        目前支持 type == 'upgrade'（远程升级）。目标不符 / 已执行过 / 版本相同
+        一律直接跳过（幂等、可控）。执行是**延迟 + 脱离会话**的，避免把当前
+        同步/上报链路掐断。
+        """
+        if not isinstance(cmd, dict):
+            return
+        ctype = str(cmd.get('type') or '').strip().lower()
+        cmd_id = str(cmd.get('id') or '').strip()
+        if ctype != 'upgrade' or not cmd_id:
+            return
+        # 目标：all / 本机 subsystem_id / 逗号列表
+        target = str(cmd.get('target') or 'all').strip().lower()
+        if target not in ('all', '*'):
+            if str(self.subsystem_id or '').strip().lower() not in [
+                    t.strip() for t in target.split(',') if t.strip()]:
+                return
+        # 幂等：同一 id 只执行一次
+        if self._ops_state_get('last_upgrade_cmd') == cmd_id:
+            return
+        # 版本相同则不折腾
+        tgt = str(cmd.get('target_version') or '').strip()
+        cur = self._current_version()
+        if tgt and cur and tgt.lstrip('v') == cur.lstrip('v'):
+            self._ops_state_set('last_upgrade_cmd', cmd_id)
+            log('SYNC', '运维指令：已是目标版本 %s，跳过升级' % cur)
+            return
+        # 包地址白名单校验（防被指向恶意包）
+        base = str(cmd.get('base_url') or '').strip()
+        if base and not str(base).startswith(self.OPS_ALLOWED_BASE):
+            log('SYNC', '运维指令：包地址不在允许清单内，拒绝执行: %s' % base[:60])
+            self._ops_state_set('last_upgrade_cmd', cmd_id)
+            return
+
+        log('SYNC', '运维指令受理：远程升级到 %s（%s 秒后执行；当前 %s）'
+            % (tgt or 'latest', int(self.OPS_DELAY_S), cur or '未知'))
+
+        def _run():
+            try:
+                time.sleep(self.OPS_DELAY_S)
+                ok, err = self._instantiate_upgrade(cmd_id, tgt, base)
+                if ok:
+                    self._ops_state_set('last_upgrade_cmd', cmd_id)
+                    self._ops_state_set('last_upgrade_result',
+                                        'triggered:%s' % (tgt or 'latest'))
+                    log('SYNC', '远程升级已触发（日志 upgrade_ops.log）')
+                else:
+                    self._ops_state_set('last_upgrade_result', 'failed:%s' % err)
+                    log('SYNC', '远程升级触发失败: %s' % err)
+            except Exception as e:  # noqa: BLE001
+                log('SYNC', '远程升级线程异常: %s' % e)
+
+        threading.Thread(target=_run, name='ops-upgrade', daemon=True).start()
 
     def merge_all(self, data, source='master'):
         """
@@ -1623,6 +1819,14 @@ class SyncEngine:
         # "master 下发了空集"（= 全部背书已吊销，需 prune 清空）
         if source == 'master' and 'trust_issued' in data:
             total += self.merge_trust_issued(data.get('trust_issued') or [])
+
+        # ★ 远程升级：总系统在 pull 响应里下发的运维指令（ops_command）。
+        #   只处理来自 master 的指令；peer 同步来的指令一律忽略（防横向伪造）。
+        if source == 'master' and data.get('ops_command'):
+            try:
+                self.handle_ops_command(data.get('ops_command'))
+            except Exception as _e_ops:  # noqa: BLE001
+                log('SYNC', '运维指令处理异常（不影响同步）: %s' % _e_ops)
         return total
 
     def merge_peer_data(self, data):
