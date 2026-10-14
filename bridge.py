@@ -811,7 +811,10 @@ class VoiceBridge(object):
         # 也就是真正的 FUS 系统）。不注入时只用手动补充的地址。
         self._candidate_source = candidate_source
         # 免证书令牌能力探测缓存（见 peer_supports_token）
+        #   ★ 缓存读写加锁；探测在**后台线程**做，绝不阻塞连接流程
         self._token_cap = {}
+        self._token_cap_lock = threading.Lock()
+        self._probe_running = set()
         self._lock = threading.RLock()
         self._cfg = load_bridge_config(self.config)
         self.node_id = (str(self._cfg.get("node_id") or "").strip()
@@ -957,44 +960,100 @@ class VoiceBridge(object):
 
     def peer_supports_token(self, api_url, host=''):
         """
-        探测对端是否支持「免证书桥接令牌」（本版本新增的 /api/bridge/info）。
+        对端是否支持「免证书桥接令牌」（只读缓存，**绝不阻塞连接**）。
 
-        ★ 为什么要探测：对**旧版本**先发令牌，会被它当作一次认证失败，
-          紧接着的证书重试也可能被连带拒绝 —— 真实事故：渝东北FMO 本来连得好好的，
-          改成"令牌优先"后反而断了。所以必须先问清楚再决定用哪种凭证。
-          探测结果缓存 10 分钟；旧版本 404/超时 → 判定不支持 → 直接用证书（零回归）。
+        ★ 为什么不在这里直接发 HTTP：对端不可达时，每条链路建立前都要干等
+          探测超时 → 桥接重连被拖慢、多成员用例直接超时（真实踩过）。
+          所以：只读缓存；缓存缺失/过期就**后台**探测，本次先用旧值（没有则 False）。
+
+        ★ 为什么需要探测：对**旧版本**先发令牌会被它当成一次认证失败，
+          紧接着的证书重试也可能被连带拒绝（真实事故：渝东北FMO 本来连得好好的，
+          改成"令牌优先"后反而断了）。
         """
         key = str(host or api_url or '').strip()
         if not key:
             return False
         now = time.time()
-        try:
+        with self._token_cap_lock:
             ent = self._token_cap.get(key)
-        except Exception:  # noqa: BLE001
-            self._token_cap = {}
-            ent = None
-        if ent and now - ent[0] < self._TOKEN_CAP_TTL:
+        if ent:
+            ttl = self._TOKEN_CAP_TTL if ent[1] else 60.0
+            if now - ent[0] < ttl:
+                return bool(ent[1])
+            # 过期：先用旧值，同时后台刷新（支持过的继续按支持处理）
+            self._probe_token_async(key, api_url, host)
             return bool(ent[1])
-        ok = False
-        url = str(api_url or '').strip()
-        if url:
-            if not url.startswith(('http://', 'https://')):
-                url = 'http://' + url
+        # 没有缓存：本次用证书（安全、零回归），后台探测供下次使用
+        self._probe_token_async(key, api_url, host)
+        return False
+
+    def _probe_token_candidates(self, api_url, host=''):
+        """组装探测候选地址：名册 api_url 可能不通（内网/旧 IP），
+        必须再试「MQTT 主机 + 端口」——BH8GPV 就是这种情况（api_url 是
+        一个连不上的 IP，真实可达的是域名）。"""
+        cands = []
+        api = str(api_url or '').strip()
+        port = '35928'
+        if api:
+            if '://' not in api:
+                api = 'http://' + api
+            cands.append(api)
             try:
-                import urllib.request
-                req = urllib.request.Request(url.rstrip('/') + '/api/bridge/info',
-                                             headers={'User-Agent': 'FUS-bridge'})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    d = json.loads(resp.read().decode('utf-8', 'replace'))
-                ok = bool((d or {}).get('bridge_token'))
+                _a = api.split('://', 1)[1]
+                if ':' in _a:
+                    _p = _a.rsplit(':', 1)[1].split('/')[0]
+                    if _p.isdigit():
+                        port = _p
             except Exception:  # noqa: BLE001
-                ok = False
+                pass
+        h = str(host or '').strip()
+        if h:
+            for u in ('http://%s:%s' % (h, port), 'http://%s:35928' % h):
+                if u not in cands:
+                    cands.append(u)
+        return cands[:3]
+
+    def _probe_token_once(self, api_url, host=''):
+        """真正探测（只在后台线程里调用）。返回是否支持。"""
+        import urllib.request
+        for url in self._probe_token_candidates(api_url, host):
+            try:
+                req = urllib.request.Request(
+                    url.rstrip('/') + '/api/bridge/info',
+                    headers={'User-Agent': 'FUS-bridge'})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    d = json.loads(resp.read().decode('utf-8', 'replace'))
+                if bool((d or {}).get('bridge_token')):
+                    self.log("[BRIDGE] %s 免证书令牌能力: 支持 ✓（%s）"
+                             % (host or api_url, url))
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        self.log("[BRIDGE] %s 免证书令牌能力: 不支持" % (host or api_url))
+        return False
+
+    def _probe_token_async(self, key, api_url, host=''):
+        """后台探测（同一 host 同时只跑一个），结果写进缓存。"""
         try:
-            self._token_cap[key] = (now, ok)
+            with self._token_cap_lock:
+                if key in self._probe_running:
+                    return
+                self._probe_running.add(key)
         except Exception:  # noqa: BLE001
-            pass
-        self.log("[BRIDGE] %s 免证书令牌能力: %s" % (key, '支持' if ok else '不支持'))
-        return ok
+            return
+
+        def _work():
+            try:
+                ok = self._probe_token_once(api_url, host)
+                with self._token_cap_lock:
+                    self._token_cap[key] = (time.time(), ok)
+            except Exception as e:  # noqa: BLE001
+                self.log("[BRIDGE] %s 令牌能力探测异常: %s" % (key, e))
+            finally:
+                with self._token_cap_lock:
+                    self._probe_running.discard(key)
+
+        threading.Thread(target=_work, name='token-probe', daemon=True).start()
 
     def client_suffix(self):
         """clientid 后缀：必须以 FMO- 开头（EMQX ACL 只放行 FMO-* 的 connect）。"""

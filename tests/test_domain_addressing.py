@@ -55,10 +55,28 @@ class DomainFirstTests(unittest.TestCase):
                          "域名被自动扫描覆盖了（用户报的「设好了又被变回来」）")
         self.assertFalse(r.get('changed'))
 
-    def test_manual_ip_is_not_silently_replaced(self):
-        """填的是 IP：也不偷偷改（只提示），避免用户地址被系统带走。"""
-        api_server.CONFIG['app_domain'] = '9.9.9.9'
-        api_server.CONFIG['app_port'] = 35928
+    def test_manual_ip_replaced_when_domain_available(self):
+        """
+        ★ 新的需求（用户明确要求）：几台分系统都是**动态 IP**，IP 一变就联系不上，
+        必须用域名上报；配置里已经有域名（mqtt_host 等）时，IP 要**主动换成域名**。
+
+        旧行为是"填了 IP 也绝不改、只提示" —— 结果动态 IP 一直被上报出去，
+        桥接/互联随 IP 变化断掉（真实事故）。
+        """
+        api_server.CONFIG.clear()
+        api_server.CONFIG.update({'app_domain': '9.9.9.9', 'app_port': 35928,
+                                  'app_use_port': True,
+                                  'mqtt_host': 'fs.example.com'})
+        r = api_server.auto_apply_public_address()
+        self.assertEqual(api_server.CONFIG['app_domain'], 'fs.example.com',
+                         "有域名可用时应改用域名（动态 IP 不可靠）")
+        self.assertTrue(r.get('changed'))
+
+    def test_manual_ip_kept_when_no_domain(self):
+        """确实一个域名都没有时，才保留 IP（用户允许："除非它没有域名"）。"""
+        api_server.CONFIG.clear()
+        api_server.CONFIG.update({'app_domain': '9.9.9.9', 'app_port': 35928,
+                                  'app_use_port': True})
         r = api_server.auto_apply_public_address()
         self.assertEqual(api_server.CONFIG['app_domain'], '9.9.9.9')
         self.assertFalse(r.get('changed'))

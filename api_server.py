@@ -1543,6 +1543,52 @@ def start_udac_ranking_loop(stop_event=None, interval=300.0):
     return t
 
 
+def _host_of(value):
+    """从 "http://host:port/path" / "host:port" / "host" 里取出主机名。"""
+    h = str(value or '').strip().strip('[]')
+    if not h:
+        return ''
+    if '://' in h:
+        h = h.split('://', 1)[1]
+    h = h.split('/', 1)[0]
+    if h.startswith('['):                     # IPv6 [::1]:1883
+        return h.split(']', 1)[0].strip('[')
+    if ':' in h:
+        h = h.rsplit(':', 1)[0]
+    return h.strip()
+
+
+def _pick_domain_from_config():
+    """
+    从配置里挑出可用的**域名**（排除 IP 字面量、localhost、环回、内网）。
+
+    ★ 用户要求：几台分系统全是动态 IP，IP 一变就联系不上，必须用域名上报与定位。
+      配置里往往**已经有**现成域名（mqtt_host / bridge.advertise_broker /
+      domain），但旧逻辑只顾着抱怨"当前是 IP"，从不去用它 ✗。
+    """
+    cands = []
+    cfg = CONFIG or {}
+    br = cfg.get('bridge') or {}
+    sas = cfg.get('sas_runtime') or {}
+    for v in (cfg.get('domain'), cfg.get('app_domain'),
+              cfg.get('mqtt_host'), br.get('advertise_broker'),
+              br.get('broker'), sas.get('public_domain')):
+        h = _host_of(v)
+        if not h:
+            continue
+        low = h.lower()
+        if low in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
+            continue
+        if not host_is_domain(h):            # IP 字面量 → 跳过
+            continue
+        # 内网域名（.local / 单标签主机名）也跳过，对端解析不了
+        if low.endswith('.local') or '.' not in low:
+            continue
+        if h not in cands:
+            cands.append(h)
+    return cands
+
+
 def _live_report_address():
     """
     实时算"报给总系统的本机地址"（需求1）。
@@ -1556,6 +1602,12 @@ def _live_report_address():
         app_domain = str((CONFIG or {}).get('app_domain') or '').strip()
         app_port = (CONFIG or {}).get('app_port')
         app_use_port = (CONFIG or {}).get('app_use_port', True)
+        # ★ 域名优先（用户要求）：当前地址是 IP 字面量或为空时，
+        #   从配置里找现成域名来上报 —— 动态 IP 一变就联系不上，必须用域名。
+        if not app_domain or _looks_like_ip(app_domain):
+            _dom = _pick_domain_from_config()
+            if _dom:
+                app_domain = _dom[0]
         if app_domain:
             if app_use_port and app_port:
                 return {'api_url': 'http://%s:%s' % (app_domain, app_port),
@@ -1679,15 +1731,39 @@ def auto_apply_public_address(force_report=False):
                 'source': '手动配置的域名', 'changed': False,
                 'note': '已按域名上报；自动扫描不会覆盖它'}
     if cur and _looks_like_ip(cur):
-        # 规则 3：历史遗留 IP —— 只提示，不覆盖（用户要的是改成域名）
+        # ★ 规则 3（改）：当前是动态 IP → **主动换成配置里现成的域名**。
+        #   旧逻辑只打日志"建议改用域名"，从不动手 ✗ —— 结果动态 IP 一变
+        #   上报地址跟着变，桥接/互联全断（用户实测：几台全是动态 IP）。
+        doms = _pick_domain_from_config()
+        if doms:
+            dom = doms[0]
+            CONFIG['app_domain'] = dom
+            CONFIG['app_port'] = port
+            CONFIG['app_use_port'] = True
+            try:
+                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+            except Exception as e:  # noqa: BLE001
+                print("[CONFIG] 保存域名失败（本次仍按域名上报）: %s" % e)
+            print("[CONFIG] 上报地址由 IP（%s）改为**域名** %s:%d"
+                  "（动态 IP 会变，域名才是稳定入口）" % (cur, dom, port))
+            try:
+                eng = _SYNC_ENGINE
+                if eng is not None:
+                    eng.report_to_master(full=False)
+            except Exception as e:  # noqa: BLE001
+                print("[CONFIG] 改用域名后上报失败（下个周期会补上）: %s" % e)
+            return {'ok': True, 'address': '%s:%d' % (dom, port),
+                    'source': '配置里的域名（替换了动态 IP）', 'changed': True,
+                    'note': '已改为域名上报；动态 IP 变化不再影响定位'}
         ip, source = _master_observed_ip()
         if ip and ip != cur:
-            print("[CONFIG] 注意：上报地址当前是 IP（%s），而公网 IP 已变成 %s；"
-                  "动态 IP 会变，建议把 app_domain 改成域名（改成后自动扫描"
-                  "不会再覆盖它）" % (cur, ip))
+            print("[CONFIG] 注意：上报地址当前是 IP（%s），公网 IP 已变成 %s，"
+                  "且配置里没有可用域名（domain/mqtt_host/advertise_broker 都没有）"
+                  % (cur, ip))
         return {'ok': True, 'address': '%s:%d' % (cur, port),
                 'source': '配置里的地址（IP）', 'changed': False,
-                'note': '当前是 IP，建议改用域名；自动扫描不会覆盖它'}
+                'note': '配置里没有域名，只能用 IP 兜底；建议补一个域名'}
     # 规则 2：没填地址 → 扫一个公网 IP 兜底（并提示换域名）
     ip, source = _master_observed_ip()
     if not ip:
