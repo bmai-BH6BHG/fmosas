@@ -185,15 +185,39 @@ class BridgeCredentialsTests(unittest.TestCase):
         src = io.open(os.path.join(REPO, 'bridge.py'), encoding='utf-8').read()
         self.assertIn('"api_url": str(c.get("api_url") or "").strip(),', src)
 
-    def test_probe_failure_means_no_token(self):
-        """探测不通（旧版本/超时）→ 判定不支持 → 不发令牌。"""
+    def test_probe_never_blocks_connection(self):
+        """
+        ★ 关键：探测**绝不能阻塞连接流程**。
+
+        真实事故：探测里直接发 HTTP（每个候选 5 秒）→ 对端不可达时每条链路
+        建立前都干等 → 桥接重连被拖慢、多成员集群用例超时失败。
+        现在只读缓存；没有缓存就立刻返回 False（本次用证书，零回归），
+        同时后台探测供下次使用。
+        """
+        import threading
         svc = B.VoiceBridge.__new__(B.VoiceBridge)
         svc._token_cap = {}
+        svc._token_cap_lock = threading.Lock()
+        svc._probe_running = set()
         svc.log = lambda *a, **k: None
-        # 指向一个必然连不上的地址（端口 1，本地无服务）
+        # 指向必然连不上的地址（端口 1）：必须立刻返回 False，不许等网络
+        t0 = __import__('time').time()
         self.assertFalse(svc.peer_supports_token('http://127.0.0.1:1', 'h'))
-        # 结果被缓存（第二次直接命中缓存，不再发起请求）
-        self.assertFalse(svc.peer_supports_token('http://127.0.0.1:1', 'h'))
+        took = __import__('time').time() - t0
+        self.assertLess(took, 1.5, '探测阻塞了连接流程（耗时 %.1fs）' % took)
+        # 没有缓存时不会凭空变出"支持"
+        self.assertFalse(svc._token_cap.get('h', (0, False))[1])
+
+    def test_probe_result_cache_is_used(self):
+        """缓存里已有结果时直接采用（不再探测）。"""
+        import threading
+        import time as _t
+        svc = B.VoiceBridge.__new__(B.VoiceBridge)
+        svc._token_cap = {'h': (_t.time(), True)}
+        svc._token_cap_lock = threading.Lock()
+        svc._probe_running = set()
+        svc.log = lambda *a, **k: None
+        self.assertTrue(svc.peer_supports_token('http://1.2.3.4:1', 'h'))
 
     def test_local_link_keeps_cert(self):
         """本机 broker 的本地连接保持证书方案（缩小改动面）。"""
