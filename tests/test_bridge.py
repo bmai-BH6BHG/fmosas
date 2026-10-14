@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MQTT 互联桥接测试（集群模型）
@@ -281,7 +281,7 @@ class BridgeTestCase(unittest.TestCase):
         svc = B.VoiceBridge(self.tmp, cfg, save_fn=lambda c: True, logger=None,
                             broker=("127.0.0.1", local_broker.port),
                             candidate_source=src)
-        svc.credentials = lambda host, port: ("CALL", "pw")
+        svc.credentials = lambda host, port, use_token=False: ("CALL", "pw")
         self.bridges.append(svc)
         return svc
 
@@ -959,7 +959,7 @@ class ClusterTests(BridgeTestCase):
                           "node_name": node_id}}
         cfg.update(extra)
         svc = B.VoiceBridge(self.tmp, cfg, save_fn=lambda c: True, logger=None)
-        svc.credentials = lambda host, port: ("CALL", "pw")
+        svc.credentials = lambda host, port, use_token=False: ("CALL", "pw")
         self.bridges.append(svc)
         return svc
 
@@ -1063,10 +1063,25 @@ class ApiAndPackagingTests(unittest.TestCase):
         self.assertIn("与总服务器名册不符", src)
 
     def test_bridge_api_not_public(self):
+        """
+        桥接**管理**接口不得公网暴露（安全底线）。
+
+        例外：`/api/bridge/info` 是**只读能力声明**（告诉对端"我支持免证书
+        桥接令牌"），不含任何敏感数据；对端要判断"该不该用令牌"必须先能探到它。
+        其余 /api/bridge/*（状态、配置、成员……）一律不得进公网白名单。
+        """
         api = open(os.path.join(ROOT, "api_server.py"), encoding="utf-8").read()
+        ALLOWED_PUBLIC_BRIDGE = '/api/bridge/info'
         for name in ("PUBLIC_GET_PATHS", "PUBLIC_POST_PATHS"):
             block = api.split(name, 1)[1].split(")", 1)[0]
-            self.assertNotIn("bridge", block, "%s 里不该有 bridge" % name)
+            # 去掉注释行与豁免项后再检查：剩下的任何 bridge 字样都不允许
+            cleaned = "\n".join(
+                ln for ln in block.split("\n")
+                if not ln.strip().startswith("#"))
+            cleaned = cleaned.replace(ALLOWED_PUBLIC_BRIDGE, "")
+            self.assertNotIn("bridge", cleaned, "%s 里不该有 bridge" % name)
+        # 只读能力声明本身必须在（否则对端探不到，只能盲试令牌）
+        self.assertIn(ALLOWED_PUBLIC_BRIDGE, api)
 
     def test_monitor_subscribes_relay_topics(self):
         mon = open(os.path.join(ROOT, "monitor.py"), encoding="utf-8").read()

@@ -728,6 +728,20 @@ def init_sync_service():
             # ★ 上报地址（需求1）也实时取：引擎手里的 config 是浅拷贝，
             #   顶层标量会冻在启动那一刻，自动扫描改了地址传不进去。
             engine.address_source = _live_report_address
+
+            # ★ 桥接密钥回写：引擎的 config 是 dict(CONFIG) 浅拷贝，
+            #   密钥要落到真实 CONFIG（bridge 与 /auth 都读它）并持久化。
+            def _save_bridge_secret():
+                try:
+                    _sec = str((engine.config or {}).get('bridge_secret') or '').strip()
+                    if _sec and _sec != str(CONFIG.get('bridge_secret') or ''):
+                        CONFIG['bridge_secret'] = _sec
+                        save_config()
+                        print("[SYNC] 桥接密钥已保存（桥接免证书互认生效）")
+                except Exception as _e_sbs:  # noqa: BLE001
+                    print("[SYNC] 保存桥接密钥失败: %s" % _e_sbs)
+
+            engine.save_config_fn = _save_bridge_secret
             # ★ UDAC 台站信任排行随同步上报带给总系统（全局台站信任排行的数据源）
             engine.udac_ranking_source = lambda: (
                 _UDAC.ranking_payload(20) if _UDAC is not None else None)
@@ -2020,6 +2034,11 @@ PUBLIC_GET_PATHS = frozenset({
     '/', '/index.html',
     '/api/health', '/api/users', '/api/stats', '/api/config',
     '/api/cert/mine', '/api/sync/status',
+    # 桥接能力探测：对端据此判断"该不该用免证书令牌" ——
+    # 旧版本没有这个端点（404）→ 对端就直接用证书，不会白试一次令牌
+    # （真实事故：对旧版本先发令牌会被计一次认证失败，紧接着的证书重试也被拒，
+    #   把原本能连的台搞断）。
+    '/api/bridge/info',
     # 根证书公开下载：别的 FMO 服务器要信任本机签发的证书（含国服绑定签发的），
     # 就得从这里取根证书放进它的 roots/。根证书是自签公开信息——它的公钥本来就
     # 出现在每张已签发证书的链里，私钥 ca_private.json 不在这里、也不外发。
@@ -2352,6 +2371,23 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return
 
         # 健康检查端点（便于总系统/监控探活）
+        if path == '/api/bridge/info':
+            # 桥接能力声明（只读、公网可访问）：告诉对端"我支持免证书桥接令牌"。
+            # 有 secret 才为真 —— 说明本机已从总系统拿到桥接密钥。
+            try:
+                _bk_sec = str((CONFIG or {}).get('bridge_secret') or '')
+                self.send_json({
+                    'ok': True,
+                    'service': 'fmo-subsystem',
+                    'subsystem_id': str((CONFIG or {}).get('subsystem_id') or ''),
+                    'name': str((CONFIG or {}).get('name') or ''),
+                    'bridge_token': bool(_bk_sec),
+                    'time': time.time(),
+                })
+            except Exception as _e_bi:  # noqa: BLE001
+                self.send_json({'ok': False, 'error': str(_e_bi)}, 500)
+            return
+
         if path == '/api/health':
             self.send_json({'ok': True, 'service': 'fmo-subsystem', 'time': time.time()})
             return
@@ -3505,6 +3541,91 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             return None, None
         return sas_db, ca_mgr
 
+    # ---------- 桥接免证书快速通道 ----------
+    def _bridge_auth(self, username, password, clientid):
+        """
+        桥接客户端免证书认证（用户要求：不验证书，只验证「是 FUS + 总服务器有记录」）。
+
+        返回 (is_bridge, allow, reason, attrs)：
+          is_bridge=False            → 不是桥接客户端，调用方继续走证书认证
+          is_bridge=True, allow=True → 放行，attrs 可直接作为 client_attrs
+          is_bridge=True, allow=False→ 明确拒绝（reason 给排查用）
+
+        ★ 判定依据（不再依赖证书信任链）：
+          1. 桥接密钥正确：password == 'FMO-BRIDGE:<节点id>:<总系统下发的密钥>'
+             —— 密钥只能通过 pull 总系统拿到，因此"拿到密钥"本身就等价于
+                "它是注册在册、能连总服务器的 FUS 系统"；
+          2. 该节点 id 在**本机缓存的总系统名册**里（在总服务器上有记录）；
+             本机自己的本地桥接连接（-LOCAL）直接放行。
+        """
+        BRIDGE_PREFIX = 'FMO-BRIDGE:'
+        u = str(username or '')
+        cid = str(clientid or '')
+        pw = str(password or '')
+        # 桥接客户端有两个特征：clientid 前缀，或 password 用了桥接令牌格式
+        is_bridge = cid.startswith('FMO-BRIDGE-') or pw.startswith(BRIDGE_PREFIX)
+        if not is_bridge:
+            return False, False, '', {}
+
+        # 本机配置里的桥接密钥（由总系统 pull 下发；见 sync_engine.merge_all）
+        secret = str((CONFIG or {}).get('bridge_secret') or '').strip()
+        if not secret:
+            # 还没拿到密钥 → 不拦，交给原证书认证（向后兼容）
+            return True, False, 'BACKWARD_COMPAT', {}
+
+        # 解析令牌：FMO-BRIDGE:<sid>:<secret>
+        sid = ''
+        if pw.startswith(BRIDGE_PREFIX):
+            rest = pw[len(BRIDGE_PREFIX):]
+            parts = rest.split(':', 1)
+            if len(parts) == 2:
+                sid, tok = parts[0].strip(), parts[1]
+            else:
+                sid, tok = '', ''
+        else:
+            # 只给了 clientid（老式密码/证书）→ 交给证书认证
+            return True, False, 'BACKWARD_COMPAT', {}
+        if tok != secret:
+            return True, False, '桥接密钥不匹配', {}
+        if not sid:
+            return True, False, '桥接令牌缺少节点标识', {}
+
+        me = str((CONFIG or {}).get('subsystem_id') or '').strip()
+        # 本机自己的本地桥接/监控连接：clientid 形如 FMO-BRIDGE-<本机sid>-LOCAL
+        base_sid = sid[:-len('-LOCAL')] if sid.endswith('-LOCAL') else sid
+        if base_sid and base_sid == me:
+            return True, True, '', {
+                'callsign': 'SERVER', 'uid': '200000',
+                'bridge_member': '1', 'bridge_sid': base_sid, 'bridge_local': '1',
+                'app_exempt': '1',
+            }
+
+        # ★ "在总服务器上有记录"：查本机缓存的总系统名册
+        hit = None
+        try:
+            for r in (_bridge_roster_source() or []):
+                if str((r or {}).get('subsystem_id') or '').strip() == base_sid:
+                    hit = r
+                    break
+        except Exception:  # noqa: BLE001
+            hit = None
+        if hit is None:
+            # 兜底：本机已确认过的集群成员（名册刷新失败时仍能互通）
+            try:
+                if _BRIDGE is not None and base_sid in (_BRIDGE.member_ids() or []):
+                    hit = {'subsystem_id': base_sid, 'name': '', 'source': 'member_ids'}
+            except Exception:  # noqa: BLE001
+                hit = None
+        if hit is None:
+            return True, False, ('节点 %s 不在总服务器名册中（无法确认它是已注册的 FUS 系统）'
+                                 % base_sid), {}
+        return True, True, '', {
+            'callsign': 'SERVER', 'uid': '200000',
+            'bridge_member': '1', 'bridge_sid': base_sid,
+            'bridge_name': str((hit or {}).get('name') or ''),
+            'app_exempt': '1',
+        }
+
     # ---------- POST /auth ----------
     def _handle_sas_auth(self):
         """MQTT broker 调用的认证端点，代理到 sas_server.authenticate"""
@@ -3543,6 +3664,45 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if _tr:
                 _auth_trace_write(_T, "ignore(no-password)")
             return
+        # ★★ 桥接免证书快速通道（用户要求：桥接不验证书，只验证
+        #    「它是 FUS 系统 + 在总服务器名册有记录」）。
+        #    放在 CA 检查之前：桥接不再依赖本机 CA/信任链是否就绪。
+        try:
+            _hb_bridge, _hb_allow, _hb_reason, _hb_attrs = self._bridge_auth(
+                username, password, clientid)
+        except Exception as _e_ba:  # noqa: BLE001
+            print("[AUTH] 桥接判定异常（回退证书认证）: %s" % _e_ba)
+            _hb_bridge, _hb_allow, _hb_reason, _hb_attrs = False, False, '', {}
+        if _hb_bridge:
+            if _hb_allow:
+                try:
+                    _note_bridge_inbound(
+                        str(_hb_attrs.get('bridge_sid') or '')
+                        or str(clientid)[len('FMO-BRIDGE-'):])
+                except Exception:  # noqa: BLE001
+                    pass
+                print("[AUTH] 桥接免证书通过: sid=%s clientid=%s（来源=%s）"
+                      % (_hb_attrs.get('bridge_sid') or 'local', clientid,
+                         '本机' if _hb_attrs.get('bridge_local') else '总服务器名册'))
+                self.send_json({
+                    'result': 'allow',
+                    'client_attrs': _hb_attrs,
+                    'is_superuser': False,
+                })
+                _t("send_allow_bridge")
+                if _tr:
+                    _auth_trace_write(_T, "allow(bridge)")
+                return
+            if _hb_reason and _hb_reason != 'BACKWARD_COMPAT':
+                print("[AUTH] 桥接拒绝: %s（clientid=%s）" % (_hb_reason, clientid))
+                self.send_json({'result': 'deny',
+                                'reason': '桥接认证失败: %s' % _hb_reason})
+                _t("send_deny_bridge")
+                if _tr:
+                    _auth_trace_write(_T, "deny(bridge:%s)" % _hb_reason)
+                return
+            # BACKWARD_COMPAT：还没拿到桥接密钥 → 继续走原证书认证（老节点不受影响）
+
         if ca_mgr is None:
             self.send_json({'result': 'deny', 'reason': 'CA 管理器未初始化'})
             _t("send_deny_noca")

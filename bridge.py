@@ -450,6 +450,12 @@ class BridgeLink(threading.Thread):
         self.peer_id = peer.get("id")
         self.key = peer.get("key") or ("%s:%d" % (peer.get("host"), peer.get("port")))
         self.peer = dict(peer)
+        # ★ clientid 代次：认证被拒时轮换，规避对端按 clientid 的封禁
+        #   （EMQX flapping_detect 会在认证失败后按 clientid 封禁一段时间，
+        #    封禁期内**连正确的证书也进不去** —— 真实事故：一次误试就把
+        #    本来正常的渝东北FMO 推入永久拒绝）。
+        #   0 = 用标准 clientid（FMO-BRIDGE-<节点>）；>0 追加 -G<代次>。
+        self._cid_gen = 0
         self.stop_event = threading.Event()
         self.connected = False
         self.state = "connecting"
@@ -569,19 +575,64 @@ class BridgeLink(threading.Thread):
                     ip, derr = _resolve_host_cached(ph)
                     if not ip:
                         raise MqttError(derr or "域名解析失败")
-                creds = self.svc.credentials(self.peer["host"], self.peer["port"])
-                if not creds:
-                    raise MqttError("本机监控证书不可用（ca/monitor_cert.json），无法向对端认证")
-                username, password = creds
-                client = MqttMiniClient(
-                    self.peer["host"], self.peer["port"],
-                    "%s%s" % (CLIENTID_PREFIX, self.svc.client_suffix()),
-                    username=username, password=password,
-                    # 需求2：keepalive 可配置（长连接保持），默认 60s
-                    keepalive=self.svc.keepalive_s,
-                    on_message=self._on_message, read_timeout=0.5)
+                # ★ 桥接凭证：**令牌优先（免证书）**，认证失败自动回退证书。
+                #   对端已升级 → 令牌可用，完全不需要证书；
+                #   对端未升级 → 它解析不了令牌（rc=5）→ 回退证书，链路照常，
+                #   不会因为这次改造把原本能连的台搞断。
+                #   ★ 优先级由**对端能力探测**决定（不能无脑令牌优先）：
+                #     对端支持令牌 → 令牌优先（免证书，达成用户目标）
+                #     对端不支持/探测失败 → **证书优先**（不发令牌，零回归）
+                #   真实事故：对旧版本先发令牌会被计一次认证失败，紧接着的证书重试
+                #   也被连带拒绝 → 把本来能连的渝东北FMO 搞断了。
+                if self.svc.peer_supports_token(
+                        self.peer.get("api_url") or "", self.peer.get("host") or ""):
+                    modes = ['token', 'cert']
+                else:
+                    modes = ['cert', 'token']
+                creds = None
+                client = None
+                last_err = None
+                for _mode in modes:
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        creds = self.svc.credentials(
+                            self.peer["host"], self.peer["port"],
+                            use_token=(_mode == 'token'))
+                    except TypeError:
+                        # 兼容自定义/旧实现：不支持 use_token 参数
+                        creds = self.svc.credentials(self.peer["host"], self.peer["port"])
+                    if not creds:
+                        last_err = MqttError(
+                            "无可用桥接凭证（既没有桥接密钥，也没有监控证书）")
+                        continue
+                    username, password = creds
+                    client = MqttMiniClient(
+                        self.peer["host"], self.peer["port"],
+                        "%s%s%s" % (CLIENTID_PREFIX, self.svc.client_suffix(),
+                                     ("-G%d" % self._cid_gen) if self._cid_gen else ""),
+                        username=username, password=password,
+                        # 需求2：keepalive 可配置（长连接保持），默认 60s
+                        keepalive=self.svc.keepalive_s,
+                        on_message=self._on_message, read_timeout=0.5)
+                    try:
+                        client.connect()
+                    except MqttError as _e_conn:
+                        last_err = _e_conn
+                        client = None
+                        # 只对「认证类失败」回退；网络类失败换凭证也没用，直接抛
+                        _m = str(_e_conn)
+                        if _mode == 'token' and ('rc=5' in _m or 'rc=4' in _m
+                                                 or 'rc=3' in _m or 'rc=2' in _m):
+                            self.svc.log("[BRIDGE] %s：桥接令牌未被接受（%s），"
+                                         "回退证书重试" % (self.peer.get("name"), _m[:40]))
+                            continue
+                        raise
+                    self._cred_mode = _mode
+                    break
+                if client is None:
+                    raise (last_err or MqttError("桥接连接失败"))
                 self._client = client
-                client.connect()
                 # 第一步**只订阅名片**：先确认对方是不是"已加入集群"的成员。
                 # 确认后才订阅语音主题 —— 免得对没加入集群的站白收一堆流量。
                 # ★ 必须看 SUBACK 返回码：对端 broker 的 ACL 可能拒绝订阅，
@@ -639,7 +690,18 @@ class BridgeLink(threading.Thread):
                     #   加进它的信任表。所以把重试间隔拉长，避免无谓连接把日志刷满
                     #   （用户看到的就是"老是显示证书被拒绝"）。
                     if _is_auth_reject(str(e)):
-                        backoff = max(backoff, AUTH_FAIL_RETRY)
+                        # ★ 先轮换 clientid：对端可能按 clientid 封禁了我们，
+                        #   换一个全新 id 再试；前几代给较短退避，快速恢复。
+                        self._cid_gen += 1
+                        if self._cid_gen <= 3:
+                            self.svc.log("[BRIDGE] %s：认证被拒，轮换 clientid "
+                                         "代次 %d 后重试（%.0fs）"
+                                         % (self.peer.get("name"), self._cid_gen, 45.0))
+                            backoff = min(backoff, 45.0)
+                        else:
+                            # 连续多代都不行 → 不是封禁，是信任链/版本问题，
+                            #   回到长退避，不刷日志
+                            backoff = max(backoff, AUTH_FAIL_RETRY)
             finally:
                 self.connected = False
                 self.member = False
@@ -748,6 +810,8 @@ class VoiceBridge(object):
         # 自动发现集群成员的候选来源（由 api_server 注入：返回 APRS 里"能进去"的台站，
         # 也就是真正的 FUS 系统）。不注入时只用手动补充的地址。
         self._candidate_source = candidate_source
+        # 免证书令牌能力探测缓存（见 peer_supports_token）
+        self._token_cap = {}
         self._lock = threading.RLock()
         self._cfg = load_bridge_config(self.config)
         self.node_id = (str(self._cfg.get("node_id") or "").strip()
@@ -888,15 +952,83 @@ class VoiceBridge(object):
         self._local_restart = True          # 地址变了 → 本机 broker 连接必须重建
         return self._persist()
 
+    # 免证书令牌能力探测缓存：{host: (探测时间, 是否支持)}
+    _TOKEN_CAP_TTL = 600.0        # 10 分钟
+
+    def peer_supports_token(self, api_url, host=''):
+        """
+        探测对端是否支持「免证书桥接令牌」（本版本新增的 /api/bridge/info）。
+
+        ★ 为什么要探测：对**旧版本**先发令牌，会被它当作一次认证失败，
+          紧接着的证书重试也可能被连带拒绝 —— 真实事故：渝东北FMO 本来连得好好的，
+          改成"令牌优先"后反而断了。所以必须先问清楚再决定用哪种凭证。
+          探测结果缓存 10 分钟；旧版本 404/超时 → 判定不支持 → 直接用证书（零回归）。
+        """
+        key = str(host or api_url or '').strip()
+        if not key:
+            return False
+        now = time.time()
+        try:
+            ent = self._token_cap.get(key)
+        except Exception:  # noqa: BLE001
+            self._token_cap = {}
+            ent = None
+        if ent and now - ent[0] < self._TOKEN_CAP_TTL:
+            return bool(ent[1])
+        ok = False
+        url = str(api_url or '').strip()
+        if url:
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
+            try:
+                import urllib.request
+                req = urllib.request.Request(url.rstrip('/') + '/api/bridge/info',
+                                             headers={'User-Agent': 'FUS-bridge'})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    d = json.loads(resp.read().decode('utf-8', 'replace'))
+                ok = bool((d or {}).get('bridge_token'))
+            except Exception:  # noqa: BLE001
+                ok = False
+        try:
+            self._token_cap[key] = (now, ok)
+        except Exception:  # noqa: BLE001
+            pass
+        self.log("[BRIDGE] %s 免证书令牌能力: %s" % (key, '支持' if ok else '不支持'))
+        return ok
+
     def client_suffix(self):
         """clientid 后缀：必须以 FMO- 开头（EMQX ACL 只放行 FMO-* 的 connect）。"""
         return slot(self.node_id)[:40]
 
-    def credentials(self, host, port):
+    # 桥接免证书互认使用的密码前缀（与服务端 _bridge_auth_check 约定一致）
+    BRIDGE_TOKEN_PREFIX = 'FMO-BRIDGE:'
+
+    def bridge_token_password(self):
+        """本机的桥接令牌密码：FMO-BRIDGE:<节点id>:<总系统下发的桥接密钥>。"""
+        sec = str((self._cfg or {}).get('bridge_secret')
+                  or self.config.get('bridge_secret') or '').strip()
+        if not sec:
+            return ''
+        return '%s%s:%s' % (self.BRIDGE_TOKEN_PREFIX, self.node_id, sec)
+
+    def credentials(self, host, port, use_token=False):
         """
-        用本机监控证书构造 MQTT 认证凭证（与监控/探测同一套）。
-        返回 (username, password)；证书不可用返回 None。
+        构造 MQTT 认证凭证。返回 (username, password)；不可用返回 None。
+
+        ★ use_token=True（**对端**桥接连接）时用免证书方案：
+            username = SERVER（沿用原值，ACL/审计/统计完全不变）
+            password = FMO-BRIDGE:<本机节点id>:<总系统下发的桥接密钥>
+          对端 /auth 只需校验「密钥正确 + 本机节点 id 在它缓存的总系统名册里」，
+          **不再依赖证书信任链** —— 这是用户要求的「验证它是 FUS + 总服务器有记录」。
+          没拿到密钥时自动回退证书（老节点/尚未 pull 到密钥时不受影响）。
+
+        use_token=False（本机 broker 的本地连接）保持原证书方案，缩小改动面。
         """
+        if use_token:
+            tok = self.bridge_token_password()
+            if tok:
+                return 'SERVER', tok
+            # 没配密钥 → 回退证书（下面继续）
         try:
             from fmo_aprs import build_probe_credentials, load_probe_cert
         except Exception as e:  # noqa: BLE001
@@ -1407,6 +1539,8 @@ class VoiceBridge(object):
                         "node_id": "", "remote_id": "",
                         # 名册登记的节点标识：用于"相互验证"（见 on_peer_announce）
                         "expect_id": sid,
+                        # ★ 对端 HTTP 地址：用于探测它是否支持免证书桥接令牌
+                        "api_url": str(c.get("api_url") or "").strip(),
                         "online": bool(c.get("online", True)),
                         "key": key,
                     }
