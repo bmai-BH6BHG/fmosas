@@ -1074,6 +1074,30 @@ class DmrGateway(threading.Thread):
         self._last_state_write = 0.0
 
     # -------------------------------------------------- 工具
+    def _callsign_for_dmr_id(self, dmr_id):
+        """
+        DMR ID → 呼号。国服发来的帧里只有数字 ID，直接回灌集群会显示成
+        "8602243"；这里换成呼号。
+
+        优先级：
+          1) 配置的 id_to_callsign 映射（界面可填）
+          2) 由 src_map（呼号→ID）**自动反转** —— 不用重复维护
+          3) 都没有则返回 None（调用方按需回退）
+        """
+        sid = str(dmr_id or "").strip()
+        if not sid:
+            return None
+        m1 = self.cfg.get("id_to_callsign") or {}
+        if isinstance(m1, dict) and sid in m1:
+            return str(m1[sid]).strip().upper() or None
+        # 由 src_map 自动反转
+        m2 = self.cfg.get("src_map") or {}
+        if isinstance(m2, dict):
+            for cs, did in m2.items():
+                if str(did).strip() == sid:
+                    return str(cs).strip().upper()
+        return None
+
     def _dmr_id_for(self, callsign):
         """FMO 呼号 → DMR ID（srcId）。优先级：配置映射 > 网关 ID > 0。"""
         m = self.cfg.get("src_map") or {}
@@ -1307,6 +1331,7 @@ class DmrGateway(threading.Thread):
         self._rx_frames += 1
 
     def begin_rx(self, call):
+        # call 传进来是国服的 DMR ID（数字）；换成呼号再发集群
         self.rx_pcm = []
         self.rx_valprev = 0
         self.rx_index = 0
@@ -1409,7 +1434,8 @@ class DmrGateway(threading.Thread):
         if want_tg and dst not in (want_tg, self._tx_dmr_id):
             return
         if (flags & 0x01) and self.rx_session is None:
-            self.begin_rx(str(src))
+            cs = self._callsign_for_dmr_id(src) or str(src)
+            self.begin_rx(cs)
         if self.rx_session is None:
             return
         # 33B 负载 → 27B AMBE（placeAmbe 逆运算）
