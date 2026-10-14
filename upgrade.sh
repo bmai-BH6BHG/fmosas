@@ -234,12 +234,15 @@ if [ "$OPT_ROLLBACK" = 1 ]; then
     say "注意：只恢复**系统文件**；config.json / *.db / ca/ 等用户数据从未被动过，无需恢复"
     svc_stop
     _n=0
+    # ★ POSIX 兼容：不用 `done < <(...)`（进程替换是 bash 专有，
+    #   而升级入口走 /bin/sh（dash）→ 会直接语法报错，升级失败：真实事故）
+    ( cd "$LAST" && find . -type f | sed 's|^\./||' ) > "$TMP_ROOT/rollback_list.txt" 2>/dev/null || true
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
         mkdir -p "$DIR/$(dirname "$rel")" 2>/dev/null || true
         cp -a "$LAST/$rel" "$DIR/$rel"
         _n=$((_n + 1))
-    done < <(cd "$LAST" && find . -type f | sed 's|^\./||')
+    done < "$TMP_ROOT/rollback_list.txt"
     say "已恢复 $_n 个文件"
     if [ "${FMO_NO_SERVICE:-0}" != "1" ]; then
         svc_start
@@ -280,19 +283,30 @@ fi
 
 # ★ 降级保护：分发站版本低于本机时不要静默"升级"成旧版
 #   （真实场景：站点 VERSION 还没更新、或 FMO_BASE_URL 指错了目录）
-ver_cmp() {  # ver_cmp A B → 1(A>B) / 0(相等) / -1(A<B)
-    local a="$1" b="$2"
-    [ "$a" = "$b" ] && { printf '0'; return; }
-    local IFS='.' x y i n
-    local -a A B
-    A=($a); B=($b)
-    n=${#A[@]}; [ "${#B[@]}" -gt "$n" ] && n=${#B[@]}
-    for ((i = 0; i < n; i++)); do
-        x="${A[i]:-0}"; y="${B[i]:-0}"
-        case "$x" in ''|*[!0-9]*) x=0 ;; esac
-        case "$y" in ''|*[!0-9]*) y=0 ;; esac
-        if [ "$x" -gt "$y" ]; then printf '1'; return; fi
-        if [ "$x" -lt "$y" ]; then printf '%s' '-1'; return; fi
+ver_cmp() {
+    # ver_cmp A B → 1(A>B) / 0(相等) / -1(A<B)
+    # ★ 纯 POSIX 实现：**不能用 bash 数组 / C 风格 for**
+    #   （升级入口走 /bin/sh(dash)，用 bash 专有语法会直接语法报错 → 升级失败：真实事故）
+    _va="$1"; _vb="$2"
+    [ "$_va" = "$_vb" ] && { printf '0'; return; }
+    # 去掉可能的 v 前缀
+    _va="${_va#v}"; _vb="${_vb#v}"
+    _i=1
+    while [ "$_i" -le 8 ]; do
+        _xa="$(printf '%s' "$_va" | cut -d. -f"$_i")"
+        _xb="$(printf '%s' "$_vb" | cut -d. -f"$_i")"
+        # 段耗尽（cut 会回显原串，用长度判断）：都耗尽则相等
+        case "$_i" in
+            1) [ "$_xa" = "$_va" ] && _xa="" ;;
+        esac
+        [ "$_i" -gt 1 ] && [ "$_xa" = "$_va" ] && _xa=""
+        [ "$_i" -gt 1 ] && [ "$_xb" = "$_vb" ] && _xb=""
+        # 非数字按 0
+        case "$_xa" in ''|*[!0-9]*) _xa=0 ;; esac
+        case "$_xb" in ''|*[!0-9]*) _xb=0 ;; esac
+        if [ "$_xa" -gt "$_xb" ] 2>/dev/null; then printf '1'; return; fi
+        if [ "$_xa" -lt "$_xb" ] 2>/dev/null; then printf '%s' '-1'; return; fi
+        _i=$((_i + 1))
     done
     printf '0'
 }
@@ -352,6 +366,7 @@ step "4/6" "计算要替换的系统文件（用户数据一律跳过）"
 PLAN="$TMP_ROOT/plan.txt"
 SKIPPED="$TMP_ROOT/skipped.txt"
 : > "$PLAN"; : > "$SKIPPED"
+( cd "$EXTRACT" && find . -type f | sed 's|^\./||' | sort ) > "$TMP_ROOT/install_list.txt" 2>/dev/null || true
 while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     src="$EXTRACT/$rel"
@@ -361,7 +376,7 @@ while IFS= read -r rel; do
         continue
     fi
     printf '%s\n' "$rel" >> "$PLAN"
-done < <(cd "$EXTRACT" && find . -type f | sed 's|^\./||' | sort)
+done < "$TMP_ROOT/install_list.txt"
 
 PLAN_N="$(wc -l < "$PLAN" | tr -d ' ')"
 SKIP_N="$(wc -l < "$SKIPPED" | tr -d ' ')"
