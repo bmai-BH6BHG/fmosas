@@ -1660,6 +1660,12 @@ class SyncEngine:
         if skipped:
             log('SYNC', 'ca_info 合并：跳过 %d 条非本机 CA 记录'
                         '（对端 CA 归 trust_chain 管，不得混入本机 ca_info）' % skipped)
+        # ★ 必须返回条数：merge_all 里是 `total += self.merge_ca_info(...)`，
+        #   漏掉这个 return 会让 merge_all 抛
+        #   "unsupported operand type(s) for +=: 'int' and 'NoneType'"
+        #   → **整条 pull 挂掉** → trust_issued 永不落地 → 桥接信任链收不到更新
+        #   （真实事故：本机 pull 连续异常，桥接大面积 rc=5）。
+        return merged
 
     # ------------------------------------------------------------------
     # 远程运维指令（总系统 → 分系统）
@@ -1756,7 +1762,7 @@ class SyncEngine:
             return
         ctype = str(cmd.get('type') or '').strip().lower()
         cmd_id = str(cmd.get('id') or '').strip()
-        if ctype != 'upgrade' or not cmd_id:
+        if ctype not in ('upgrade', 'restart') or not cmd_id:
             return
         # 目标：all / 本机 subsystem_id / 逗号列表
         target = str(cmd.get('target') or 'all').strip().lower()
@@ -1764,9 +1770,34 @@ class SyncEngine:
             if str(self.subsystem_id or '').strip().lower() not in [
                     t.strip() for t in target.split(',') if t.strip()]:
                 return
-        # 幂等：同一 id 只执行一次
-        if self._ops_state_get('last_upgrade_cmd') == cmd_id:
+        # 幂等：同一 id 只执行一次（升级/重启各自记录）
+        _key = 'last_restart_cmd' if ctype == 'restart' else 'last_upgrade_cmd'
+        if self._ops_state_get(_key) == cmd_id:
             return
+        # ---- restart：让分系统自己重启服务（同步线程卡住时救命用）----
+        if ctype == 'restart':
+            log('SYNC', '运维指令受理：%s 秒后重启本机服务（%s）'
+                % (int(self.OPS_DELAY_S), cmd.get('note') or '无说明'))
+            self._ops_state_set('last_restart_cmd', cmd_id)
+
+            def _do_restart():
+                try:
+                    time.sleep(self.OPS_DELAY_S)
+                    import subprocess
+                    # 脱离会话执行：重启会把本进程一起带走，必须用 setsid 派生
+                    subprocess.Popen(
+                        ['/bin/sh', '-c',
+                         'sleep 1; systemctl restart fmo-subsystem'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    log('SYNC', '重启指令已执行（服务将短暂中断）')
+                except Exception as e:  # noqa: BLE001
+                    log('SYNC', '重启指令执行失败: %s' % e)
+
+            threading.Thread(target=_do_restart, name='ops-restart',
+                             daemon=True).start()
+            return
+
         # 版本相同则不折腾
         tgt = str(cmd.get('target_version') or '').strip()
         cur = self._current_version()
@@ -1819,6 +1850,22 @@ class SyncEngine:
         # "master 下发了空集"（= 全部背书已吊销，需 prune 清空）
         if source == 'master' and 'trust_issued' in data:
             total += self.merge_trust_issued(data.get('trust_issued') or [])
+
+        # ★ 桥接密钥：总系统下发，用于**免证书**桥接互认（见 bridge.credentials
+        #   / api_server._bridge_auth_check）。能拿到它就说明本机是注册在册的
+        #   FUS 系统（能连总系统并成功 pull）。
+        if source == 'master' and data.get('bridge_auth'):
+            try:
+                _sec = str((data.get('bridge_auth') or {}).get('secret') or '').strip()
+                if _sec and _sec != str(self.config.get('bridge_secret') or ''):
+                    self.config['bridge_secret'] = _sec
+                    # 落盘（由 api_server 注入的回调保存整个 CONFIG）
+                    _sv = getattr(self, 'save_config_fn', None)
+                    if callable(_sv):
+                        _sv()
+                    log('SYNC', '已更新桥接密钥（%d 位），桥接将免证书互认' % len(_sec))
+            except Exception as _e_ba:  # noqa: BLE001
+                log('SYNC', '保存桥接密钥失败（不影响同步）: %s' % _e_ba)
 
         # ★ 远程升级：总系统在 pull 响应里下发的运维指令（ops_command）。
         #   只处理来自 master 的指令；peer 同步来的指令一律忽略（防横向伪造）。

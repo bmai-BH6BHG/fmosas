@@ -51,7 +51,9 @@ class FUSSideTests(unittest.TestCase):
     def test_idempotent_by_command_id(self):
         """同一指令 id 只执行一次。"""
         self.assertIn("last_upgrade_cmd", self.src)
-        self.assertIn("if self._ops_state_get('last_upgrade_cmd') == cmd_id:", self.src)
+        # 幂等 key 按指令类型选：升级 / 重启各自幂等
+        self.assertIn("_key = 'last_restart_cmd' if ctype == 'restart'", self.src)
+        self.assertIn("if self._ops_state_get(_key) == cmd_id:", self.src)
 
     def test_skips_when_already_target_version(self):
         """已是目标版本就不再折腾。"""
@@ -60,6 +62,11 @@ class FUSSideTests(unittest.TestCase):
     def test_target_filter(self):
         """支持 all 或指定 subsystem_id（只升某几台）。"""
         self.assertIn("target not in ('all', '*')", self.src)
+
+    def test_supports_restart(self):
+        """支持 restart 指令（同步线程卡住时远程救命用）。"""
+        self.assertIn("ctype not in ('upgrade', 'restart')", self.src)
+        self.assertIn("systemctl restart fmo-subsystem", self.src)
 
     def test_uses_official_upgrade_script(self):
         """复用官方 upgrade.sh（内建 sha256 校验 + 重启）。"""
