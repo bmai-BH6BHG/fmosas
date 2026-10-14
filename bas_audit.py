@@ -261,7 +261,31 @@ class AuditService(object):
             return False
         return True
 
+    # ============================================================
+    #  系统身份永不禁封
+    # ============================================================
+    #  真实事故：审计规则「包头呼号 != 连接呼号」把 SERVER 封了，
+    #  而 SERVER 是桥接/监控/网关的公共身份 —— 它们按设计就要转发
+    #  别人的语音帧，"包头呼号 != 连接呼号"对它们是正常现象。
+    #  一封 -> 桥接/监控/DMR 网关全断，整站语音中断。
+    SYS_IDENTITIES = {"SERVER", "MASTER", "DMRGW", "BH6BHG"}
+
+    @classmethod
+    def _is_sys_identity(cls, who):
+        w = str(who or "").strip().upper()
+        if w in cls.SYS_IDENTITIES:
+            return True
+        # 兼容 "SERVER:xxx" / "SERVER-xxx" 这类带后缀的写法，
+        # 但不把 SERVERX9 这种真实呼号误判进去
+        for pre in ("SERVER", "MASTER", "DMRGW"):
+            if w.startswith(pre) and len(w) > len(pre) and w[len(pre)] in ":-_":
+                return True
+        return False
+
     def _ban_recorder(self, callsign, reason, hours):
+        # 系统身份（桥接/监控/网关）永不禁封
+        if self._is_sys_identity(callsign):
+            return False
         # 注意：EMQX 的 until 必须是 RFC3339 带时区（实测 5.8.9 只认这个或 "infinity"），
         # 由 bas_emqx.rfc3339 统一格式化；这里直接传"小时数"。
         until = bas_emqx.rfc3339(hours)
@@ -274,10 +298,13 @@ class AuditService(object):
 
     def _ban_any(self, who, reason, hours, as_type="username"):
         """
-        按指定维度封禁并踢下线：as_type ∈ username / clientid / peerhost。
+        按指定维度封禁并踢下线（系统身份永不禁封）：as_type ∈ username / clientid / peerhost。
         （EMQX 支持这三种。假证书处置用 clientid/peerhost，避免按呼号栽赃）
         """
         if not who:
+            return False
+        # 系统身份永不禁封（真实事故：封 SERVER 导致桥接/监控/DMR 网关全断）
+        if self._is_sys_identity(who):
             return False
         if as_type == "peerhost" and not bas_emqx.is_ip_like(who):
             return False        # EMQX 只接受合法 IP；非法值直接放弃（避免误封）
