@@ -82,6 +82,7 @@ DEFAULTS = {
     "dmr_tg": 860562,                # 通话组（860562 安铜集群 / 8601 国服公共）
     "dmr_ts": 1,                     # 时隙：860 区 TG 用 TS1
     "dmr_cc": 1,                     # 色码
+    "dmr_callsign": "BH6BHG",        # ★ 国服呼号（RPTC 上报用；主站按 ID 校验呼号）
 
     # ---- USRP（DVSwitch：Analog_Bridge 的 rx/tx 端口）----
     "usrp_host": "127.0.0.1",
@@ -121,7 +122,9 @@ def fetch_master_gateways(cfg):
     base = str(cfg.get("master_admin_url") or "").rstrip("/")
     if not base:
         return None
-    url = base + "/api/dmr/gateways"
+    # ★ 必须走 /internal：普通接口返回的密码是脱敏的 "***"，
+    #   拿它算 RPTK 的 SHA256 必然被主站拒绝（真实故障）。
+    url = base + "/api/dmr/gateways/internal"
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "FUS-DMR-GW"})
@@ -688,7 +691,10 @@ class HomebrewPeer:
         self.port = int(cfg.get("dmr_master_port", 62031))
         self.gw_id = int(cfg.get("dmr_gateway_id") or 0)
         self.password = str(cfg.get("dmr_password") or "")
-        self.callsign = str(cfg.get("fmo_callsign", "DMRGW"))[:8]
+        # ★ 国服呼号必须单独配：fmo_callsign 是本网关发 FMO 帧用的（DMRGW），
+        #   而 RPTC 里上报给主站的应是账号的真实呼号（如 BH6BHG）。
+        self.callsign = str(cfg.get("dmr_callsign")
+                            or cfg.get("fmo_callsign") or "BH6BHG")[:8]
         self.cc = int(cfg.get("dmr_cc", 1))
         self.slot = int(cfg.get("dmr_ts", 1))
         self.on_voice = on_voice
@@ -709,6 +715,52 @@ class HomebrewPeer:
 
     def _be32(self, v):
         return struct.pack(">I", v & 0xFFFFFFFF)
+
+    def try_handshake_blocking(self, sock, timeout=8.0):
+        """
+        阻塞式三步握手（**与 probe_dmr_login.py 完全一致**，该脚本实测三步全过）。
+
+        ★ 为什么单独写这个：
+          网关原来的循环式握手在公网主站下握不上（RPTL 发出后立刻 MSTNAK），
+          而同一 ID/密码用这个阻塞流程能连上。差别在于：
+            · 握手期间用较长超时（公网往返 >0.5s）
+            · 每一步都明确等对应的 ACK，不等就判失败
+            · 每次握手用**新建的 socket**（新源端口）
+        """
+        old = sock.gettimeout()
+        try:
+            sock.settimeout(timeout)
+            # 1) RPTL → RPTACK(salt)
+            sock.sendto(b"RPTL" + self._be32(self.gw_id), (self.host, self.port))
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                return False, "RPTL 超时（主站不可达？）"
+            if data[:6] != b"RPTACK":
+                return False, "RPTL 被拒（ID %s 未注册？）: %r" % (self.gw_id, data[:20])
+            # 2) RPTK → RPTACK
+            sock.sendto(self._key(data[6:]), (self.host, self.port))
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                return False, "RPTK 超时"
+            if data[:6] != b"RPTACK":
+                return False, "RPTK 被拒（DMR 密码错误）: %r" % (data[:20],)
+            # 3) RPTC → RPTACK
+            sock.sendto(b"RPTC" + self._be32(self.gw_id) + self._config(),
+                        (self.host, self.port))
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                return False, "RPTC 超时"
+            if data[:6] != b"RPTACK":
+                return False, "RPTC 被拒（配置字段）: %r" % (data[:20],)
+            return True, "握手完成"
+        finally:
+            try:
+                sock.settimeout(old if old else 0.5)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _login(self):
         self._send(b"RPTL" + self._be32(self.gw_id))
@@ -758,13 +810,34 @@ class HomebrewPeer:
             if self.sock is None:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.settimeout(0.5)
+                    # ★ 握手期间必须放宽超时：主站在公网（实测往返 >0.5s），
+                    #   原写死 0.5s → RPTL 发出后根本等不到 salt → 永远握不上
+                    #   （probe_dmr_login.py 用 6s 实测三步全过）。
+                    #   握手成功后（下面 hs==3）会改回 0.5s 保心跳灵敏。
+                    s.settimeout(8.0)
                     s.bind(("0.0.0.0", 0))
                     self.sock = s
                     self.connected = False
                     hs = 0
                     log("DMR 连接 %s:%s（网关 ID %s）" % (self.host, self.port, self.gw_id))
-                    self._login()
+                    # ★ 用已验证成功的阻塞式握手（公网主站 0.5s 超时握不上）
+                    ok, why = self.try_handshake_blocking(s)
+                    if ok:
+                        self.connected = True
+                        hs = 3              # 让收包循环不再重复握手
+                        backoff = 3.0
+                        log("DMR 主站已连通（握阻完成）：TG %s / TS%s"
+                            % (self.cfg.get("dmr_tg"), self.slot))
+                        self._ping()
+                    else:
+                        log("DMR 登录失败：%s" % why)
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                        self.sock = None
+                        self._stop.wait(10.0)
+                        continue
                 except OSError as e:
                     log("DMR socket 失败: %s" % e)
                     self._stop.wait(backoff)
@@ -797,6 +870,11 @@ class HomebrewPeer:
                     elif hs == 3:
                         self.connected = True
                         backoff = 3.0
+                        # 握手完成 → 恢复短超时，保证心跳/收包灵敏
+                        try:
+                            self.sock.settimeout(0.5)
+                        except Exception:  # noqa: BLE001
+                            pass
                         log("DMR 主站已连通（握手完成）：TG %s / TS%s"
                             % (self.cfg.get("dmr_tg"), self.slot))
                         self._ping()
@@ -841,8 +919,12 @@ class HomebrewPeer:
                     continue
                 if now - self._ping_at >= 5:
                     self._ping()
-            elif now - self._ping_at > 10:
-                # 握手卡住：重来
+            elif (not hs) and (now - self._ping_at > 10):
+                # 握手卡住才重来。
+                # ★ 原来是 `now - self._ping_at > 10`，而 _ping_at 初始为 0 →
+                #   now - 0 > 10 恒真 → 每 10 秒就把 hs 归零重发 RPTL，
+                #   握手永远被打断（实测同一 ID/密码用阻塞式握手 3 步全过）。
+                #   现在只在"还没收到第一个 ACK"（hs == 0）时才重发。
                 hs = 0
                 self._login()
 
@@ -1509,6 +1591,7 @@ def _gateway_cfg(base, gw):
         "dmr_tg": int(gw.get("dmr_tg") or 0),
         "dmr_ts": int(gw.get("dmr_ts") or 1),
         "dmr_cc": int(gw.get("dmr_cc") or 1),
+        "dmr_callsign": str(gw.get("dmr_callsign") or "BH6BHG"),
         # FMO 侧
         "fmo_topic": gw.get("fmo_topic") or "FMO/RAW",
         "sub_topic": gw.get("fmo_topic") or "FMO/RAW",
