@@ -1,0 +1,26 @@
+{
+  "_comment": "FMO 集群语音 ↔ 国服 DMR 网关配置（fus_dmr_gw.py）。登录主站的 DMR ID/密码在 /opt/MMDVM_Bridge/MMDVM_Bridge.ini 里配，不在这里。",
+
+  "mqtt_host": "127.0.0.1",
+  "mqtt_port": 1883,
+  "sub_topic": "FMO/RAW",
+  "pub_topic": "FMO/RAW",
+  "client_id": "FMO-DMRGW-01",
+
+  "dmr_master_host": "mastra.radiowo.com",
+  "dmr_master_port": 62031,
+  "dmr_gateway_id": 8600000,
+  "dmr_essid": 0,
+  "dmr_tg": 860562,
+  "dmr_ts": 1,
+  "dmr_cc": 1,
+
+  "usrp_host": "127.0.0.1",
+  "usrp_rx_port": 51000,
+  "usrp_tx_port": 51001,
+
+  "ptt_timeout_ms": 800,
+  "fmo_callsign": "DMRGW",
+  "src_map": {},
+  "state_path": "/opt/fmo-subsystem/fus_dmr_gw_state.json"
+}
