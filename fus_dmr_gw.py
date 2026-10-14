@@ -93,6 +93,11 @@ DEFAULTS = {
     "fmo_callsign": "DMRGW",         # 本网关发帧用的呼号（取主叫呼号更佳）
     "src_map": {},                   # FMO 呼号 -> DMR ID 覆盖表（可选）
     "state_path": "",                # 状态文件路径（留空=不写）
+
+    # ---- 配置来源（总系统）----
+    "master_admin_url": "",          # 如 http://127.0.0.1:35931
+    "master_admin_token": "",        # 总系统管理令牌（如有）
+    "config_refresh_sec": 30,        # 从总系统刷新配置的间隔
 }
 
 SAMPLE_RATE = 8000
@@ -109,6 +114,26 @@ USRP_TYPE_PING = 3
 USRP_TYPE_TLV = 4
 TLV_TAG_SET_INFO = 8
 TLV_TAG_REMOTE_CMD = 5
+
+
+def fetch_master_gateways(cfg):
+    """从总系统拉 DMR 网关配置列表（失败返回 None，由调用方兜底）。"""
+    base = str(cfg.get("master_admin_url") or "").rstrip("/")
+    if not base:
+        return None
+    url = base + "/api/dmr/gateways"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "FUS-DMR-GW"})
+        if cfg.get("master_admin_token"):
+            req.add_header("X-Admin-Token", str(cfg["master_admin_token"]))
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            d = json.loads(resp.read().decode("utf-8", "replace"))
+        gws = d.get("gateways")
+        return gws if isinstance(gws, list) else None
+    except Exception as e:  # noqa: BLE001
+        log("从总系统拉取 DMR 网关配置失败: %s" % e)
+        return None
 
 
 def log(msg):
@@ -860,11 +885,13 @@ class UsrpLink:
 
 
 # ================================================================ 网关主体
-class DmrGateway:
+class DmrGateway(threading.Thread):
     """FMO 集群语音 ↔ 国服 DMR 双向网关。"""
 
     def __init__(self, cfg):
+        threading.Thread.__init__(self, daemon=True)
         self.cfg = cfg
+        self._cfg_lock = threading.Lock()
         self.usrp = UsrpLink(cfg.get("usrp_host", "127.0.0.1"),
                              cfg.get("usrp_rx_port", 51000),
                              cfg.get("usrp_tx_port", 51001))
@@ -1283,6 +1310,20 @@ class DmrGateway:
         return True
 
     # -------------------------------------------------- 主循环
+    def reconfigure(self, new_cfg):
+        """hot-reload config (affects future connections only)."""
+        with self._cfg_lock:
+            self.cfg = dict(new_cfg)
+        pr = new_cfg.get("peer")
+        if pr is not None:
+            try:
+                pr.cfg = dict(new_cfg)
+            except Exception:  # noqa: BLE001
+                pass
+        log("gateway %s config updated (TG%s/TS%s id=%s)"
+            % (new_cfg.get("gw_id", ""), new_cfg.get("dmr_tg"),
+               new_cfg.get("dmr_ts"), new_cfg.get("dmr_gateway_id")))
+
     def run(self):
         cfg = self.cfg
         log("FMO↔DMR 网关启动：MQTT %s:%s 主题 %s → USRP %s:%s → DMR TG%s/TS%s"
@@ -1364,16 +1405,103 @@ def load_config(path):
     return cfg
 
 
+def _gateway_cfg(base, gw):
+    """把总系统下发的一条网关配置合并成本地配置字典。"""
+    cfg = dict(base)
+    cfg.update({
+        "gw_id": gw.get("id") or "",
+        "cluster_id": gw.get("cluster_id") or 0,
+        "gw_name": gw.get("name") or "",
+        # MQTT 桥接账号密码（总系统 UI 里配）
+        "mqtt_user": gw.get("mqtt_user") or "SERVER",
+        "mqtt_password": gw.get("mqtt_password") or "",
+        # 国服
+        "dmr_master_host": gw.get("dmr_master_host") or "mastra.radiowo.com",
+        "dmr_master_port": int(gw.get("dmr_master_port") or 62031),
+        "dmr_gateway_id": int(gw.get("dmr_gateway_id") or 0),
+        "dmr_password": gw.get("dmr_password") or "",
+        "dmr_tg": int(gw.get("dmr_tg") or 0),
+        "dmr_ts": int(gw.get("dmr_ts") or 1),
+        "dmr_cc": int(gw.get("dmr_cc") or 1),
+        # FMO 侧
+        "fmo_topic": gw.get("fmo_topic") or "FMO/RAW",
+        "sub_topic": gw.get("fmo_topic") or "FMO/RAW",
+        "pub_topic": gw.get("fmo_topic") or "FMO/RAW",
+        "src_map": gw.get("src_map") or {},
+    })
+    cfg["client_id"] = "FMO-DMRGW-%s" % (gw.get("id") or "01")
+    if base.get("state_path"):
+        cfg["state_path"] = str(base["state_path"]).replace(
+            ".json", "-%s.json" % (gw.get("id") or "01"))
+    return cfg
+
+
 def main():
-    ap = argparse.ArgumentParser(description="FMO 集群语音 ↔ 国服 DMR 网关")
+    ap = argparse.ArgumentParser(description="FMO cluster voice to DMR gateway")
     ap.add_argument("--config", default="/opt/fmo-subsystem/fus_dmr_gw.json")
+    ap.add_argument("--standalone", action="store_true",
+                    help="only use local config file (single gateway)")
     args = ap.parse_args()
-    cfg = load_config(args.config)
-    gw = DmrGateway(cfg)
+    base = load_config(args.config)
+
+    # Mode A: managed by master (default) - config from master UI, multi-cluster
+    if not args.standalone and base.get("master_admin_url"):
+        log("master-managed mode: %s (refresh %ss)"
+            % (base["master_admin_url"], base.get("config_refresh_sec", 30)))
+        gws = {}
+        try:
+            while True:
+                lst = fetch_master_gateways(base)
+                if lst is None:
+                    if not gws:
+                        log("master unreachable and no gateway running, retry in %ss"
+                            % base.get("config_refresh_sec", 30))
+                    time.sleep(base.get("config_refresh_sec", 30))
+                    continue
+                want = {}
+                for gw in lst:
+                    if not gw.get("enabled"):
+                        continue
+                    gid = str(gw.get("id") or "")
+                    if gid:
+                        want[gid] = gw
+                for gid in list(gws.keys()):
+                    if gid not in want:
+                        log("stop DMR gateway %s (disabled or removed)" % gid)
+                        try:
+                            gws[gid].stop()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        del gws[gid]
+                for gid, gw in want.items():
+                    cfg = _gateway_cfg(base, gw)
+                    if gid not in gws:
+                        log("start DMR gateway %s: cluster %s -> %s:%s TG%s/TS%s"
+                            % (gid, cfg.get("cluster_id"), cfg.get("dmr_master_host"),
+                               cfg.get("dmr_master_port"), cfg.get("dmr_tg"),
+                               cfg.get("dmr_ts")))
+                        inst = DmrGateway(cfg)
+                        inst.daemon = True
+                        gws[gid] = inst
+                        inst.start()
+                    else:
+                        gws[gid].reconfigure(cfg)
+                time.sleep(base.get("config_refresh_sec", 30))
+        except KeyboardInterrupt:
+            log("exiting")
+            for g in gws.values():
+                try:
+                    g.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        return
+
+    # Mode B: single gateway (local config)
+    gw = DmrGateway(base)
     try:
         gw.run()
     except KeyboardInterrupt:
-        log("已退出")
+        log("exiting")
         gw.stop()
 
 

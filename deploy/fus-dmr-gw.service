@@ -1,0 +1,20 @@
+[Unit]
+Description=FMO FUS DMR Gateway (FMO/RAW <-> 国服 DMR)
+Documentation=https://github.com/bmai-BH6BHG/fmosas
+After=network.target fmo-subsystem.service
+Wants=fmo-subsystem.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fmo-subsystem
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /opt/fmo-subsystem/fus_dmr_gw.py --config /opt/fmo-subsystem/fus_dmr_gw.json
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
