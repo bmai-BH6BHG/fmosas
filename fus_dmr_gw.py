@@ -257,6 +257,7 @@ def parse_fmo_frame(data):
     ★ 呼号取 [10:22] 12 字节（真实硬件），按 NUL 截断（旧版只取 6 字节会截断长呼号）。
     """
     stats = {"adpcm": 0, "opus": 0, "other": 0}
+    opus_pkts = []
     if not data or len(data) < FRAME_HEADER or data[0] != 0x01:
         return None
     session = struct.unpack_from("<H", data, 6)[0]
@@ -283,10 +284,13 @@ def parse_fmo_frame(data):
                 blocks.append((vp, idx, payload[8:328]))
         elif itype == 0x01:
             stats["opus"] += 1
+            # Opus 载荷 = 裸 Opus 包（inner 去掉 type/len/CONST5 后即包体）
+            if payload:
+                opus_pkts.append(payload)
         else:
             stats["other"] += 1
         off = inner + blen - 8
-    return session, call, blocks, stats
+    return session, call, blocks, stats, opus_pkts
 
 
 # ================================================================ AMBE 声码器
@@ -360,6 +364,57 @@ class AmbeCodec:
             errs = self._ct.c_int32(0)
             if self._lib.opendmr_decode(self._dec, ambe, pcm, self._ct.byref(errs)):
                 return list(pcm)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+
+# ================================================================ Opus 解码
+# 现网集群（FMO/RAW）实际发的是 **Opus（SILK NB 8kHz）**，不是 ADPCM。
+# 真实故障：早期版本只支持 ADPCM，结果整段语音被丢弃（"累计丢弃 N 块"），
+# FMO→DMR 完全没声音。这里用 libopus.so 解码（群晖实测可用）。
+class OpusCodec:
+    """Opus 包 → PCM(8kHz s16)，每包 40ms = 320 样本。"""
+
+    def __init__(self, lib_path):
+        self.ok = False
+        self.err = ""
+        try:
+            import ctypes
+            self._ct = ctypes
+            lib = ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+            lib.opus_decoder_create.restype = ctypes.c_void_p
+            lib.opus_decoder_create.argtypes = [ctypes.c_int, ctypes.c_int,
+                                                ctypes.POINTER(ctypes.c_int)]
+            lib.opus_decode.restype = ctypes.c_int
+            lib.opus_decode.argtypes = [ctypes.c_void_p,
+                                        ctypes.POINTER(ctypes.c_ubyte),
+                                        ctypes.c_int32,
+                                        ctypes.POINTER(ctypes.c_int16),
+                                        ctypes.c_int, ctypes.c_int]
+            lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+            self._lib = lib
+            err = ctypes.c_int(0)
+            self._dec = lib.opus_decoder_create(8000, 1, ctypes.byref(err))
+            if not self._dec:
+                self.err = "opus_decoder_create 失败 err=%d" % err.value
+                return
+            self.ok = True
+            log("Opus 解码器就绪: %s（8kHz 单声道，40ms/包）" % lib_path)
+        except Exception as e:  # noqa: BLE001
+            self.err = str(e)
+            log("Opus 解码器不可用（语音若为 Opus 将无法转发）: %s" % e)
+
+    def decode(self, pkt):
+        """一个 Opus 包 → 320 个 int16 样本（40ms）；失败返回 None。"""
+        if not self.ok or not pkt:
+            return None
+        try:
+            buf = (self._ct.c_ubyte * len(pkt))(*pkt)
+            pcm = (self._ct.c_int16 * 320)()
+            n = self._lib.opus_decode(self._dec, buf, len(pkt), pcm, 320, 0)
+            if n > 0:
+                return list(pcm[:n])
         except Exception:  # noqa: BLE001
             return None
         return None
@@ -748,8 +803,11 @@ class HomebrewPeer:
                 elif tag == b"MSTPONG":
                     self._ping_at = 0.0
                 elif tag in (b"MSTNAK", b"RPTNAK"):
-                    log("DMR 主站拒绝登录（%s）：检查 DMR ID / 密码 / ESSID"
-                        % data[:6].decode("ascii", "replace"))
+                    log("DMR 主站拒绝登录（%s）：网关 ID=%s 主机=%s:%s —— "
+                        "请核对 ① 国服 ID 是否为 7 位 ② DMR 密码是否正确 "
+                        "③ 该 ID 是否已在国服注册热点 ④ ESSID 后缀(%s)"
+                        % (data[:6].decode("ascii", "replace"), self.gw_id,
+                           self.host, self.port, self.cfg.get("dmr_essid", 0)))
                     try:
                         self.sock.close()
                     except OSError:
@@ -924,6 +982,8 @@ class DmrGateway(threading.Thread):
         # ---- 音频/链路 ----
         self.ambe = AmbeCodec(cfg.get("ambe_lib") or
                               os.path.join(_HERE, "lib", "libfusambe.so"))
+        self.opus = OpusCodec(cfg.get("opus_lib") or
+                              os.path.join(_HERE, "lib", "libopus.so"))
         self.peer = None
         self._ambe_buf = []       # 待组帧的 9B AMBE
         self._dmrcnt = 0
@@ -957,6 +1017,7 @@ class DmrGateway(threading.Thread):
                 "ts": now,
                 "dmr_connected": bool(self.peer and self.peer.connected),
                 "ambe_ok": bool(self.ambe and self.ambe.ok),
+                "opus_ok": bool(getattr(self, "opus", None) and self.opus.ok),
                 "mqtt_connected": bool(self.client and self.client._sock),
                 "tx_frames": self._tx_frames,
                 "tx_dropped_opus": self._tx_dropped_opus,
@@ -979,18 +1040,43 @@ class DmrGateway(threading.Thread):
         parsed = parse_fmo_frame(payload)
         if parsed is None:
             return
-        session, call, blocks, stats = parsed
+        if len(parsed) == 5:
+            session, call, blocks, stats, opus_pkts = parsed
+        else:                                   # 兼容旧 4 元组
+            session, call, blocks, stats = parsed
+            opus_pkts = []
         # 回环过滤：自己发出去的帧不要又转回去
         if (call or "").upper() == (self.cfg.get("fmo_callsign") or "DMRGW").upper():
             return
         if session in self.published_sessions:
             return
+        # ★ Opus 段：解码后照常转发（不再丢弃）
+        if opus_pkts and getattr(self, "opus", None) is not None and self.opus.ok:
+            with self.tx_lock:
+                if not self.tx_active or self.tx_session != session:
+                    self.tx_active = True
+                    self.tx_session = session
+                    self._tx_dmr_id = self._dmr_id_for(call)
+                    self.on_new_tx()
+                    log("FMO→DMR 会话开始（Opus）：%s session=%s → DMR ID %s"
+                        % (call or "?", session, self._tx_dmr_id))
+                self.tx_last_frame = time.monotonic()
+                self._tx_frames += 1
+                for pkt in opus_pkts:
+                    pcm = self.opus.decode(pkt)       # 320 样本 = 40ms
+                    if not pcm:
+                        continue
+                    for i in range(0, len(pcm), 160):  # 切成 20ms
+                        chunk = pcm[i:i + 160]
+                        if len(chunk) < 160:
+                            chunk = chunk + [0] * (160 - len(chunk))
+                        self.tx_queue.append(struct.pack("<160h", *chunk))
+            return
         if not blocks:
-            # Opus 段等无 ADPCM：明确计数，不静默
             if stats.get("opus"):
                 self._tx_dropped_opus += stats["opus"]
-                log("FMO→DMR：收到 Opus 段（本网关只转 ADPCM），"
-                    "累计丢弃 %d 块" % self._tx_dropped_opus)
+                log("FMO→DMR：Opus 段但解码器不可用（%s），丢弃 %d 包"
+                    % (getattr(self.opus, "err", "未加载"), self._tx_dropped_opus))
             return
         with self.tx_lock:
             if not self.tx_active or self.tx_session != session:

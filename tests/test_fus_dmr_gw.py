@@ -52,7 +52,7 @@ class FmoFrameTests(unittest.TestCase):
     def test_roundtrip(self):
         fr = self._frame()
         self.assertEqual(len(fr), 64 + 344)
-        s, call, blocks, stats = G.parse_fmo_frame(fr)
+        s, call, blocks, stats, opus_pkts = G.parse_fmo_frame(fr)
         self.assertEqual(s, 1234)
         self.assertEqual(call, "BH6BHG")
         self.assertEqual(len(blocks), 1)
@@ -78,10 +78,11 @@ class FmoFrameTests(unittest.TestCase):
         inner = bytes([0x01]) + struct.pack("<H", 8 + 40) + G.CONST5 + bytes(40)
         blk = G.make_block(2, 0x01, inner[8:])
         fr = G.pack_frame("BH6BHG", 99, 1, 2, blk, 1, 0)
-        s, call, blocks, stats = G.parse_fmo_frame(fr)
+        s, call, blocks, stats, opus_pkts = G.parse_fmo_frame(fr)
         self.assertEqual(stats["opus"], 1)
         self.assertEqual(stats["adpcm"], 0)
-        self.assertEqual(len(blocks), 0)      # Opus 不解码，返回空 ADPCM 块
+        self.assertEqual(len(blocks), 0)      # Opus 不产生 ADPCM 块
+        self.assertEqual(len(opus_pkts), 1, "Opus 载荷必须被提取出来供解码")
 
     def test_bad_frames_rejected(self):
         self.assertIsNone(G.parse_fmo_frame(b""))
