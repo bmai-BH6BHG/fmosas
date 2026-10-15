@@ -90,11 +90,11 @@ DEFAULTS = {
     "usrp_tx_port": 51001,           # 本地绑定，收 Analog_Bridge
 
     # ---- 会话行为 ----
-    "ptt_timeout_ms": 800,           # FMO 侧静默多久判定松键
+    "ptt_timeout_ms": 1200,          # FMO 侧静默多久判定松键（帧间隔大，勿太短）
     "highpass": True,                # ★ 直流/超低频滤除（嗡嗡声的根治手段，务必开）
     "ambe_gain_db": 3,               # ★ AMBE 编码增益（dB，-20..20）。声音小/差就调大，失真就调小
     "rx_gain": 1.0,                  # 国服→集群回灌方向的 PCM 增益（1.0=不变）
-    "tx_prebuffer_chunks": 4,        # 开口前预缓冲（×20ms），避免开头吞字/断续
+    "tx_prebuffer_chunks": 12,       # 开口前预缓冲（×20ms）。240ms=整个 FMO 帧长，太小会卡顿
     "fmo_callsign": "DMRGW",         # 本网关发帧用的呼号（取主叫呼号更佳）
     "src_map": {},                   # FMO 呼号 -> DMR ID 覆盖表（可选）
     "state_path": "",                # 状态文件路径（留空=不写）
@@ -119,6 +119,75 @@ USRP_TYPE_PING = 3
 USRP_TYPE_TLV = 4
 TLV_TAG_SET_INFO = 8
 TLV_TAG_REMOTE_CMD = 5
+
+
+# ================================================================
+#  国服 ID 库（radiowo.com/id_library/dmrid.dat）
+#  格式：DMR_ID;呼号;昵称;市;省;China;区  （分号分隔，UTF-8）
+#  ★ 用户反馈："fmo 那边显示未知台站" —— 国服 860 区 ID 在
+#    radioid.net 里查不到（APP 源码注释也证实），但国服自己有官方
+#    ID 库可拉。加载后所有国服来话都能显示呼号。
+# ================================================================
+_IDLIB_URL = "https://radiowo.com/id_library/dmrid.dat"
+_idlib_cache = {"data": {}, "at": 0.0}
+
+
+def load_id_library(cfg, force=False):
+    """下载并解析国服 ID 库（1 小时缓存）。返回 {id_int: callsign}。"""
+    now = time.time()
+    if not force and _idlib_cache["data"] and now - _idlib_cache["at"] < 3600:
+        return _idlib_cache["data"]
+    url = str(cfg.get("id_library_url") or _IDLIB_URL)
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "FUS-DMR-GW"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode("utf-8", "replace")
+        data = {}
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line or ";" not in line:
+                continue
+            parts = line.split(";")
+            if len(parts) < 2:
+                continue
+            try:
+                did = int(parts[0])
+            except Exception:  # noqa: BLE001
+                continue
+            cs = (parts[1] or "").strip().upper()
+            if did > 0 and cs:
+                # 同一 ID 多条时保留第一条（呼号相同居多）
+                data.setdefault(did, cs)
+        if data:
+            _idlib_cache["data"] = data
+            _idlib_cache["at"] = now
+            log("国服 ID 库已加载：%d 条（%s）" % (len(data), url))
+            # 落盘缓存（断网也能用）
+            try:
+                cache_path = str(cfg.get("id_library_cache") or
+                                 os.path.join(_HERE, "dmrid_cache.json"))
+                json.dump(data, open(cache_path, "w"))
+            except Exception:  # noqa: BLE001
+                pass
+            return data
+        raise RuntimeError("解析结果为空")
+    except Exception as e:  # noqa: BLE001
+        # 失败时用落盘缓存兜底
+        try:
+            cache_path = str(cfg.get("id_library_cache") or
+                             os.path.join(_HERE, "dmrid_cache.json"))
+            if os.path.exists(cache_path):
+                data = json.load(open(cache_path))
+                data = {int(k): v for k, v in data.items()}
+                _idlib_cache["data"] = data
+                _idlib_cache["at"] = now
+                log("国服 ID 库下载失败（%s），使用本地缓存 %d 条" % (e, len(data)))
+                return data
+        except Exception:  # noqa: BLE001
+            pass
+        log("国服 ID 库不可用: %s" % e)
+        return _idlib_cache["data"] or {}
 
 
 def fetch_master_gateways(cfg):
@@ -478,27 +547,57 @@ class OpusCodec:
             log("Opus 解码器不可用（语音若为 Opus 将无法转发）: %s" % e)
 
     def reset(self):
-        """新会话前复位解码器状态（OPUS_RESET_STATE=4028）。"""
+        """
+        新会话前复位解码器状态。
+        ★ 崩溃修复（真实事故：FMO→DMR 网关段错误）：
+          原来用 opus_decoder_ctl(dec, OPUS_RESET_STATE) —— 这是**可变参数
+          函数**，ctypes 未声明 argtypes 就调用 → 参数传错 → Segmentation
+          fault，整个网关进程崩掉。
+          改为「销毁重建」：destroy + create，语义等价且 100% 安全。
+        """
         if not self.ok:
             return
         try:
-            self._lib.opus_decoder_ctl(self._dec, 4028)
+            self._lib.opus_decoder_destroy(self._dec)
         except Exception:  # noqa: BLE001
             pass
+        try:
+            err = self._ct.c_int(0)
+            self._dec = self._lib.opus_decoder_create(8000, 1, ctypes.byref(err)) \
+                if False else self._lib.opus_decoder_create(8000, 1, self._ct.byref(err))
+            if not self._dec:
+                self.ok = False
+                self.err = "opus 解码器重建失败 err=%d" % err.value
+                log("Opus 解码器重建失败: %s" % self.err)
+        except Exception as e:  # noqa: BLE001
+            self.ok = False
+            self.err = str(e)
+            log("Opus 解码器重建异常: %s" % e)
 
     def decode(self, pkt):
-        """一个 Opus 包 → 320 个 int16 样本（40ms）；失败返回 None。"""
+        """
+        一个 Opus 包 → PCM 样本列表；失败返回 None。
+
+        ★ 崩溃修复（真实事故：FMO→DMR 全程没声、网关段错误）：
+          opus_decode 的 frame_size 参数是 **pcm 缓冲容量**（每通道最大
+          样本数），不是包时长！原先给 320（40ms），而 FMO 实际的包
+          比 40ms 长 → libopus 写超缓冲 → Segmentation fault，
+          整个网关进程直接死掉（所以 FMO→DMR 一个字都出不去，
+          而 DMR→FMO 不走 Opus 所以正常）。
+          现在按 Opus 规格给足容量（120ms = 5760 样本/通道），
+          按返回值 n 取实际样本数。
+        """
         if not self.ok or not pkt:
             return None
         try:
             buf = (self._ct.c_ubyte * len(pkt))(*pkt)
-            pcm = (self._ct.c_int16 * 320)()
-            n = self._lib.opus_decode(self._dec, buf, len(pkt), pcm, 320, 0)
+            pcm = (self._ct.c_int16 * 5760)()          # 120ms 容量（规格上限）
+            n = self._lib.opus_decode(self._dec, buf, len(pkt), pcm, 5760, 0)
             if n > 0:
                 return list(pcm[:n])
+            return None
         except Exception:  # noqa: BLE001
             return None
-        return None
 
 
 # ================================================================ DMR 编解码
@@ -1163,6 +1262,9 @@ class DmrGateway(threading.Thread):
         self._hp = bool(cfg.get("highpass", True))
         self._dc_tx = DcBlocker()
         self._dc_rx = DcBlocker()
+        # 国服 ID 库（异步加载，不阻塞启动）
+        self._idlib = {}
+        threading.Thread(target=self._load_idlib_bg, name="idlib", daemon=True).start()
         self.peer = None
         self._ambe_buf = []       # 待组帧的 9B AMBE
         self._dmrcnt = 0
@@ -1171,6 +1273,15 @@ class DmrGateway(threading.Thread):
         self._last_state_write = 0.0
 
     # -------------------------------------------------- 工具
+    def _load_idlib_bg(self):
+        """后台加载国服 ID 库；每小时刷新一次。"""
+        while not self._stop.is_set():
+            try:
+                self._idlib = load_id_library(self.cfg)
+            except Exception:  # noqa: BLE001
+                pass
+            self._stop.wait(3600.0)
+
     def _callsign_for_dmr_id(self, dmr_id):
         """
         DMR ID → 呼号。国服发来的帧里只有数字 ID，直接回灌集群会显示成
@@ -1193,6 +1304,15 @@ class DmrGateway(threading.Thread):
             for cs, did in m2.items():
                 if str(did).strip() == sid:
                     return str(cs).strip().upper()
+        # 3) 国服官方 ID 库（radiowo.com/id_library/dmrid.dat）
+        lib = getattr(self, "_idlib", None)
+        if lib:
+            try:
+                cs = lib.get(int(sid))
+                if cs:
+                    return str(cs).upper()
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
     def _dmr_id_for(self, callsign):
@@ -1230,6 +1350,11 @@ class DmrGateway(threading.Thread):
                 "tg": self.cfg.get("dmr_tg"),
                 "ts": self.cfg.get("dmr_ts"),
                 "gateway_id": self.cfg.get("dmr_gateway_id"),
+                "unknown_ids": [
+                    {"id": k, "ts": v}
+                    for k, v in sorted(getattr(self, "_unknown_ids", {}).items(),
+                                       key=lambda kv: -kv[1])[:10]
+                ],
             }
             tmp = self._state_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1343,6 +1468,21 @@ class DmrGateway(threading.Thread):
                     (time.monotonic() - self.tx_last_frame) * 1000 > timeout_ms
                 chunk = self.tx_queue.popleft() if self.tx_queue else None
                 active = self.tx_active
+                # ★ 防延迟累积：积压超过 max_queue_chunks（默认 30=600ms）
+                #   丢最旧的 —— 缓冲换流畅，但越攒越延迟也不行
+                try:
+                    maxq = int(self.cfg.get("max_queue_chunks") or 30)
+                except Exception:  # noqa: BLE001
+                    maxq = 30
+                dropped = 0
+                while len(self.tx_queue) > maxq:
+                    self.tx_queue.popleft()
+                    dropped += 1
+                if dropped:
+                    self._tx_dropped_backlog = getattr(
+                        self, "_tx_dropped_backlog", 0) + dropped
+                    log("FMO→DMR：积压超限丢弃 %d 块（累计 %d）"
+                        % (dropped, self._tx_dropped_backlog))
                 if timed_out:
                     self.tx_active = False
                     log("FMO→DMR 会话结束（静默超时松键）")
@@ -1354,6 +1494,7 @@ class DmrGateway(threading.Thread):
                 continue
             if chunk is None:
                 chunk = b"\x00" * USRP_CHUNK     # PTT 期间补静音保流
+                self._starve_count = getattr(self, "_starve_count", 0) + 1
             pcm = list(struct.unpack("<160h", chunk))
             ambe = self.ambe.encode(pcm)
             if ambe is None:
@@ -1363,6 +1504,15 @@ class DmrGateway(threading.Thread):
                 self._emit_dmrd(bytes(b"".join(self._ambe_buf[:3])))
                 self._ambe_buf = self._ambe_buf[3:]
             self._write_state()
+            # ★ 量化排障：每 5 秒打一次队列水位与 starvation（断流）计数
+            now_s = time.monotonic()
+            if now_s - getattr(self, "_stat_at", 0) > 5 and self.tx_active:
+                self._stat_at = now_s
+                starve = getattr(self, "_starve_count", 0)
+                if starve:
+                    log("TX 水位: 队列=%d 断流(发静音)=%d次 已发=%d"
+                        % (len(self.tx_queue), starve, self._tx_frames))
+                    self._starve_count = 0
 
     def _emit_dmrd(self, ambe27):
         """发一个 DMRD 语音帧（LC 头 / 同步帧 / 普通语音帧）。"""
@@ -1554,8 +1704,17 @@ class DmrGateway(threading.Thread):
         if want_tg and dst not in (want_tg, self._tx_dmr_id):
             return
         if (flags & 0x01) and self.rx_session is None:
-            cs = self._callsign_for_dmr_id(src) or str(src)
-            self.begin_rx(cs)
+            cs = self._callsign_for_dmr_id(src)
+            if not cs:
+                # ★ 未映射：记录下来（界面可见），提示补映射后就能显示呼号
+                rec = getattr(self, "_unknown_ids", {})
+                rec[str(src)] = time.time()
+                if len(rec) > 20:                    # 只留最近 20 个
+                    for k in sorted(rec, key=rec.get)[:-20]:
+                        del rec[k]
+                self._unknown_ids = rec
+                log("国服来波：DMR ID %s 未配呼号映射（映射后集群将显示呼号）" % src)
+            self.begin_rx(cs or str(src))
         if self.rx_session is None:
             return
         # 33B 负载 → 27B AMBE（placeAmbe 逆运算）
