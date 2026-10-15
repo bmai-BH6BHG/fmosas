@@ -13,5 +13,8 @@
   "ambe_lib": "/opt/fmo-subsystem/lib/libfusambe.so",
   "fmo_callsign": "DMRGW",
   "ptt_timeout_ms": 800,
+  "ambe_gain_db": 3,
+  "rx_gain": 1.0,
+  "tx_prebuffer_chunks": 4,
   "state_path": "/opt/fmo-subsystem/fus_dmr_gw_state.json"
 }
