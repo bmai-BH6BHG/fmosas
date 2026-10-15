@@ -91,6 +91,9 @@ DEFAULTS = {
 
     # ---- 会话行为 ----
     "ptt_timeout_ms": 800,           # FMO 侧静默多久判定松键
+    "ambe_gain_db": 3,               # ★ AMBE 编码增益（dB，-20..20）。声音小/差就调大，失真就调小
+    "rx_gain": 1.0,                  # 国服→集群回灌方向的 PCM 增益（1.0=不变）
+    "tx_prebuffer_chunks": 4,        # 开口前预缓冲（×20ms），避免开头吞字/断续
     "fmo_callsign": "DMRGW",         # 本网关发帧用的呼号（取主叫呼号更佳）
     "src_map": {},                   # FMO 呼号 -> DMR ID 覆盖表（可选）
     "state_path": "",                # 状态文件路径（留空=不写）
@@ -344,6 +347,34 @@ class AmbeCodec:
             self.err = str(e)
             log("AMBE 声码器不可用: %s" % e)
 
+    def set_gain_db(self, db):
+        """
+        设置编码增益（OP25 MBEEncoder 支持 -20..+20 dB）。
+        DMR 的 AMBE 声码器电平偏低是"过去声音小/差"的常见原因之一，
+        适当加增益能显著改善（过大也会失真，3~6dB 比较稳妥）。
+        """
+        if not self.ok:
+            return False
+        try:
+            f = getattr(self._lib, "opendmr_encoder_set_gain", None)
+            if f is None:
+                return False
+            f.restype = self._ct.c_bool
+            f.argtypes = [self._ct.c_void_p, self._ct.c_int]
+            ok = bool(f(self._enc, int(db)))
+            return ok
+        except Exception:  # noqa: BLE001
+            return False
+
+    def reset_encoder(self):
+        """新会话前复位编码器状态（跨会话残留会产生杂音）。"""
+        if not self.ok:
+            return
+        try:
+            self._lib.opendmr_encoder_reset(self._enc)
+        except Exception:  # noqa: BLE001
+            pass
+
     def encode(self, pcm160):
         """160 个 int16 PCM → 9 字节 AMBE；失败返回 None。"""
         if not self.ok or len(pcm160) != 160:
@@ -407,6 +438,15 @@ class OpusCodec:
         except Exception as e:  # noqa: BLE001
             self.err = str(e)
             log("Opus 解码器不可用（语音若为 Opus 将无法转发）: %s" % e)
+
+    def reset(self):
+        """新会话前复位解码器状态（OPUS_RESET_STATE=4028）。"""
+        if not self.ok:
+            return
+        try:
+            self._lib.opus_decoder_ctl(self._dec, 4028)
+        except Exception:  # noqa: BLE001
+            pass
 
     def decode(self, pkt):
         """一个 Opus 包 → 320 个 int16 样本（40ms）；失败返回 None。"""
@@ -1066,6 +1106,21 @@ class DmrGateway(threading.Thread):
                               os.path.join(_HERE, "lib", "libfusambe.so"))
         self.opus = OpusCodec(cfg.get("opus_lib") or
                               os.path.join(_HERE, "lib", "libopus.so"))
+        # ★ 音质：编码增益 + 回灌增益
+        try:
+            g_db = int(cfg.get("ambe_gain_db") or 0)
+        except Exception:  # noqa: BLE001
+            g_db = 0
+        if g_db and self.ambe.ok:
+            if self.ambe.set_gain_db(g_db):
+                log("AMBE 编码增益已设为 %d dB" % g_db)
+            else:
+                log("AMBE 声码器不支持 set_gain（该库较旧），增益未生效")
+        try:
+            self.rx_gain = float(cfg.get("rx_gain") or 1.0)
+        except Exception:  # noqa: BLE001
+            self.rx_gain = 1.0
+        self._tx_primed = False
         self.peer = None
         self._ambe_buf = []       # 待组帧的 9B AMBE
         self._dmrcnt = 0
@@ -1224,6 +1279,19 @@ class DmrGateway(threading.Thread):
             peer = self.peer
             if peer is None or not peer.connected:
                 continue
+            # ★ 音质：开口前先攒一小段（默认 4×20ms=80ms）再发，
+            #   否则 FMO 语音按 240ms 一帧突突到达，开头会被静音填充/断续
+            with self.tx_lock:
+                _active_now = self.tx_active
+            if _active_now and not getattr(self, "_tx_primed", False):
+                try:
+                    need = int(self.cfg.get("tx_prebuffer_chunks") or 4)
+                except Exception:  # noqa: BLE001
+                    need = 4
+                if len(self.tx_queue) < need:
+                    self._write_state()
+                    continue
+                self._tx_primed = True
             with self.tx_lock:
                 timed_out = self.tx_active and \
                     (time.monotonic() - self.tx_last_frame) * 1000 > timeout_ms
@@ -1302,11 +1370,17 @@ class DmrGateway(threading.Thread):
         self._ambe_buf = []
 
     def on_new_tx(self):
-        """新 FMO 会话开始：换 streamId、清 AMBE 缓冲。"""
+        """新 FMO 会话开始：换 streamId、清 AMBE 缓冲、复位声码器状态。"""
         import random
         self._stream_id = random.getrandbits(32)
         self._ambe_buf = []
         self._dmrcnt = 0
+        # ★ 音质：跨会话不复位会产生"咔啦"杂音/电平漂移
+        if getattr(self, "opus", None) is not None:
+            self.opus.reset()
+        if self.ambe.ok:
+            self.ambe.reset_encoder()
+        self._tx_primed = False
 
     # -------------------------------------------------- DMR → FMO
     def _emit_frame(self, frame_blocks):
@@ -1449,6 +1523,9 @@ class DmrGateway(threading.Thread):
             ambe9 = bytes(ambe27[i * 9:(i + 1) * 9])
             pcm = self.ambe.decode(ambe9)
             if pcm:
+                g = getattr(self, "rx_gain", 1.0) or 1.0
+                if g != 1.0:
+                    pcm = [max(-32768, min(32767, int(v * g))) for v in pcm]
                 self.rx_pcm.extend(pcm)
         if (flags & 0x02):                      # EOT
             self.end_rx()
