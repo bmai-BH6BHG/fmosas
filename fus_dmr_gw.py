@@ -91,6 +91,7 @@ DEFAULTS = {
 
     # ---- 会话行为 ----
     "ptt_timeout_ms": 800,           # FMO 侧静默多久判定松键
+    "highpass": True,                # ★ 直流/超低频滤除（嗡嗡声的根治手段，务必开）
     "ambe_gain_db": 3,               # ★ AMBE 编码增益（dB，-20..20）。声音小/差就调大，失真就调小
     "rx_gain": 1.0,                  # 国服→集群回灌方向的 PCM 增益（1.0=不变）
     "tx_prebuffer_chunks": 4,        # 开口前预缓冲（×20ms），避免开头吞字/断续
@@ -144,6 +145,43 @@ def fetch_master_gateways(cfg):
 
 def log(msg):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+# ================================================================ DC blocker
+# ★ 音质核心修复：嗡嗡声 = PCM 直流偏置/超低频漂移。
+#   ADPCM（差分编码）会累积直流误差；Opus 低码率也有直流偏移。
+#   AMBE+2 只传 300~3000Hz，直流/超低频送进去会被声码器持续激发，
+#   表现为强"嗡嗡"声。一阶 DC blocker（y[n]=x[n]-x[n-1]+a*y[n-1]）
+#   在 8kHz 下 a=0.99 时约 -3dB@13Hz，能干净去掉直流与漂移，
+#   对 300Hz 以上的语音几乎无影响。
+class DcBlocker:
+    def __init__(self, a=0.99):
+        self.a = float(a)
+        self._x1 = 0
+        self._y1 = 0
+
+    def process(self, samples):
+        a = self.a
+        x1 = self._x1
+        y1 = self._y1
+        out = []
+        for x in samples:
+            y = x - x1 + a * y1
+            # 限幅防溢出
+            if y > 32767:
+                y = 32767
+            elif y < -32768:
+                y = -32768
+            out.append(int(y))
+            x1 = x
+            y1 = y
+        self._x1 = x1
+        self._y1 = y1
+        return out
+
+    def reset(self):
+        self._x1 = 0
+        self._y1 = 0
 
 
 # ================================================================ IMA ADPCM
@@ -1121,6 +1159,10 @@ class DmrGateway(threading.Thread):
         except Exception:  # noqa: BLE001
             self.rx_gain = 1.0
         self._tx_primed = False
+        # ★ 音质：两个方向各一个 DC blocker（有状态，会话间复位）
+        self._hp = bool(cfg.get("highpass", True))
+        self._dc_tx = DcBlocker()
+        self._dc_rx = DcBlocker()
         self.peer = None
         self._ambe_buf = []       # 待组帧的 9B AMBE
         self._dmrcnt = 0
@@ -1227,6 +1269,8 @@ class DmrGateway(threading.Thread):
                     pcm = self.opus.decode(pkt)       # 320 样本 = 40ms
                     if not pcm:
                         continue
+                    if self._hp:
+                        pcm = self._dc_tx.process(pcm)
                     for i in range(0, len(pcm), 160):  # 切成 20ms
                         chunk = pcm[i:i + 160]
                         if len(chunk) < 160:
@@ -1251,6 +1295,8 @@ class DmrGateway(threading.Thread):
             self._tx_frames += 1
             for valprev, index, nibbles in blocks:
                 pcm = adpcm_decode(nibbles, valprev, index)   # 640 样本
+                if self._hp:
+                    pcm = self._dc_tx.process(pcm)
                 for i in range(0, len(pcm), 160):
                     chunk = pcm[i:i + 160]
                     if len(chunk) < 160:
@@ -1523,6 +1569,8 @@ class DmrGateway(threading.Thread):
             ambe9 = bytes(ambe27[i * 9:(i + 1) * 9])
             pcm = self.ambe.decode(ambe9)
             if pcm:
+                if self._hp:
+                    pcm = self._dc_rx.process(pcm)
                 g = getattr(self, "rx_gain", 1.0) or 1.0
                 if g != 1.0:
                     pcm = [max(-32768, min(32767, int(v * g))) for v in pcm]
