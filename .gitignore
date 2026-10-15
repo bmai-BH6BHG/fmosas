@@ -95,3 +95,4 @@ udac.db-shm
 *_audit.db-journal
 *_audit.db-wal
 *_audit.db-shm
+dmrid_cache.json
