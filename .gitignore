@@ -38,6 +38,12 @@ __pycache__/
 *$py.class
 *.so
 
+# ★ 例外：DMR 网关的动态库必须入库 —— 否则 CI 从仓库构建发布包时拿不到它们，
+#   发布包会缺 lib/libfusambe.so 与 lib/libopus.so，DMR 网关在目标机上无法加载。
+#   （*.so 忽略规则在上方，这里显式放行 lib/ 下的两个库）
+!lib/
+!lib/*.so
+
 # 虚拟环境
 venv/
 env/
