@@ -35,10 +35,13 @@
 # ==========================================================================
 set -euo pipefail
 
-# 分发地址 = 本项目的 Release 下载地址（发版工作流会把资产发布到这里）。
-# 它既是"上传地址"也是"下载地址"：releases/latest/download 永远指向最新一次 Release，
-# 所以发新版**不需要改这里**。
-DEFAULT_BASE_URL="https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
+# 分发地址 = 本项目自建分发站（云服务器镜像）。
+# ★ 真实事故：原先指向 GitHub Release，但国内分系统访问 GitHub 会被 DNS 污染/阻断
+#   （实测节点上 curl github.com 超时 HTTP=000），导致「运维指令下发成功、
+#    目标版本却退化成 DEFAULT_VERSION 1.0.0 → 判成降级而拒绝升级」。
+#   现在默认走云分发站；GitHub 仍作为源码与 CI 构建源头（构建后镜像到云站）。
+#   如需临时覆盖：FMO_BASE_URL=<地址> bash upgrade.sh
+DEFAULT_BASE_URL="http://175.24.227.38:8080"
 DEFAULT_VERSION="1.0.0"
 
 SERVICE_NAME="fmo-subsystem"
