@@ -1776,6 +1776,11 @@ class SyncEngine:
     OPS_ALLOWED_BASE = (
         'https://github.com/bmai-BH6BHG/fmosas/releases/',
         'https://objects.githubusercontent.com/',
+        # ★ 自建分发站（云服务器）：国内分系统无法访问 GitHub（DNS 污染/阻断，
+        #   实测 curl github.com 超时 HTTP=000），发布包必须走可达的镜像源。
+        #   引导方式见 CONTRACT：FMO_BASE_URL=http://175.24.227.38:8080 bash upgrade.sh
+        'http://175.24.227.38:8080/',
+        'https://175.24.227.38:8080/',
     )
     OPS_DELAY_S = 20.0          # 收到指令后延迟执行，先让本次 pull 收尾
 

@@ -24,10 +24,11 @@
 # ==========================================================================
 set -euo pipefail
 
-# ↓↓↓ 分发地址 = 本项目 Release 的下载地址（既是上传地址也是下载地址）。
-#      latest/download 永远指向最新一次 Release，因此发新版**不用改这里**。
-#      build_release.sh 若传了别的地址，会在打包时注入覆盖（不动仓库文件）。
-DEFAULT_BASE_URL="https://github.com/bmai-BH6BHG/fmosas/releases/latest/download"
+# ↓↓↓ 分发地址 = 本项目自建分发站（云服务器镜像，国内节点可达）。
+#      ★ 真实事故：指向 GitHub 时国内节点 DNS 污染/阻断，安装与升级全部失败。
+#      GitHub 仍用于源码托管与 CI 构建，构建产物镜像到云分发站。
+#      可用 FMO_BASE_URL=<地址> 临时覆盖；build_release.sh 也会注入覆盖。
+DEFAULT_BASE_URL="http://175.24.227.38:8080"
 # ↓↓↓ 兜底版本号；若分发站根目录存在 VERSION 文件，则以该文件为准（契约 §2）↓↓↓
 DEFAULT_VERSION="1.0.0"
 
