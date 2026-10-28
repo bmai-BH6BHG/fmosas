@@ -1784,6 +1784,25 @@ class SyncEngine:
     )
     OPS_DELAY_S = 20.0          # 收到指令后延迟执行，先让本次 pull 收尾
 
+    @classmethod
+    def base_url_allowed(cls, base):
+        """
+        包地址白名单校验（带尾斜杠归一化）。
+
+        ★ 真实故障：白名单里写的是 'http://175.24.227.38:8080/'，
+          而总系统下发的是 'http://175.24.227.38:8080'（少个斜杠）——
+          str.startswith 匹配失败 → 指令被拒 → 表面「已下发」但节点纹丝不动。
+          现在两边都归一化成「去尾斜杠 + 补一个斜杠」再比，两种写法都放行。
+        """
+        b = str(base or '').strip()
+        if not b:
+            return True                      # 空地址 = 用节点默认分发源，无需校验
+        norm = b.rstrip('/') + '/'
+        for a in cls.OPS_ALLOWED_BASE:
+            if norm.startswith(str(a).rstrip('/') + '/'):
+                return True
+        return False
+
     def _ops_state_get(self, key):
         """读本机运维状态（存在 sync_state 的保留行里，避免新增表）。"""
         try:
@@ -1919,9 +1938,9 @@ class SyncEngine:
             self._ops_state_set('last_upgrade_cmd', cmd_id)
             log('SYNC', '运维指令：已是目标版本 %s，跳过升级' % cur)
             return
-        # 包地址白名单校验（防被指向恶意包）
+        # 包地址白名单校验（防被指向恶意包；尾斜杠两种写法都放行）
         base = str(cmd.get('base_url') or '').strip()
-        if base and not str(base).startswith(self.OPS_ALLOWED_BASE):
+        if not self.base_url_allowed(base):
             log('SYNC', '运维指令：包地址不在允许清单内，拒绝执行: %s' % base[:60])
             self._ops_state_set('last_upgrade_cmd', cmd_id)
             return

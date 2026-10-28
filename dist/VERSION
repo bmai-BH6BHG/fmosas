@@ -20,7 +20,7 @@
 #   云分发站：http://175.24.227.38:8080
 #             服务 systemd fmo-dist（python3 -m http.server 8080）
 #             目录 /opt/fmo-dist
-VERSION=1.8.50
+VERSION=1.8.51
 RELEASE_BASE_URL=http://175.24.227.38:8080
 
 # 部署后 install.sh 的可选环境变量（默认全自动，无需任何参数）：
