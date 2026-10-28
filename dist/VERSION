@@ -1,12 +1,32 @@
-﻿# FMO 鍒嗙郴缁?鍙戝竷鐗堟湰淇℃伅锛堟瀯寤烘椂鐢?build_release.sh 璇诲彇锛?# VERSION          : 鍙戝竷鐗堟湰鍙凤紝浼氬啓鍏?install.sh 涓庢墦鍖呮枃浠跺悕
-# RELEASE_BASE_URL : 鍒嗗彂鏍瑰湴鍧€锛宨nstall.sh 浠庤繖閲屼笅杞藉寘涓庢牎楠屾枃浠?#                    褰撳墠鐢?GitHub Release 鐨?latest/download 鍥哄畾鍏ュ彛锛?#                      https://github.com/bmai-BH6BHG/fmosas/releases/latest/download
-#                    鈽?瀹冩案杩滄寚鍚戞渶鏂颁竴娆?Release锛屽彂鏂扮増鏈笉鐢ㄦ敼杩欓噷銆?#                    澶囬€夊啓娉曪紙鍙€夛級锛?#                      鍥哄畾鐗堟湰锛歨ttps://github.com/bmai-BH6BHG/fmosas/releases/download/v1.0.0
-#                      瀵硅薄瀛樺偍锛歨ttps://your-bucket.oss-cn-hangzhou.aliyuncs.com/fmo-deploy
-#                    鏀瑰畬鎵ц bash build_release.sh 閲嶆柊鎵撳寘锛屽湴鍧€浼氳娉ㄥ叆鍖呭唴 install.sh
-VERSION=1.8.49
+# FMO 分系统 发布版本信息（构建时由 build_release.sh 读取）
+# VERSION          : 发布版本号，会写入 install.sh 与打包文件名
+# RELEASE_BASE_URL : 分发根地址，install.sh / upgrade.sh 从这里下载包与校验文件
+#
+# ★★ 分发策略（v1.8.49 起，真实故障驱动，务必遵守）★★
+#   GitHub 只作为「源码托管 + CI 构建」源头，**不作为节点分发源**：
+#   国内分系统实测无法访问 github.com（curl 超时 HTTP=000，DNS 污染/阻断）。
+#
+#   曾经的故障链：
+#     1) 运维指令下发成功，节点去 GitHub 取站点 VERSION
+#     2) 取不到 → 目标版本退化成 DEFAULT_VERSION（1.0.0）
+#     3) 1.0.0 < 当前版本 → 判定「这是降级，不是升级」→ 拒绝执行
+#     4) 表面现象：总系统显示「已触发」，节点版本却纹丝不动
+#
+#   现在的流程：
+#     1) 打 tag → GitHub Actions 构建 Release 资产
+#     2) mirror_release.py 下载资产 → 上传到云分发站 /opt/fmo-dist
+#     3) 节点从云分发站升级（运维指令里带 base_url 更稳）
+#
+#   云分发站：http://175.24.227.38:8080
+#             服务 systemd fmo-dist（python3 -m http.server 8080）
+#             目录 /opt/fmo-dist
+VERSION=1.8.50
 RELEASE_BASE_URL=http://175.24.227.38:8080
 
-# 閮ㄧ讲鍚?install.sh 鐨勫彲閫夌幆澧冨彉閲忥紙榛樿鍏ㄨ嚜鍔紝鏃犻渶浠讳綍鍙傛暟锛夛細
-#   FMO_BASE_URL  瑕嗙洊涓嬭浇鏍瑰湴鍧€锛堜粎褰撳垎鍙戝湴鍧€鍙樻洿鏃朵娇鐢級
-#   FMO_DIR       瑕嗙洊瀹夎鐩綍锛堥粯璁?/opt/fmo-subsystem 鎴栧彲鍐欏洖閫€鐩綍锛?#   FMO_PORT      瑕嗙洊鍏綉 API 绔彛锛堥粯璁?35928锛岀鐞嗙鍙ｈ嚜鍔ㄤ负绔彛+1锛?#   FMO_DOMAIN    瑕嗙洊瀵瑰鍩熷悕锛堥粯璁ゅ彇鏈満 IP锛岀敤浜庢暟鎹簱鍛藉悕涓庝笂鎶ワ級
-#   FMO_MASTER    瑕嗙洊鎬荤郴缁熷湴鍧€锛堥粯璁ゆ部鐢?config.json 鍐呯殑 master_url锛?#   FMO_NO_SERVICE=1  鍙В鍘嬮儴缃诧紝涓嶆敞鍐屽紑鏈鸿嚜鍚湇鍔?
+# 部署后 install.sh 的可选环境变量（默认全自动，无需任何参数）：
+#   FMO_BASE_URL  覆盖下载根地址（仅当分发地址变更时使用）
+#   FMO_DIR       覆盖安装目录（默认 /opt/fmo-subsystem 或可写回退目录）
+#   FMO_PORT      覆盖公网 API 端口（默认 35928，管理端口自动为端口+1）
+#   FMO_DOMAIN    覆盖对外域名（默认取本机 IP，用于数据库命名与上报）
+#   FMO_MASTER    覆盖总系统地址（默认沿用 config.json 内的 master_url）
+#   FMO_NO_SERVICE=1  只解压部署，不注册开机自启服务
