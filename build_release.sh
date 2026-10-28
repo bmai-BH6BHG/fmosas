@@ -165,8 +165,10 @@ echo "[2/8] 预检查（必需文件 + shell 语法）..."
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
          fmo_stations.py fmo_aprs.py bridge.py \
+         fus_dmr_gw.py fus_dmr_gw.json init_user_db.py \
          config.default.json requirements.txt start.sh \
          fmo-subsystem.service install.sh uninstall.sh upgrade.sh fix_bridge_acl.sh \
+         lib/libfusambe.so lib/libopus.so deploy/fus-dmr-gw.service \
          uploads/.gitkeep \
          CONTRACT.md dist/VERSION; do
     [ -e "$REPO/$F" ] || die "缺少必需文件: $F（契约第 5 节必须包含）"
@@ -223,9 +225,14 @@ copy_path() {
 # 代码（契约必须包含）
 for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          gen_app_key.py set_appkey.py diagnose.py dmrid_bind_demo.py dmrid_http_test.py \
-         fmo_stations.py fmo_aprs.py bridge.py udac.py fix_bridge_acl.sh; do
+         fmo_stations.py fmo_aprs.py bridge.py udac.py fix_bridge_acl.sh \
+         fus_dmr_gw.py fus_dmr_gw.json init_user_db.py; do
     copy_path "$F" 1
 done
+# ★ DMR 网关运行库与服务单元（真实事故：v1.8.47 及以前漏了这三项，
+#   导致发布包不含 DMR 网关，远端升级后「看着升级成功但没有网关」）
+copy_path lib 1
+copy_path deploy 1
 # BAS：内嵌审计子系统（Python 重写 FAS，无 .NET 依赖）
 for F in bas_fmo_parser.py bas_emqx.py bas_identity.py bas_audit_db.py \
          bas_audit.py bas_http.py bas_migrate.py bas_emqx_auth.py bas_diagnose.py; do
