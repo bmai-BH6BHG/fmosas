@@ -130,6 +130,13 @@ def get_config_extra_root_pubkeys() -> set:
     读取 config.json → trust.extraRootPubkeys（字符串或数组）。
     注意：**直接读文件**，不走 load_config —— 后者只保留已知键，会把 trust 丢掉。
     结果缓存（改配置后需重启生效，与 roots 目录一致）。
+
+    ★ 宽限期（trust.legacyRootGraceUntil，Unix 秒）：
+      旧根公钥默认**永久**受信（兼容历史证书）。一旦配置了这个截止时间，
+      过了那个时刻旧根就**不再被信任** —— 这是"强制换证"的落地方式：
+      先升级（新旧并存、无人掉线），再等 APP 用户换完证，最后把截止时间
+      调到过去，旧证书才真正失效。
+      没配 = 不启用强制（保持原行为，绝不误伤）。
     """
     global _CONFIG_EXTRA_ROOTS_CACHE
     if _CONFIG_EXTRA_ROOTS_CACHE is not None:
@@ -139,7 +146,20 @@ def get_config_extra_root_pubkeys() -> set:
         p = os.path.join(_HERE, "config.json")
         with open(p, "r", encoding="utf-8-sig") as f:
             raw_cfg = json.load(f)
-        raw = ((raw_cfg or {}).get("trust") or {}).get("extraRootPubkeys")
+        tr = ((raw_cfg or {}).get("trust") or {})
+        # ---- 宽限期判定：过了截止时间就**不再**把旧根算作受信 ----
+        grace_until = tr.get("legacyRootGraceUntil")
+        if grace_until not in (None, "", 0):
+            try:
+                if time.time() >= float(grace_until):
+                    # 已过宽限期：返回空集，旧根失去信任 → 旧证书被拒
+                    print("[CA] 旧根宽限期已过（截止 %s），旧 CA 证书不再受信"
+                          % time.strftime("%Y-%m-%d %H:%M", time.localtime(float(grace_until))))
+                    _CONFIG_EXTRA_ROOTS_CACHE = set()
+                    return _CONFIG_EXTRA_ROOTS_CACHE
+            except (TypeError, ValueError):
+                pass
+        raw = tr.get("extraRootPubkeys")
         if isinstance(raw, str):
             raw = [raw]
         for x in (raw or []):
