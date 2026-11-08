@@ -4623,21 +4623,26 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 pass
         hits = state.get('hit_fingerprints') or []
+        revoked_hits = state.get('revoked_hit_list') or []
         checked = state.get('checked_at') or 0
         age = (time.time() - float(checked)) if checked else None
         # 超过 2 天没检查 → 提示监测可能停了
         stale = bool(age is None or age > 2 * 86400)
+        # 注意：hit_fingerprints 只含**未吊销**的证书（leak_watch.py 已过滤）。
+        # 已吊销的残留记录单独给 revoked_count，界面上按"已作废、不计入告警"展示。
         self.send_json({
             'ok': True,
             'leaked': bool(hits),
             'hit_count': len(hits),
             'hits': state.get('hit_list') or [],
+            'revoked_count': len(revoked_hits),
+            'revoked_hits': revoked_hits,
             'checked_at': checked,
             'checked_age_s': int(age) if age is not None else None,
             'stale': stale,
             'target': state.get('target') or 'https://fmo.panyong.top/fmo-statistics',
             'message': (
-                '发现 %d 张本机证书被第三方台账站收录，请立即核查' % len(hits)
+                '发现 %d 张有效证书被第三方台账站收录，请立即核查' % len(hits)
                 if hits else
                 ('证书外泄监测已超过 2 天未检查，请确认监测任务在运行'
                  if stale and checked else

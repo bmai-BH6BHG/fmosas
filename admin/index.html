@@ -329,12 +329,14 @@
 
     /* ============ SAS 卡片 ============ */
     .sas-card {
-        background: rgba(13, 27, 42, 0.6);
+        /* ★ 不用 backdrop-filter：SAS 页有十几张卡片，每张都要实时模糊背景，
+           在低配机器/核显上会让整页滚动和交互明显发卡（用户实测反馈卡顿）。
+           改用不透明度更高的纯色底，视觉几乎无差别，但没有 GPU 合成开销。 */
+        background: rgba(13, 27, 42, 0.92);
         border: 1px solid rgba(0, 180, 255, 0.15);
         border-radius: 10px;
         padding: 20px 24px;
         margin-bottom: 20px;
-        backdrop-filter: blur(6px);
     }
     .sas-card h2 {
         color: #00e5ff;
@@ -1535,8 +1537,13 @@ async function recDelete() {
 loadData();
 loadMonitorCfg();
 scanAddress(false);        // 打开页面即自动扫描公网 IP 并直接上报（需求1）
-// 每 5 秒刷新
-setInterval(loadData, 5000);
+// ★ 用户表自动刷新：15 秒一次，且页面在后台时跳过（原来固定 5 秒无条件刷）。
+//   每次刷新要拉 35KB 的 /api/users 并重建最多 100+ 行 × 11 列的表格，
+//   低配机器/长时间开着页面会明显发卡。用户状态本来也不需要 5 秒级实时。
+setInterval(function() {
+    if (document.hidden) return;
+    loadData();
+}, 15000);
 
 // ★ 「手动注册表单提交」已移除：注册系统页已上移总系统，本页不再有该表单。
 //   （留着会对 null 调 addEventListener 抛错，把后面的初始化全断掉 —— 真实踩过）
@@ -1658,9 +1665,9 @@ function _secAlertRender(j) {
         _SEC_ALERT_HIDDEN = false;
         box.className = 'sec-alert';
         box.style.display = 'flex';
-        title.textContent = '⚠️ 证书外泄告警：本机证书出现在第三方台账站';
+        title.textContent = '⚠️ 证书外泄告警：本机有效证书出现在第三方台账站';
         var lines = [];
-        lines.push('共 <b>' + (j.hit_count || 0) + '</b> 张证书被 '
+        lines.push('共 <b>' + (j.hit_count || 0) + '</b> 张**仍有效**的证书被 '
                    + (j.target || '第三方站点') + ' 收录。'
                    + '该站点会抄收 FMO 协议里的证书广播，' +
                    '我们的证书一旦出现，就会被公开标注为"未验签"。');
@@ -1675,9 +1682,13 @@ function _secAlertRender(j) {
             if (hits.length > 8) lines.push('… 还有 ' + (hits.length - 8) + ' 条');
             lines.push('</div>');
         }
+        if (j.revoked_count) {
+            lines.push('<div style="margin-top:4px;opacity:.7;">另有 ' + j.revoked_count
+                       + ' 张已吊销的残留记录（我方已作废，不计入告警）</div>');
+        }
         lines.push('<div style="margin-top:6px;opacity:.8;">上次检查：'
                    + _secAlertFmtAge(j.checked_age_s)
-                   + '　处置：确认 tools/leak_watch.py 在运行；检查是否仍有链路在广播证书。</div>');
+                   + '　处置：吊销该证书，或确认仍有链路在广播。</div>');
         detail.innerHTML = lines.join('');
     } else if (j && j.stale && j.checked_at) {
         // 监测停了 → 黄色提示
@@ -1705,23 +1716,42 @@ async function refreshSecAlert() {
 async function forceLeakCheck() {
     var btn = document.getElementById('sec-alert-recheck');
     if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+    // ★ 加超时：原来没有 AbortController，后端一慢按钮就一直"检查中"再也回不来
+    //   （真实反馈：点复查后长时间无结果）。
+    //   实测完整检查约 28 秒（对方站点单请求 2~4 秒），超时设 35 秒：
+    //   既容得下正常抖动，又保证真卡住时按钮一定能恢复。
+    var ctl = null, timer = null;
     try {
-        var r = await apiPost('/api/security/leak-check', {});
+        ctl = new AbortController();
+        timer = setTimeout(function() { try { ctl.abort(); } catch (e) {} }, 35000);
+        var resp = await fetch('/api/security/leak-check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+            signal: ctl.signal
+        });
+        var r = await resp.json();
         if (r && r.ok) {
             if (r.hits) {
                 showToast('err', '发现外泄',
-                          '对方站点收录了 ' + r.hits + ' 张本机证书（新增 ' + (r.new_hits || 0) + '）');
+                          '对方站点仍收录 ' + r.hits + ' 张**有效**本机证书（新增 ' + (r.new_hits || 0) + '）');
             } else {
+                var extra = r.revoked_hits ? ('；另有 ' + r.revoked_hits + ' 张已吊销的残留记录，不计入告警') : '';
                 showToast('success', '检查完成',
-                          '未发现外泄（本机 ' + (r.our_certs || 0) + ' 张证书，对方收录 '
-                          + (r.remote_certs_seen || 0) + ' 张）');
+                          '未发现有效证书外泄' + extra);
             }
         } else {
             showToast('err', '检查失败', (r && r.error) ? r.error : '未知错误');
         }
     } catch (e) {
-        showToast('err', '检查失败', String(e));
+        if (e && e.name === 'AbortError') {
+            showToast('warn', '检查超时',
+                      '对方站点响应过慢（>35 秒）。已放弃本次检查，可稍后重试。');
+        } else {
+            showToast('err', '检查失败', String(e));
+        }
     } finally {
+        if (timer) clearTimeout(timer);
         if (btn) { btn.disabled = false; btn.textContent = '立即复查'; }
         refreshSecAlert();
     }

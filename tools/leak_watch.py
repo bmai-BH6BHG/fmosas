@@ -45,6 +45,11 @@ DEFAULT_TARGET = "https://fmo.panyong.top/fmo-statistics"
 UA = "fmo-leak-watch/1.0 (+local audit; read-only)"
 TIMEOUT = 20
 STATE_FILE = os.path.join(BASE, "leak_watch_state.json")
+# 单次检查里"逐呼号查明细"这一步的总预算（秒）。
+# 对方站点较慢（单请求 2~4 秒），若不设预算，几十个呼号会拖到分钟级，
+# 界面上就表现为"点了复查一直检查中"（真实反馈）。
+# 超预算就带着已收集的结果返回 —— 宁可少看几个，也不让界面卡死。
+SCAN_BUDGET_S = float(os.environ.get("FMO_LEAK_BUDGET_S") or 20)
 
 
 # ---------------------------------------------------------------- 本机指纹
@@ -129,14 +134,29 @@ def remote_certs(target, max_pages=40):
         offset += page
 
     # ---- 2) 设备明细（已验签的也在里面） ----
-    # 只查我们自己的呼号，避免把几千个台站全抓一遍。
-    mine_calls = sorted({v["callsign"] for v in local_certs().values() if v["callsign"]})
+    # ★ 性能权衡（实测数据，真实反馈"一直检查中"）：
+    #   对方站点 /api/stations 全量有 2500+ 条，每页 200 条 ≈ 13 页 × 2 秒 = 26 秒+，
+    #   一慢就几十秒甚至超时 —— 界面上表现为"检查中"卡死。
+    #   改用 `/api/stations?q=<呼号>` 精确查询：本机只有几十个呼号，
+    #   每个 1 次请求（~2 秒）但**只有命中才去抓明细**，总请求数可控且可提前退出。
+    #   同时给整体加"预算"：超过 SCAN_BUDGET_S 就带着已有结果返回，
+    #   宁可少看几个呼号，也不要让界面一直转。
+    mine = local_certs()
+    mine_calls = sorted({v["callsign"] for v in mine.values() if v["callsign"]})
+    if not mine_calls:
+        return found
+
+    deadline = time.time() + SCAN_BUDGET_S
     for cs in mine_calls:
+        if time.time() > deadline:
+            break                      # 超出预算，返回已收集的部分
         try:
             j = _get("%s/api/stations?q=%s&limit=50" % (target, cs))
         except Exception:  # noqa: BLE001
             continue
         for st in (j.get("items") or []):
+            if str(st.get("callsign") or "").upper() != cs.upper():
+                continue               # q= 是模糊匹配，必须再精确比对
             sid = st.get("id")
             if sid is None:
                 continue
@@ -173,10 +193,11 @@ def check(target=DEFAULT_TARGET, as_json=False, quiet=False):
         return 1, None
 
     hits = []
+    revoked_hits = []
     for fp, r in remote.items():
         if fp in local:
             l = local[fp]
-            hits.append({
+            row = {
                 "fingerprint": fp,
                 "callsign": l["callsign"],
                 "uid": l["uid"],
@@ -187,8 +208,18 @@ def check(target=DEFAULT_TARGET, as_json=False, quiet=False):
                 "remote_uid": r.get("uid"),
                 "last_seen": r.get("last_seen"),
                 "where": r.get("where"),
-            })
+            }
+            # ★ 已吊销的证书**不算外泄**（真实反馈）：
+            #   吊销后它在本机已经失效，别人拿它来连会被拒，
+            #   对方站点上残留的那条记录只是一串没用的废指纹。
+            #   继续在告警里显示会让管理员以为"还没处理完"。
+            #   但也不完全丢弃 —— 单独记在 revoked_hits 里，供审计查看。
+            if l["revoked"]:
+                revoked_hits.append(row)
+            else:
+                hits.append(row)
     hits.sort(key=lambda x: (x["callsign"] or "", x["fingerprint"]))
+    revoked_hits.sort(key=lambda x: (x["callsign"] or "", x["fingerprint"]))
 
     new_hits, known = [], []
     prev = {}
@@ -209,18 +240,21 @@ def check(target=DEFAULT_TARGET, as_json=False, quiet=False):
         "remote_certs_seen": len(remote),
         "hits": len(hits),
         "new_hits": len(new_hits),
+        "revoked_hits": len(revoked_hits),
         "elapsed_ms": int((time.time() - t0) * 1000),
         "hit_list": hits,
         "new_hit_list": new_hits,
+        "revoked_hit_list": revoked_hits,
     }
     # 状态文件同时供管理界面 /api/security/leak-status 读取：
-    #   hit_fingerprints 用于"是否新增"判断，
-    #   hit_list / target 供界面展示明细。
+    #   hit_fingerprints 用于"是否新增"判断（只统计**未吊销**的），
+    #   hit_list / revoked_hit_list / target 供界面展示明细。
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "hit_fingerprints": [h["fingerprint"] for h in hits],
                 "hit_list": hits,
+                "revoked_hit_list": revoked_hits,
                 "target": target,
                 "checked_at": result["checked_at"],
             }, f, ensure_ascii=False)
