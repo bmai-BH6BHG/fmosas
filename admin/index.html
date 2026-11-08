@@ -652,6 +652,32 @@
         display: flex; flex-direction: column; gap: 8px;
         max-height: 460px; overflow-y: auto;
     }
+    /* ===== 安全告警横幅（证书被第三方台账站收录）===== */
+    .sec-alert {
+        display: flex; align-items: center; gap: 14px;
+        margin: 0; padding: 14px 20px;
+        background: linear-gradient(90deg, rgba(255,77,77,.16), rgba(255,140,66,.10));
+        border-bottom: 1px solid rgba(255,77,77,.45);
+        color: #ffe3e0;
+    }
+    .sec-alert.warn {
+        background: linear-gradient(90deg, rgba(255,180,0,.14), rgba(255,140,66,.08));
+        border-bottom-color: rgba(255,180,0,.45);
+        color: #fff3d6;
+    }
+    .sec-alert-icon { font-size: 26px; line-height: 1; flex-shrink: 0; }
+    .sec-alert-body { flex: 1; min-width: 0; }
+    .sec-alert-title { font-weight: 700; font-size: 15px; margin-bottom: 3px; }
+    .sec-alert-detail { font-size: 13px; opacity: .92; line-height: 1.55; word-break: break-all; }
+    .sec-alert-acts { display: flex; gap: 8px; flex-shrink: 0; }
+    .sec-btn {
+        background: rgba(255,255,255,.12); color: #fff;
+        border: 1px solid rgba(255,255,255,.25); border-radius: 7px;
+        padding: 7px 14px; font-size: 13px; cursor: pointer; white-space: nowrap;
+    }
+    .sec-btn:hover { background: rgba(255,255,255,.2); }
+    .sec-btn.ghost { background: transparent; opacity: .8; }
+    .sec-fp { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; opacity: .85; }
     .mon-side-title {
         color: #00e5ff; font-size: 12px; letter-spacing: 1px;
         border-bottom: 1px solid rgba(0, 180, 255, 0.15);
@@ -700,6 +726,18 @@
 </style>
 </head>
 <body>
+<!-- 安全告警横幅：本机证书是否被第三方台账站收录（数据来自 tools/leak_watch.py） -->
+<div id="sec-alert" class="sec-alert" style="display:none;">
+    <span class="sec-alert-icon">⚠️</span>
+    <div class="sec-alert-body">
+        <div class="sec-alert-title" id="sec-alert-title">安全告警</div>
+        <div class="sec-alert-detail" id="sec-alert-detail"></div>
+    </div>
+    <div class="sec-alert-acts">
+        <button class="sec-btn" id="sec-alert-recheck">立即复查</button>
+        <button class="sec-btn ghost" id="sec-alert-close">隐藏</button>
+    </div>
+</div>
 <div class="header">
     <div>
         <h1>🔐 SAS 统一认证服务</h1>
@@ -1583,8 +1621,7 @@ function downloadText(filename, text) {
 async function apiGet(url) {
     var resp = await fetch(url);
     return await resp.json();
-}
-async function apiPost(url, body) {
+}async function apiPost(url, body) {
     var resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1596,6 +1633,112 @@ async function apiDelete(url) {
     var resp = await fetch(url, { method: 'DELETE' });
     return await resp.json();
 }
+
+// ========== 安全告警：本机证书是否被第三方台账站收录 ==========
+// 数据来自 /api/security/leak-status（只读状态文件，不触发外网请求）。
+// 真正的检查由 tools/leak_watch.py 定时做；这里让管理员能"立即复查"。
+var _SEC_ALERT_HIDDEN = false;
+
+function _secAlertFmtAge(s) {
+    if (s == null) return '从未检查';
+    if (s < 90) return '刚刚';
+    if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+    if (s < 86400) return Math.round(s / 3600) + ' 小时前';
+    return Math.round(s / 86400) + ' 天前';
+}
+
+function _secAlertRender(j) {
+    var box = document.getElementById('sec-alert');
+    if (!box) return;
+    var title = document.getElementById('sec-alert-title');
+    var detail = document.getElementById('sec-alert-detail');
+
+    if (j && j.leaked) {
+        // 有外泄 → 红色横幅，不可自动隐藏
+        _SEC_ALERT_HIDDEN = false;
+        box.className = 'sec-alert';
+        box.style.display = 'flex';
+        title.textContent = '⚠️ 证书外泄告警：本机证书出现在第三方台账站';
+        var lines = [];
+        lines.push('共 <b>' + (j.hit_count || 0) + '</b> 张证书被 '
+                   + (j.target || '第三方站点') + ' 收录。'
+                   + '该站点会抄收 FMO 协议里的证书广播，' +
+                   '我们的证书一旦出现，就会被公开标注为"未验签"。');
+        var hits = j.hits || [];
+        if (hits.length) {
+            lines.push('<div style="margin-top:6px;">');
+            hits.slice(0, 8).forEach(function(h) {
+                lines.push('· <b>' + (h.callsign || '?') + '</b> uid=' + (h.uid || '?')
+                    + ' issuer_sn=' + (h.issuer_sn || '?')
+                    + ' <span class="sec-fp">' + String(h.fingerprint || '').slice(0, 24) + '…</span>');
+            });
+            if (hits.length > 8) lines.push('… 还有 ' + (hits.length - 8) + ' 条');
+            lines.push('</div>');
+        }
+        lines.push('<div style="margin-top:6px;opacity:.8;">上次检查：'
+                   + _secAlertFmtAge(j.checked_age_s)
+                   + '　处置：确认 tools/leak_watch.py 在运行；检查是否仍有链路在广播证书。</div>');
+        detail.innerHTML = lines.join('');
+    } else if (j && j.stale && j.checked_at) {
+        // 监测停了 → 黄色提示
+        box.className = 'sec-alert warn';
+        box.style.display = _SEC_ALERT_HIDDEN ? 'none' : 'flex';
+        title.textContent = '证书外泄监测可能已停止';
+        detail.innerHTML = '上次检查在 ' + _secAlertFmtAge(j.checked_age_s)
+            + '，已超过 2 天。请确认 <code>tools/leak_watch.py</code> 的定时任务在运行，'
+            + '否则证书被第三方收录时不会有人知道。';
+    } else {
+        // 正常 → 不打扰
+        box.style.display = 'none';
+    }
+}
+
+async function refreshSecAlert() {
+    try {
+        var j = await apiGet('/api/security/leak-status');
+        _secAlertRender(j);
+    } catch (e) {
+        // 接口不可用时不弹窗打扰（避免旧版本/重启瞬间刷屏）
+    }
+}
+
+async function forceLeakCheck() {
+    var btn = document.getElementById('sec-alert-recheck');
+    if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+    try {
+        var r = await apiPost('/api/security/leak-check', {});
+        if (r && r.ok) {
+            if (r.hits) {
+                showToast('err', '发现外泄',
+                          '对方站点收录了 ' + r.hits + ' 张本机证书（新增 ' + (r.new_hits || 0) + '）');
+            } else {
+                showToast('success', '检查完成',
+                          '未发现外泄（本机 ' + (r.our_certs || 0) + ' 张证书，对方收录 '
+                          + (r.remote_certs_seen || 0) + ' 张）');
+            }
+        } else {
+            showToast('err', '检查失败', (r && r.error) ? r.error : '未知错误');
+        }
+    } catch (e) {
+        showToast('err', '检查失败', String(e));
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '立即复查'; }
+        refreshSecAlert();
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    var rc = document.getElementById('sec-alert-recheck');
+    if (rc) rc.addEventListener('click', forceLeakCheck);
+    var cl = document.getElementById('sec-alert-close');
+    if (cl) cl.addEventListener('click', function() {
+        _SEC_ALERT_HIDDEN = true;
+        var box = document.getElementById('sec-alert');
+        if (box) box.style.display = 'none';
+    });
+    refreshSecAlert();
+    setInterval(refreshSecAlert, 30000);   // 每 30 秒刷一次（只读本地状态文件）
+});
 
 // ---------- 导航栏切换 ----------
 var _sasInited = false;

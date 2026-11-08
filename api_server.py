@@ -3526,6 +3526,13 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
             if method == 'GET' and path == '/api/ca/root.json':
                 self._handle_sas_ca_root_json()
                 return True
+            # 安全告警：证书是否被第三方台账站收录（见 tools/leak_watch.py）
+            if method == 'GET' and path == '/api/security/leak-status':
+                self._handle_leak_status()
+                return True
+            if method == 'POST' and path == '/api/security/leak-check':
+                self._handle_leak_check()
+                return True
             if method == 'POST' and path == '/api/ca/init':
                 self._handle_sas_ca_init()
                 return True
@@ -4201,12 +4208,25 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                 existing_revoked = bool(existing.get('revoked')) if existing else False
                 if existing and not existing_revoked:
                     try:
-                        existing_pub = json.loads(existing['cert_user_json'])['subject']['publicKey']
-                        if existing_pub == pubkey_b64:
+                        existing_obj = json.loads(existing['cert_user_json'])
+                        existing_pub = existing_obj['subject']['publicKey']
+                        # ★ 只复用**当前 CA 签发**的证书（真实事故预防）：
+                        #   APP 的私钥是由国服账号派生的，用户换机器/重装后公钥不变。
+                        #   如果只按"公钥相同"复用，那么本机 CA 换代（换根/换 sn）后，
+                        #   用户重新绑定仍会拿回**旧 CA 签的**证书 —— 旧证书一旦到期/被
+                        #   拒绝，用户在 APP 里怎么点都换不出新证，等于永久登不上。
+                        #   这里额外比对 issuerSn：旧 CA 的证书即使公钥相同也必须重签。
+                        ca_int_sn = getattr(ca_mgr.int_cert or {}, "sn", None)
+                        same_ca = (ca_int_sn is not None
+                                   and str(existing_obj.get('issuerSn')) == str(ca_int_sn))
+                        if existing_pub == pubkey_b64 and same_ca:
                             return self._send_bind_success(
                                 callsign, existing['uid'], existing['fingerprint'],
-                                json.loads(existing['cert_user_json']),
-                                guoji_id, dmr_id, token, ca_mgr)
+                                existing_obj, guoji_id, dmr_id, token, ca_mgr)
+                        if existing_pub == pubkey_b64 and not same_ca:
+                            print("[BIND] %s 的现有证书由旧 CA 签发（issuerSn=%s，当前 %s）"
+                                  " → 强制用新 CA 重签" % (
+                                      callsign, existing_obj.get('issuerSn'), ca_int_sn))
                     except Exception:
                         pass
                 # 确定 uid：已有证书则沿用，否则 max+1（不复用已吊销的 uid）
@@ -4358,16 +4378,26 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
                     dk = None
                     if not derived and existing.get('cert_devicekey_json'):
                         dk = json.loads(existing['cert_devicekey_json'])
-                    return {
-                        'callsign': callsign,
-                        'uid': existing['uid'],
-                        'fingerprint': existing['fingerprint'],
-                        'cert_root': ca_mgr.root_cert,
-                        'cert_int': ca_mgr.int_cert,
-                        'cert_user': json.loads(existing['cert_user_json']),
-                        'cert_devicekey': dk,
-                        'derived': derived,
-                    }, None
+                    # ★ 只复用**当前 CA 签发**的证书（同 _handle_bind 的理由）：
+                    #   本机 CA 换代后，旧证即使还没被吊销也不能再返回给客户端，
+                    #   否则用户永远换不出新证。这里放行"旧证 → 重签"的路径。
+                    ex_obj = json.loads(existing['cert_user_json'])
+                    ca_int_sn = getattr(ca_mgr.int_cert or {}, "sn", None)
+                    if (ca_int_sn is not None
+                            and str(ex_obj.get('issuerSn')) == str(ca_int_sn)):
+                        return {
+                            'callsign': callsign,
+                            'uid': existing['uid'],
+                            'fingerprint': existing['fingerprint'],
+                            'cert_root': ca_mgr.root_cert,
+                            'cert_int': ca_mgr.int_cert,
+                            'cert_user': ex_obj,
+                            'cert_devicekey': dk,
+                            'derived': derived,
+                        }, None
+                    print("[AUTO-ISSUE] %s 的现有证书由旧 CA 签发（issuerSn=%s，当前 %s）"
+                          " → 改用新 CA 重签" % (
+                              callsign, ex_obj.get('issuerSn'), ca_int_sn))
                 except Exception as e:
                     return None, '解析已有证书失败: %s' % e
             # 白名单检查（与手动签发 /api/cert/issue 一致）
@@ -4572,6 +4602,73 @@ class ApiHandler(SyncApiMixin, http.server.BaseHTTPRequestHandler):
         self.send_json({'ok': True, 'ca': info})
 
     # ---------- GET /api/ca/root.json ----------
+    def _handle_leak_status(self):
+        """
+        安全告警：本机证书是否被第三方台账站收录（给管理界面顶部横幅用）。
+
+        数据来源：tools/leak_watch.py 写下的状态文件
+          leak_watch_state.json  → 上次检查结果（指纹命中集合）
+          leak_watch.log         → 最近一次完整检查的摘要
+        本接口**只读文件、绝不发网络请求**（界面每秒轮询也不会打到外面）。
+        真正的外网检查由 tools/leak_watch.py check / daemon 定时做。
+        """
+        state = {}
+        for name in ('leak_watch_state.json', 'leak_watch_status.json'):
+            p = os.path.join(BASE_DIR, name)
+            try:
+                if os.path.exists(p):
+                    with open(p, 'r', encoding='utf-8') as f:
+                        state = json.load(f) or {}
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        hits = state.get('hit_fingerprints') or []
+        checked = state.get('checked_at') or 0
+        age = (time.time() - float(checked)) if checked else None
+        # 超过 2 天没检查 → 提示监测可能停了
+        stale = bool(age is None or age > 2 * 86400)
+        self.send_json({
+            'ok': True,
+            'leaked': bool(hits),
+            'hit_count': len(hits),
+            'hits': state.get('hit_list') or [],
+            'checked_at': checked,
+            'checked_age_s': int(age) if age is not None else None,
+            'stale': stale,
+            'target': state.get('target') or 'https://fmo.panyong.top/fmo-statistics',
+            'message': (
+                '发现 %d 张本机证书被第三方台账站收录，请立即核查' % len(hits)
+                if hits else
+                ('证书外泄监测已超过 2 天未检查，请确认监测任务在运行'
+                 if stale and checked else
+                 ('检查正常，未发现外泄' if checked else '尚未执行过外泄检查'))
+            ),
+        })
+
+    def _handle_leak_check(self):
+        """立即跑一次外泄检查（同步，最多约 20 秒），结果写状态文件。"""
+        script = os.path.join(BASE_DIR, 'tools', 'leak_watch.py')
+        if not os.path.exists(script):
+            self.send_json({'ok': False, 'error': '监测脚本不存在: tools/leak_watch.py'}, 503)
+            return
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, 'check', '--json'],
+                capture_output=True, timeout=90,
+                cwd=BASE_DIR)
+            out = (proc.stdout or b'').decode('utf-8', 'replace')
+            try:
+                res = json.loads(out)
+            except Exception:  # noqa: BLE001
+                res = {'ok': False, 'error': '脚本输出无法解析',
+                       'raw': out[:800],
+                       'stderr': (proc.stderr or b'').decode('utf-8', 'replace')[:400]}
+            self.send_json(res)
+        except subprocess.TimeoutExpired:
+            self.send_json({'ok': False, 'error': '检查超时（>90 秒）'}, 504)
+        except Exception as e:  # noqa: BLE001
+            self.send_json({'ok': False, 'error': '检查失败: %s' % e}, 500)
+
     def _handle_sas_ca_root_json(self):
         """
         下载本机 Root CA 完整证书（自签，含 signature）。

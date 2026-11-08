@@ -229,6 +229,15 @@ for F in api_server.py sas_server.py sync_engine.py monitor.py cert_gen.py \
          fus_dmr_gw.py fus_dmr_gw.json init_user_db.py; do
     copy_path "$F" 1
 done
+# ★ 旧 CA 证书审计 / 批量重签工具（v1.8.53 起）：
+#   CA 换 sn 后有新旧两代证书并存，管理员需要这个工具查"谁还在用旧证书"
+#   以及回滚/批量重签。漏打包会让换证流程在节点上无工具可用。
+copy_path tools/rotate_old_certs.py 0
+# ★ 第三方台账站证书外泄监测（v1.8.53 起）：
+#   台账站会抄收 FMO 协议里的 userCert 广播。我们已关闭对外探测并换了 CA 号段，
+#   但只要有老链路还在广播，证书就会重新出现在对方站点上。这个工具定期核对
+#   "我方证书指纹 vs 对方站点收录的指纹"，发现重合即告警，供管理员及时处置。
+copy_path tools/leak_watch.py 0
 # ★ DMR 网关运行库与服务单元（真实事故：v1.8.47 及以前漏了这三项，
 #   导致发布包不含 DMR 网关，远端升级后「看着升级成功但没有网关」）
 copy_path lib 1
