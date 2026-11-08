@@ -714,8 +714,8 @@ def generate_all(
     ca_name: str = "MYCA",
     ca_email: str = "",
     output_dir: str = ".",
-    root_sn: int = 1,
-    int_sn: int = 1001,
+    root_sn: int = 900000001,
+    int_sn: int = 900001001,
     validity_years: int = 10,
     uid_start: int = 1,
     uid_end: int = 200000,
@@ -899,8 +899,10 @@ def main(argv=None) -> int:
     parser.add_argument("--ca-name", default="MYCA", help="CA 名称（默认 MYCA）")
     parser.add_argument("--ca-email", default="", help="CA 邮箱（可选）")
     parser.add_argument("--output", default=".", help="输出目录（默认当前目录）")
-    parser.add_argument("--root-sn", type=int, default=1, help="Root CA 序列号（默认 1）")
-    parser.add_argument("--int-sn", type=int, default=1001, help="Intermediate CA 序列号（默认 1001）")
+    parser.add_argument("--root-sn", type=int, default=900000001,
+                        help="Root CA 序列号（默认 900000001，避开官方 ESN 的 1）")
+    parser.add_argument("--int-sn", type=int, default=900001001,
+                        help="Intermediate CA 序列号（默认 900001001，避开官方 ESN 的 1001）")
     parser.add_argument("--validity-years", type=int, default=10, help="证书有效期（年，默认 10）")
     parser.add_argument("--uid-start", type=int, default=1, help="Intermediate CA UID 范围起始（默认 1）")
     parser.add_argument("--uid-end", type=int, default=200000, help="Intermediate CA UID 范围结束（默认 200000）")

@@ -52,6 +52,22 @@ SWEEP_MAX_PER_ROUND = 20             # 每轮最多探这么多个，避免一�
 SWEEP_MIN_INTERVAL = 300.0           # 两轮全量重探之间至少 5 分钟
 PROBE_WORKERS = 3                    # 并发数（越小越温和）
 
+# ---- 对外证书广播开关（隐私）----
+# ★ 关掉「带证书向外探测」的原因（真实事故）：
+#   第三方台账站（如 fmo.panyong.top/fmo-statistics）会抄收 FMO 协议里的
+#   userCert 广播，把每个站的自签证书收进它的库。我们的 CA 是自建 MYCA
+#   （根 sn=1、中间 sn=1001），与官方 ESN 的 sn=1/sn=1001 撞号，于是它用
+#   官方 CA 去验我们的证书 → 全部判成 unknown_ca / bad_signature，
+#   在它的「未验签」页把我们整批挂出来。
+#
+#   探测时发的正是 certPackage{intermediateCert,userCert}，等于主动把
+#   我们的证书递给网络上的任意监听者。关掉后：
+#     · 仍**能收**别站（APRS 订阅是 pass -1 只收不发，不受影响）
+#     · 仍**能入**别站（自家 APP 登录 / 集群互认走 sas_server，不经过这里）
+#     · 只是不再对外"试能否进入"，台账里的 reachable 字段停止更新
+#   设 True 可恢复原行为。
+ALLOW_OUTBOUND_CERT_PROBE = False
+
 _HOST_RE = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _PORT_RE = re.compile(r"^P\d{2,5}$")
@@ -302,7 +318,16 @@ def probe_station_login(st, base_dir, timeout=MQTT_PROBE_TIMEOUT, cert=None):
 
     ⚠️ 不要用「匿名 CONNECT 收到 CONNACK 就算能进」——broker 对匿名连接会回
        4/5（拒绝），那样会把**所有**台站都判成能进，完全是假数据。
+
+    ★ 隐私开关（ALLOW_OUTBOUND_CERT_PROBE=False）时**不发出任何证书**：
+      直接返回「未探测」，而不是退回匿名探测 —— 匿名结果必定是假数据
+      （见上一条），会污染台账，比不探测更糟。
     """
+    if not ALLOW_OUTBOUND_CERT_PROBE:
+        return False, {"ok": False, "addr": station_mqtt_addr(st) or "",
+                       "ms": 0, "code": None,
+                       "skipped": True,
+                       "error": "对外证书探测已关闭（隐私保护）"}
     addr = station_mqtt_addr(st)
     if not addr:
         return False, {"ok": False, "addr": "", "ms": 0, "code": None,
@@ -366,9 +391,17 @@ def probe_all(store, base_dir, timeout=MQTT_PROBE_TIMEOUT, workers=8,
     并发探测台账里所有台站「我的证书能不能进入」，结果写回台账。
 
     only_enterable=True 时只回能进的（即「进不去的不显示」）。
+
+    ★ 隐私开关（ALLOW_OUTBOUND_CERT_PROBE=False）时直接返回空结果，
+      不建立任何对外连接、不发出任何证书。
     """
     log = logger or (lambda m: None)
     stations = store.all()
+    if not ALLOW_OUTBOUND_CERT_PROBE:
+        log("[APRS] 对外证书探测已关闭（隐私保护），跳过探测")
+        return [], {"total": len(stations), "enterable": 0, "unreachable": 0,
+                    "elapsed_ms": 0, "skipped": True,
+                    "error": "对外证书探测已关闭（隐私保护）"}
     if not stations:
         return [], {"total": 0, "enterable": 0, "unreachable": 0, "elapsed_ms": 0}
     cert = load_probe_cert(base_dir)
@@ -660,6 +693,8 @@ class AprsCollector(threading.Thread):
     # ---------- 探测（发现即探） ----------
     def _probe_one(self, st):
         """探测单个台站（真实登录），结果写回台账。带全局节流。"""
+        if not ALLOW_OUTBOUND_CERT_PROBE:
+            return                       # 隐私开关关闭：不发证书、不发起连接
         if self.is_self(st):
             return                       # 绝不探自己
         # 全局节流：两次探测之间至少 PROBE_MIN_INTERVAL，避免打爆对端与本机
@@ -688,6 +723,8 @@ class AprsCollector(threading.Thread):
             self.log("[APRS] 探测失败 %s: %s" % (st.get("callsign"), e))
 
     def _submit_probe(self, st):
+        if not ALLOW_OUTBOUND_CERT_PROBE:
+            return                       # 隐私开关关闭：不发证书、不发起连接
         if self.is_self(st):
             return
         pool = self._ensure_pool()

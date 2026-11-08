@@ -89,6 +89,28 @@ OFFICIAL_ROOT_PUBKEYS = {
     "DCeeVS320f36ToVP2eOADVN-Q0LzpMYmiVkmNYzuysY": "BG5ESN",
 }
 
+# ============================================================
+#  本机 CA 的序列号（sn）
+#
+#  ★ 必须避开官方 ESN 体系的号段（真实事故，2026-11）：
+#    官方根 CA  sn=1     （BG5ESN，自签）
+#    官方中间 CA sn=1001  （uid 1~200000，CN）
+#    我们原来照抄 sn=1 / sn=1001 → 第三方台账站（内置官方 CA）拿官方的
+#    sn=1 去验我们的证书，必然失败，整批判成 unknown_ca / bad_signature，
+#    在它的「未验签」页被公开点名（BH6BHG/BG8KOE/BH6RGQ 等十余个呼号）。
+#
+#  ★ 为什么改 sn 是安全的：
+#    - 我们自己的根信任判定**只比对根公钥**（见根信任判定那段的 5 个来源），
+#      sn 一次都没参与；
+#    - 桥接/集群互通同样走公钥比对与指纹（指纹由完整证书算出，本来就随
+#      证书变化）；
+#    - 因此 sn 纯属本地编号，改成任意唯一值都不影响任何互通能力。
+#
+#  取值：用 8 位以上、远离官方 1/1001 的号段，避免与任何外部 CA 再撞。
+# ============================================================
+DEFAULT_ROOT_SN = 900000001          # 本机根 CA 序列号（唯一，避开官方 sn=1）
+DEFAULT_INT_SN = 900001001           # 本机中间 CA 序列号（唯一，避开官方 sn=1001）
+
 
 # ============================================================
 #  配置里追加信任的根公钥（trust.extraRootPubkeys）
@@ -536,7 +558,9 @@ class CaManager:
                  ca_name: str = "MYCA", ca_email: str = "",
                  validity_years: int = 10,
                  uid_start: int = 1, uid_end: int = 200000,
-                 issuing_countries: list = None):
+                 issuing_countries: list = None,
+                 root_sn: int = DEFAULT_ROOT_SN,
+                 int_sn: int = DEFAULT_INT_SN):
         self.ca_dir = ca_dir
         self.db = db
         self.ca_name = ca_name
@@ -545,6 +569,11 @@ class CaManager:
         self.uid_start = uid_start
         self.uid_end = uid_end
         self.issuing_countries = issuing_countries or ["CN"]
+        # ★ 本地 CA 的序列号。默认值是刻意避开官方 ESN 的（官方根 sn=1、
+        #   中间 sn=1001），详见 _generate() 的注释。sn 只是本地编号，不参与
+        #   互通验证（验证认根公钥），改成任意唯一值都安全。
+        self.root_sn = int(root_sn)
+        self.int_sn = int(int_sn)
 
         self.root_cert = None
         self.int_cert = None
@@ -721,13 +750,22 @@ class CaManager:
         return False
 
     def _generate(self):
-        """生成新的 Root CA + Intermediate CA。"""
+        """生成新的 Root CA + Intermediate CA。
+
+        ★ sn 必须避开官方 ESN 体系（真实事故）：
+          官方根 CA 的 sn=1（BG5ESN），官方中间 CA 的 sn=1001（uid 1~200000）。
+          我们原来照抄了 sn=1 / sn=1001，导致第三方台账站（它内置官方 CA）
+          拿官方的 sn=1 去验我们的证书 → 整批判成 unknown_ca / bad_signature，
+          在「未验签」页被公开点名。sn 只是本地编号，改成唯一值不影响任何互通
+          （我们的验证认的是**根公钥**，见 sas_server 根信任判定），
+          但能彻底避免与任何外部 CA 撞号。
+        """
         # Root CA
         root_seed, root_pub = generate_keypair()
         self.root_cert, _ = build_root_ca(
             seed=root_seed, pub=root_pub,
             ca_name=self.ca_name, ca_email=self.ca_email,
-            sn=1, validity_years=self.validity_years,
+            sn=self.root_sn, validity_years=self.validity_years,
         )
         # Intermediate CA
         int_seed, int_pub = generate_keypair()
@@ -735,7 +773,7 @@ class CaManager:
             seed=int_seed, pub=int_pub,
             root_cert=self.root_cert, root_seed=root_seed,
             ca_name=self.ca_name, ca_email=self.ca_email,
-            sn=1001, validity_years=self.validity_years,
+            sn=self.int_sn, validity_years=self.validity_years,
             uid_start=self.uid_start, uid_end=self.uid_end,
             issuing_countries=self.issuing_countries,
         )
